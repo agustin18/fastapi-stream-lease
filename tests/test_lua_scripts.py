@@ -123,3 +123,48 @@ async def test_release_exception_handling(lease_manager):
     lease_manager.redis.eval = AsyncMock(side_effect=ConnectionError("Redis connection lost"))
     # Should catch exception and log warning without re-raising
     await lease.release()
+
+
+@pytest.mark.asyncio
+async def test_renew_exception_handling(lease_manager):
+    lease = await lease_manager.acquire("user_1")
+    lease_manager.redis.eval = AsyncMock(side_effect=ConnectionError("Redis timeout"))
+    assert await lease_manager.renew(lease) is False
+    assert await lease.renew() is False
+
+
+@pytest.mark.asyncio
+async def test_unlimited_limits(fake_redis):
+    from fastapi_stream_lease import LeaseConfig, StreamLeaseManager
+
+    unlimited_mgr = StreamLeaseManager(
+        redis=fake_redis,
+        config=LeaseConfig(max_per_user=0, max_global=0),
+    )
+    leases = [await unlimited_mgr.acquire("user_unlimited") for _ in range(5)]
+    assert await unlimited_mgr.get_active_count("user_unlimited") == 5
+
+    for lease_item in leases:
+        await lease_item.release()
+
+
+def test_lease_config_validation():
+    from fastapi_stream_lease import LeaseConfig
+
+    with pytest.raises(ValueError, match="lease_seconds must be greater than 0"):
+        LeaseConfig(lease_seconds=0)
+
+    with pytest.raises(ValueError, match="max_per_user cannot be negative"):
+        LeaseConfig(max_per_user=-1)
+
+    with pytest.raises(ValueError, match="max_global cannot be negative"):
+        LeaseConfig(max_global=-1)
+
+    # Hash tag validation for Redis Cluster support
+    cfg = LeaseConfig(key_prefix="sse")
+    assert cfg.user_key("42") == "{sse}:user:42"
+    assert cfg.global_key == "{sse}:global"
+
+    custom_cfg = LeaseConfig(key_prefix="{app_v1}:lease")
+    assert custom_cfg.user_key("42") == "{app_v1}:lease:user:42"
+    assert custom_cfg.global_key == "{app_v1}:lease:global"

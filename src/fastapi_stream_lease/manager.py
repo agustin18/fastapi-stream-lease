@@ -78,19 +78,26 @@ class StreamLeaseManager:
         Renew an active lease, extending its TTL in Redis.
 
         Returns:
-            bool: True if successfully extended, False if the lease expired or was evicted.
+            bool: True if successfully extended, False if the lease expired, was evicted,
+                  or if a Redis error occurred.
         """
         new_expires = time.time() + self.config.lease_seconds
-        result = await self.redis.eval(
-            RENEW_SCRIPT,
-            2,
-            lease.user_key,
-            lease.global_key,
-            lease.lease_id,
-            new_expires,
-            self.config.redis_ttl,
-        )
-        return int(result) == 1
+        check_global = 1 if self.config.max_global > 0 else 0
+        try:
+            result = await self.redis.eval(
+                RENEW_SCRIPT,
+                2,
+                lease.user_key,
+                lease.global_key,
+                lease.lease_id,
+                new_expires,
+                self.config.redis_ttl,
+                check_global,
+            )
+            return int(result) == 1
+        except Exception as exc:
+            logger.warning("Failed to renew stream lease %s: %s", lease.lease_id, exc)
+            return False
 
     async def release(self, lease: StreamLease) -> None:
         """
@@ -121,11 +128,17 @@ class StreamLeaseManager:
     @asynccontextmanager
     async def lease(self, user_id: str | int) -> AsyncIterator[StreamLease]:
         """
-        Context manager for acquiring and safely releasing a stream lease.
+        Context manager for acquiring and safely releasing a stream lease for scoped
+        executions (such as WebSockets, background tasks, or pub/sub loops).
+
+        For HTTP StreamingResponse (SSE / LLM tokens), use `lease = await acquire()`
+        and `return StreamingResponse(lease.wrap(...))` instead.
 
         Example:
             async with lease_manager.lease(user_id=42) as lease:
-                return StreamingResponse(lease.wrap(my_stream()))
+                while True:
+                    msg = await websocket.receive_text()
+                    ...
         """
         stream_lease = await self.acquire(user_id)
         try:

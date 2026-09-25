@@ -17,26 +17,31 @@ local global_limit = tonumber(ARGV[5])
 local ttl = tonumber(ARGV[6])
 
 redis.call('ZREMRANGEBYSCORE', user_key, '-inf', now)
-redis.call('ZREMRANGEBYSCORE', global_key, '-inf', now)
+if global_limit > 0 then
+    redis.call('ZREMRANGEBYSCORE', global_key, '-inf', now)
+end
 
-if redis.call('ZCARD', user_key) >= user_limit then
+if user_limit > 0 and redis.call('ZCARD', user_key) >= user_limit then
     return 2
 end
 
-if redis.call('ZCARD', global_key) >= global_limit then
+if global_limit > 0 and redis.call('ZCARD', global_key) >= global_limit then
     return 3
 end
 
 redis.call('ZADD', user_key, expires, lease_id)
-redis.call('ZADD', global_key, expires, lease_id)
 redis.call('EXPIRE', user_key, ttl)
-redis.call('EXPIRE', global_key, ttl)
+
+if global_limit > 0 then
+    redis.call('ZADD', global_key, expires, lease_id)
+    redis.call('EXPIRE', global_key, ttl)
+end
 
 return 1
 """
 
 # Atomic Lua script to renew an active stream lease:
-# Verifies the lease is still active in both sets and extends its expiration.
+# Verifies the lease is still active in sets and extends its expiration.
 # Returns:
 #   1 -> Renewed successfully
 #   0 -> Lease not found or already expired
@@ -46,19 +51,23 @@ local global_key = KEYS[2]
 local lease_id = ARGV[1]
 local new_expires = tonumber(ARGV[2])
 local ttl = tonumber(ARGV[3])
+local check_global = tonumber(ARGV[4]) or 1
 
 if not redis.call('ZSCORE', user_key, lease_id) then
     return 0
 end
 
-if not redis.call('ZSCORE', global_key, lease_id) then
+if check_global > 0 and not redis.call('ZSCORE', global_key, lease_id) then
     return 0
 end
 
 redis.call('ZADD', user_key, new_expires, lease_id)
-redis.call('ZADD', global_key, new_expires, lease_id)
 redis.call('EXPIRE', user_key, ttl)
-redis.call('EXPIRE', global_key, ttl)
+
+if check_global > 0 then
+    redis.call('ZADD', global_key, new_expires, lease_id)
+    redis.call('EXPIRE', global_key, ttl)
+end
 
 return 1
 """

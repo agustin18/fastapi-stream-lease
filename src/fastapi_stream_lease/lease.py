@@ -6,7 +6,7 @@ import time
 from collections.abc import AsyncIterable, AsyncIterator
 from contextlib import suppress
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
 if TYPE_CHECKING:
     from fastapi_stream_lease.manager import StreamLeaseManager
@@ -27,6 +27,12 @@ class StreamLease:
     manager: StreamLeaseManager
     created_at: float = field(default_factory=time.time)
     _is_released: bool = field(default=False, init=False)
+
+    async def __aenter__(self) -> StreamLease:
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        await self.release()
 
     async def renew(self) -> bool:
         """Manually renew this lease, extending its TTL in Redis."""
@@ -56,6 +62,14 @@ class StreamLease:
         2. When the stream terminates, is cancelled, or the client disconnects,
            the lease is guaranteed to be released in the `finally` block.
         """
+        if renew_interval is not None and renew_interval >= self.manager.config.lease_seconds:
+            logger.warning(
+                "renew_interval (%.1fs) >= lease_seconds (%.1fs) on lease %s",
+                renew_interval,
+                self.manager.config.lease_seconds,
+                self.lease_id,
+            )
+
         interval = renew_interval or (self.manager.config.lease_seconds / 2.0)
         renew_task: asyncio.Task[None] | None = None
 

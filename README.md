@@ -109,6 +109,21 @@ async def chat_stream(user_id: str = "user_123"):
     )
 ```
 
+### Protecting WebSockets
+
+For WebSockets and scoped async routines, use the `lease_manager.lease(...)` context manager:
+
+```python
+@app.websocket("/ws/chat/{user_id}")
+async def websocket_chat(websocket: WebSocket, user_id: str):
+    await websocket.accept()
+    # Acquires lease on enter, automatically releases when socket closes or disconnects
+    async with lease_manager.lease(user_id):
+        while True:
+            msg = await websocket.receive_text()
+            await websocket.send_text(f"Echo: {msg}")
+```
+
 ---
 
 ## 🛠️ How It Works (Algorithmic Math)
@@ -117,10 +132,11 @@ All concurrency validations, expirations, and insertions run inside **atomic Lua
 
 1. **Sorted Sets (`ZSET`):** Active streams are stored in Redis `ZSET`s where the value is a unique `lease_id` and the score is the epoch expiration timestamp (`now + lease_seconds`).
 2. **Atomic Eviction:** Before checking capacity, `ZREMRANGEBYSCORE` purges all expired entries in $O(\log N + M)$.
-3. **Capacity Check:** `ZCARD` verifies current stream count in $O(1)$ against `max_per_user` and `max_global`.
-4. **Acquisition:** If capacity permits, `ZADD` registers the lease in $O(\log N)$ and updates the key TTL.
-5. **Auto-Renewal:** While the stream is active, `lease.wrap()` spawns a lightweight background worker that calls `ZADD` to advance the expiration score every `lease_seconds / 2`.
-6. **Guaranteed Release:** When the stream completes or the client disconnects, `ZREM` removes the lease immediately in the `finally:` block.
+3. **Capacity Check:** `ZCARD` verifies current stream count in $O(1)$ against `max_per_user` and `max_global`. Setting either to `0` disables that limit.
+4. **Redis Cluster Slot Affinity:** Keys automatically use `{prefix}` hash tags (e.g. `{stream_lease}:user:123` and `{stream_lease}:global`), guaranteeing zero `CROSSSLOT` errors across distributed Redis clusters.
+5. **Acquisition:** If capacity permits, `ZADD` registers the lease in $O(\log N)$ and updates the key TTL.
+6. **Auto-Renewal:** While the stream is active, `lease.wrap()` spawns a lightweight background worker that calls `ZADD` to advance the expiration score every `lease_seconds / 2`.
+7. **Guaranteed Release:** When the stream completes or the client disconnects, `ZREM` removes the lease immediately in the `finally:` block.
 
 ---
 
@@ -133,9 +149,9 @@ from fastapi_stream_lease import LeaseConfig
 
 config = LeaseConfig(
     lease_seconds=30.0,  # Lease expiration window (seconds)
-    max_per_user=3,  # Maximum active streams per user/key
-    max_global=1000,  # Maximum active streams across the entire cluster
-    key_prefix="my_app:sse",  # Custom Redis key prefix
+    max_per_user=3,  # Max active streams per user (set 0 to disable)
+    max_global=1000,  # Max active streams cluster-wide (set 0 to disable)
+    key_prefix="my_app:sse",  # Custom Redis key prefix (hash-tag safe)
 )
 ```
 

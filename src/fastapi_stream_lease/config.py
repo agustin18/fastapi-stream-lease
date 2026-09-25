@@ -19,12 +19,27 @@ class LeaseConfig:
     key_prefix: str = "stream_lease"
     """Prefix for Redis keys (e.g. stream_lease:user:{id}, stream_lease:global)."""
 
+    def __post_init__(self) -> None:
+        if self.lease_seconds <= 0:
+            raise ValueError("lease_seconds must be greater than 0")
+        if self.max_per_user < 0:
+            raise ValueError("max_per_user cannot be negative")
+        if self.max_global < 0:
+            raise ValueError("max_global cannot be negative")
+
+    @property
+    def _cluster_prefix(self) -> str:
+        """Ensure prefix uses Redis hash tags {...} for slot affinity in Redis Cluster."""
+        if "{" in self.key_prefix and "}" in self.key_prefix:
+            return self.key_prefix
+        return f"{{{self.key_prefix}}}"
+
     def user_key(self, user_id: str | int) -> str:
-        return f"{self.key_prefix}:user:{user_id}"
+        return f"{self._cluster_prefix}:user:{user_id}"
 
     @property
     def global_key(self) -> str:
-        return f"{self.key_prefix}:global"
+        return f"{self._cluster_prefix}:global"
 
     @property
     def redis_ttl(self) -> int:

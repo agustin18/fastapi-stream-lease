@@ -128,3 +128,32 @@ async def test_wrap_stream_auto_renew_lost_lease(lease_manager, fake_redis):
         chunks.append(chunk)
 
     assert chunks == ["start", "end"]
+
+
+@pytest.mark.asyncio
+async def test_stream_lease_as_context_manager(lease_manager):
+    lease = await lease_manager.acquire("user_cm")
+    assert await lease_manager.get_active_count("user_cm") == 1
+
+    async with lease:
+        assert await lease_manager.get_active_count("user_cm") == 1
+
+    # Guaranteed release after block exit
+    assert await lease_manager.get_active_count("user_cm") == 0
+
+
+@pytest.mark.asyncio
+async def test_wrap_renew_interval_large_warning(lease_manager, caplog):
+    async def quick_generator():
+        yield "data"
+
+    lease = await lease_manager.acquire("user_warn")
+    import logging
+
+    with caplog.at_level(logging.WARNING):
+        chunks = []
+        async for chunk in lease.wrap(quick_generator(), auto_renew=False, renew_interval=10.0):
+            chunks.append(chunk)
+
+    assert chunks == ["data"]
+    assert any("renew_interval" in r.message for r in caplog.records)
