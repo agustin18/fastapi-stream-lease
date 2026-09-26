@@ -53,7 +53,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.11", "3.12", "3.13"]
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -67,10 +67,10 @@ jobs:
         run: uv python install ${{ matrix.python-version }}
 
       - name: Install dependencies
-        run: uv sync --locked --extra dev
+        run: uv sync --locked --extra dev --python ${{ matrix.python-version }}
 
       - name: Run Pytest with Coverage
-        run: uv run pytest
+        run: uv run --python ${{ matrix.python-version }} pytest
 
       - name: Upload coverage artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -104,13 +104,80 @@ jobs:
       - name: Check Redis 5 compatibility
         run: uv run pytest -o addopts='' tests/test_real_redis.py -q
 
-  package:
+  test-redis8:
     runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:8-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 10
+    env:
+      REDIS_URL: redis://localhost:6379/15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install uv
         uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      - name: Set up Python
+        run: uv python install 3.13
+      - name: Install dependencies
+        run: uv sync --locked --extra dev
+      - name: Check Redis 8 compatibility
+        run: uv run pytest -o addopts='' tests/test_real_redis.py -q
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          enable-cache: true
+
       - name: Build wheel and sdist
         run: uv build
+
       - name: Validate package metadata
         run: uvx twine check dist/*
+
+      - name: Verify package version consistency
+        run: |
+          uv run python - <<'PY'
+          import tomllib
+          from pathlib import Path
+          import fastapi_stream_lease
+
+          toml_version = tomllib.loads(Path("pyproject.toml").read_text())["project"]["version"]
+          pkg_version = fastapi_stream_lease.__version__
+          if toml_version != pkg_version:
+              raise SystemExit(f"Version mismatch: pyproject.toml ({toml_version}) != package __version__ ({pkg_version})")
+          print(f"Version consistency verified: {pkg_version}")
+          PY
+
+      - name: Clean environment wheel smoke test
+        run: |
+          mkdir -p /tmp/smoke-test
+          cd /tmp/smoke-test
+          uv venv
+          uv pip install $GITHUB_WORKSPACE/dist/*.whl
+          uv run python - <<'PY'
+          import fastapi_stream_lease
+          from fastapi_stream_lease import (
+              LeaseConfig,
+              StreamLeaseManager,
+              StreamLease,
+              StreamLeaseError,
+              StreamLeaseRejected,
+              StreamLeaseLost,
+              StreamLeaseUnavailable,
+          )
+
+          config = LeaseConfig(max_per_user=1, max_global=10)
+          assert config.max_per_user == 1
+          print(f"Smoke test passed on fastapi-stream-lease {fastapi_stream_lease.__version__}")
+          PY
