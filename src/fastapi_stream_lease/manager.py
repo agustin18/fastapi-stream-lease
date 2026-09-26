@@ -9,7 +9,11 @@ from typing import Any
 from uuid import uuid4
 
 from fastapi_stream_lease.config import LeaseConfig
-from fastapi_stream_lease.exceptions import StreamLeaseLost, StreamLeaseRejected
+from fastapi_stream_lease.exceptions import (
+    StreamLeaseLost,
+    StreamLeaseRejected,
+    StreamLeaseUnavailable,
+)
 from fastapi_stream_lease.lease import StreamLease
 from fastapi_stream_lease.lua import (
     ACQUIRE_SCRIPT,
@@ -41,17 +45,36 @@ class StreamLeaseManager:
         lease_id = uuid4().hex
         user_key = self.config.user_key(user_id)
         global_key = self.config.global_key
-        result = await self.redis.eval(
-            ACQUIRE_SCRIPT,
-            2,
-            user_key,
-            global_key,
-            self.config.lease_seconds,
-            lease_id,
-            self.config.max_per_user,
-            self.config.max_global,
-            self.config.redis_ttl,
-        )
+        try:
+            result = await self.redis.eval(
+                ACQUIRE_SCRIPT,
+                2,
+                user_key,
+                global_key,
+                self.config.lease_seconds,
+                lease_id,
+                self.config.max_per_user,
+                self.config.max_global,
+                self.config.redis_ttl,
+            )
+        except Exception as exc:
+            if self.config.fail_open:
+                logger.warning(
+                    "Redis backend unavailable during acquire; fail_open=True allows lease %s: %s",
+                    lease_id,
+                    exc,
+                )
+                lease = StreamLease(
+                    lease_id=lease_id,
+                    user_id=user_id,
+                    user_key=user_key,
+                    global_key=global_key,
+                    manager=self,
+                    created_at=time.time(),
+                )
+                lease._is_fallback = True
+                return lease
+            raise StreamLeaseUnavailable(detail=f"Redis backend unavailable: {exc}") from exc
 
         code = int(result)
         if code == 2:

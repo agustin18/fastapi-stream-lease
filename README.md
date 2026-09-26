@@ -95,7 +95,8 @@ The manager context and `async with lease` both renew while open. Handle normal 
 ## Behavior and limits
 
 - Acquisition, renewal, expiration cleanup, and release use atomic Redis Lua scripts. The keys share a Redis Cluster hash tag, so a user and global limit can be checked in one script.
-- Every lease expires after `lease_seconds` without a successful renewal. `wrap()` and `manager.lease()` renew every half interval by default. A short Redis outage can therefore end an active stream. New acquisitions propagate Redis errors to the application.
+- Every lease expires after `lease_seconds` without a successful renewal. `wrap()` and `manager.lease()` renew every half interval by default. Transient Redis connection errors trigger fast retries across the remaining lease TTL (Adaptive Grace Period), preventing temporary hiccups from dropping active streams.
+- If Redis is unavailable on initial acquisition, `StreamLeaseUnavailable` (HTTP 503) is raised by default (`fail_open=False`). Set `fail_open=True` in `LeaseConfig` if your application prefers allowing streams during Redis outages (graceful degradation).
 - Normal completion or cancellation attempts immediate release. If Redis is unavailable during release, the lease is removed after expiration; cleanup of the key itself uses a longer TTL. An async iterator abandoned without being closed may also hold its slot until expiration. Use `contextlib.aclosing()` if your own consumer stops iteration early.
 - `get_active_count(user_id)` counts active leases for one identity; `get_active_count()` counts globally when `max_global` is enabled. Neither is a historical usage metric.
 - All workers sharing limits must use the same key prefix and compatible limit settings. Lease expiration is measured by Redis, avoiding clock differences among application workers.

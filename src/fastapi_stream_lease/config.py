@@ -20,6 +20,9 @@ class LeaseConfig:
     key_prefix: str = "stream_lease"
     """Prefix for Redis keys (e.g. stream_lease:user:{id}, stream_lease:global)."""
 
+    fail_open: bool = False
+    """If True, allows streams to proceed unthrottled with an emergency stub if Redis is down."""
+
     def __post_init__(self) -> None:
         if not isfinite(self.lease_seconds) or self.lease_seconds <= 0:
             raise ValueError("lease_seconds must be finite and greater than 0")

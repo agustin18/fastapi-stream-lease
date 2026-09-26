@@ -64,3 +64,45 @@ class StreamLeaseRejected(StreamLeaseError):
             detail=self.detail,
             headers={"Retry-After": str(self.retry_after)},
         )
+
+
+class StreamLeaseUnavailable(StreamLeaseError):
+    """Raised when the Redis backend is unavailable to coordinate stream leases."""
+
+    def __init__(self, retry_after: int = 5, detail: str | None = None) -> None:
+        self.retry_after = retry_after
+        self.detail = detail or "Stream lease coordination backend is temporarily unavailable"
+        super().__init__(self.detail)
+
+    def as_response(self) -> Any:
+        """Convert into a JSONResponse (HTTP 503)."""
+        try:
+            from starlette.responses import JSONResponse
+        except ImportError as err:
+            raise RuntimeError(
+                "Starlette or FastAPI must be installed to use as_response()"
+            ) from err
+
+        return JSONResponse(
+            status_code=503,
+            content={
+                "code": "stream_lease_backend_unavailable",
+                "detail": self.detail,
+            },
+            headers={"Retry-After": str(self.retry_after)},
+        )
+
+    def as_http_exception(self) -> Any:
+        """Convert into a FastAPI/Starlette HTTPException (HTTP 503)."""
+        try:
+            from starlette.exceptions import HTTPException
+        except ImportError as err:
+            raise RuntimeError(
+                "FastAPI or Starlette must be installed to use as_http_exception()"
+            ) from err
+
+        return HTTPException(
+            status_code=503,
+            detail=self.detail,
+            headers={"Retry-After": str(self.retry_after)},
+        )
