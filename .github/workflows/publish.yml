@@ -54,8 +54,11 @@ jobs:
           git fetch origin main
           git merge-base --is-ancestor HEAD origin/main
 
-      - name: Build sdist and wheel
-        run: uv build
+      - name: Download verified distributions
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.1.8
+        with:
+          name: dist-packages
+          path: dist/
 
       - name: Publish distribution 📦 to PyPI
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1

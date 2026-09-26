@@ -197,12 +197,22 @@ async def test_as_streaming_response_and_manager_stream(lease_manager, monkeypat
     assert await lease_manager.get_active_count("manager_stream_user") == 0
 
     # 3. manager.stream() setup error cleans up lease
-    lease_err = await lease_manager.acquire("cleanup_user")
+    import dataclasses
+
+    released_reasons = []
+    config_with_hook = dataclasses.replace(
+        lease_manager.config,
+        on_released=lambda lease, reason: released_reasons.append(reason),
+    )
+    custom_mgr = lease_manager.__class__(lease_manager.redis, config_with_hook)
+    lease_err = await custom_mgr.acquire("cleanup_user")
     with patch.object(lease_err, "as_streaming_response", side_effect=ValueError("stream error")):
-        with patch.object(lease_manager, "acquire", return_value=lease_err):
+        with patch.object(custom_mgr, "acquire", return_value=lease_err):
             with pytest.raises(ValueError, match="stream error"):
-                await lease_manager.stream("cleanup_user", token_gen())
-    assert await lease_manager.get_active_count("cleanup_user") == 0
+                await custom_mgr.stream("cleanup_user", token_gen())
+    assert await custom_mgr.get_active_count("cleanup_user") == 0
+    await asyncio.sleep(0.02)
+    assert released_reasons == ["error"]
 
     # 4. as_streaming_response without starlette
     lease_no_starlette = await lease_manager.acquire("no_starlette_user")

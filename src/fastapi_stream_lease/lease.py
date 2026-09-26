@@ -36,8 +36,13 @@ async def _run_async_hook(coro: Any, hook: Any) -> None:
         logger.warning("Error executing lease lifecycle callback %s: %s", hook, exc)
 
 
-def _trigger_hook_background(hook: Any, *args: Any) -> None:
-    """Safely trigger an optional lifecycle callback in the background without blocking."""
+def _trigger_hook(hook: Any, *args: Any) -> None:
+    """Safely trigger an optional sync or async lifecycle callback without raising.
+
+    Synchronous callbacks execute inline and must be non-blocking (e.g. metric updates).
+    Asynchronous callbacks are dispatched out-of-band on the running event loop as
+    background tasks, ensuring network/telemetry I/O never delays coordination.
+    """
     if hook is None:
         return
     try:
@@ -54,16 +59,7 @@ def _trigger_hook_background(hook: Any, *args: Any) -> None:
         logger.warning("Error executing lease lifecycle callback %s: %s", hook, exc)
 
 
-async def _trigger_hook(hook: Any, *args: Any) -> None:
-    """Safely trigger an optional sync or async lifecycle callback without raising."""
-    if hook is None:
-        return
-    try:
-        res = hook(*args)
-        if asyncio.iscoroutine(res):
-            await res
-    except Exception as exc:
-        logger.warning("Error executing lease lifecycle callback %s: %s", hook, exc)
+_trigger_hook_background = _trigger_hook
 
 
 @dataclass

@@ -18,6 +18,7 @@ import logging
 import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from typing import Any
 
 import redis.asyncio as redis
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -57,7 +58,15 @@ manager = StreamLeaseManager(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    api_key = os.environ.get("OPENAI_API_KEY")
+    client: Any = None
+    if _HAS_OPENAI and api_key and AsyncOpenAI is not None:
+        client = AsyncOpenAI(api_key=api_key)
+        logger.info("Initialized shared AsyncOpenAI client connection pool")
+    app.state.openai_client = client
     yield
+    if client is not None:
+        await client.close()
     await redis_client.aclose()
 
 
@@ -81,14 +90,12 @@ async def unavailable_handler(request: Request, exc: StreamLeaseUnavailable):
     return exc.as_response()
 
 
-async def llm_token_stream(prompt: str) -> AsyncIterator[str]:
-    """Streams LLM tokens using the official OpenAI SDK when OPENAI_API_KEY is present,
+async def llm_token_stream(prompt: str, client: Any = None) -> AsyncIterator[str]:
+    """Streams LLM tokens using the shared AsyncOpenAI client when available,
 
     or falls back to a simulated token stream if unconfigured.
     """
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if _HAS_OPENAI and api_key and AsyncOpenAI is not None:
-        client = AsyncOpenAI(api_key=api_key)
+    if client is not None:
         model = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
         response = await client.chat.completions.create(
             model=model,
@@ -129,15 +136,20 @@ async def llm_token_stream(prompt: str) -> AsyncIterator[str]:
 
 
 @app.get("/v1/chat/stream")
-async def chat_stream(prompt: str = "Hello", user_id: str = Depends(authenticated_user)):
+async def chat_stream(
+    request: Request,
+    prompt: str = "Hello",
+    user_id: str = Depends(authenticated_user),
+):
     """
     Protected LLM chat completion endpoint.
 
     Uses `await manager.stream(...)` to acquire the lease, wrap the generator,
     and return an SSE StreamingResponse in a single, safe call.
     """
+    client = getattr(request.app.state, "openai_client", None)
     return await manager.stream(
         user_id=user_id,
-        stream=llm_token_stream(prompt),
+        stream=llm_token_stream(prompt, client=client),
         media_type="text/event-stream",
     )

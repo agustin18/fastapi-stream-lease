@@ -125,18 +125,19 @@ The manager context and `async with lease` both renew while open. Handle normal 
 |---|---|---|---|
 | **Worker Process Crash (`SIGKILL`)** | Lease expires in Redis after `lease_seconds` via Redis `TIME` score. Subsequent acquisitions automatically sweep expired members. | **Strong (Self-healing within $TTL$)** | Slot remains held until `lease_seconds` elapses; no zombie leases persist permanently. |
 | **Transient Redis Disconnect (Renewal)** | Renewal worker enters Adaptive Grace Period, retrying across the remaining TTL. If connection recovers before deadline, stream proceeds normally. | **High Availability** | If outage exceeds remaining TTL, lease is revoked, cancelling stream immediately. |
+| **Event Loop Stalled / Process Paused > TTL** | Redis lease expires while local worker is stalled (e.g. extreme GC pause, VM suspension, CPU starvation). When execution resumes, the next renewal detects expiration and terminates the stream immediately. | **Eventual Safety** | Slots are preserved in Redis, but a local worker stalled past TTL cannot observe cancellation until its event loop resumes execution. |
 | **Redis Outage on Acquire (`fail_open=False`)** | Immediate fail-closed rejection raising `StreamLeaseUnavailable` (`HTTP 503 Service Unavailable`). | **Strict Safety** | Limits strictly enforced; incoming streams rejected until Redis is reachable. |
-| **Redis Outage on Acquire (`fail_open=True`)** | Grants an uncoordinated in-memory fallback lease using worker monotonic clock (`time.monotonic()`). | **Graceful Degradation** | Limits are uncoordinated across workers during Redis outage; fallback leases do not retroactively register upon Redis recovery. |
+| **Redis Outage on Acquire (`fail_open=True`)** | Grants an uncoordinated in-memory fallback lease using worker monotonic clock (`time.monotonic()`). | **Graceful Degradation** | Fallback acquisitions are intentionally unthrottled across and *within* worker processes during outage; fallback leases do not retroactively register upon Redis recovery. |
 | **Worker Clock Drift** | All lease evaluations and expiration purges use `redis.call('TIME')`. | **Absolute** | Worker system clock or NTP skew cannot cause premature expiration or lingering leases. |
-| **Slow Observability / Metric Hooks** | All lifecycle hooks (`on_acquired`, `on_released`, `on_lost`, etc.) run out-of-band via background tasks. Stream cancellation executes immediately. | **Strong Guarantee** | Slow APM/Datadog/StatsD calls cannot delay stream termination or consume renewal retry windows. |
-| **Redis Sentinel Master Failover** | `ReadOnlyError` during replica write is classified as transient, triggering adaptive retry until promotion completes. | **High Availability** | Seamlessly rides out master elections shorter than remaining `lease_seconds`. |
-| **Redis Cluster Multi-Key Coordination** | Keys share hash tag `{prefix}` (`{prefix}:user:...` and `{prefix}:global`), guaranteeing identical slot placement. | **Atomic Lua Execution** | Atomically validates both per-user and global capacity in a single Redis round-trip without `CROSSSLOT` errors. |
+| **Slow Observability / Metric Hooks** | All lifecycle hooks (`on_acquired`, `on_released`, `on_lost`, `on_rejected`, `on_backend_error`) run out-of-band via background tasks and threadpool offloading (`asyncio.to_thread` for sync callables). | **Strong Guarantee** | Slow APM/Datadog/StatsD calls cannot delay stream cancellation, block acquire returns, or consume renewal retry windows. |
+| **Redis Sentinel Master Failover** | `READONLY` transitions during replica write are retried. Asynchronous Redis replication can lose recently acknowledged writes if a master fails before syncing; un-replicated leases are detected as lost on next renewal and cancelled cleanly. | **High Availability** | Seamlessly rides out master elections shorter than remaining `lease_seconds`. Divergent writes are terminated rather than resurrected. |
+| **Redis Cluster Multi-Key Coordination** | Keys share hash tag `{prefix}` (`{prefix}:user:...` and `{prefix}:global`), guaranteeing placement on the same hash slot for atomic Lua execution. | **Atomic Lua Execution** | Atomically validates both per-user and global capacity in a single Redis round-trip without `CROSSSLOT` errors. Coordinated keys share one cluster slot, which can become a hot slot at extreme throughput. |
 
 ### Fail-Open Fallback Lease Lifecycle
 
 When `fail_open=True` is enabled in `LeaseConfig`, the manager grants fallback leases during Redis outages to maintain service availability:
+- **Completely Unthrottled Fallback:** While Redis is unavailable, fallback acquisitions are intentionally unthrottled; neither per-user nor global limits are enforced, even within a single worker process (no local in-memory semaphore is maintained).
 - **Local Time Basis:** Fallback leases use `time.monotonic()` locally and are isolated to the executing worker process.
-- **Uncoordinated Concurrency:** Concurrency limits cannot be enforced across multiple worker processes while Redis is unreachable.
 - **No Retroactive Registration:** Active fallback leases do not attempt retroactive registration into Redis when connectivity returns. They complete locally and release normally.
 
 ## Production and Operational Guide
@@ -177,4 +178,4 @@ When `fail_open=True` is enabled in `LeaseConfig`, the manager grants fallback l
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the local workflow and [SECURITY.md](SECURITY.md) for private vulnerability reports. Changes are proposed through pull requests and merged by the maintainer after CI passes. The package is licensed under [MIT](LICENSE).
 
-CI checks formatting, lint, types, Redis 5 and 7 behavior, package build, and a minimum of 95% combined line and branch coverage. This is a small beta project; reports from real deployments are especially helpful for documenting operational limits.
+CI checks formatting, lint, types, Redis 5, 7, and 8 behavior, package build, and a minimum of 95% combined line and branch coverage. This is a small beta project; reports from real deployments are especially helpful for documenting operational limits.

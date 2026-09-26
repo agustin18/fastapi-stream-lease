@@ -26,7 +26,7 @@ docker compose run --rm backend uv run pytest
 docker compose down
 ```
 
-The default test command requires at least 95% combined line and branch coverage. CI also checks Redis 5 and 7, builds both distributions, and validates package metadata.
+The default test command requires at least 95% combined line and branch coverage. CI also checks Redis 5, 7, and 8, builds both distributions, and validates package metadata.
 
 GitHub Actions are pinned to full commit hashes so a changed version tag cannot silently change the release pipeline. The comment beside each hash shows the readable release version, and Dependabot proposes grouped updates.
 
