@@ -36,6 +36,9 @@ class LeaseConfig:
     on_lost: Any = None
     """Optional callback hook: on_lost(lease: StreamLease, reason: str) -> None | Awaitable[None]"""
 
+    on_released: Any = None
+    """Optional callback hook: on_released(lease, reason) -> None | Awaitable[None]"""
+
     on_backend_error: Any = None
     """Optional callback hook: on_backend_error(exc: Exception) -> None | Awaitable[None]"""
 
@@ -50,7 +53,13 @@ class LeaseConfig:
             raise ValueError("key_prefix cannot be empty")
         if self.retry_after_seconds < 0:
             raise ValueError("retry_after_seconds cannot be negative")
-        for hook_name in ("on_acquired", "on_rejected", "on_lost", "on_backend_error"):
+        for hook_name in (
+            "on_acquired",
+            "on_rejected",
+            "on_lost",
+            "on_released",
+            "on_backend_error",
+        ):
             hook_val = getattr(self, hook_name)
             if hook_val is not None and not callable(hook_val):
                 raise TypeError(f"{hook_name} must be callable if provided")

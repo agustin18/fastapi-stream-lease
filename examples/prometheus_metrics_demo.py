@@ -55,8 +55,11 @@ def on_rejected(user_id: str | int, reason: str) -> None:
     REJECTED_STREAMS.labels(reason=reason).inc()
 
 
-def on_lost(lease: StreamLease, reason: str) -> None:
+def on_released(lease: StreamLease, reason: str) -> None:
     ACTIVE_STREAMS.dec()
+
+
+def on_lost(lease: StreamLease, reason: str) -> None:
     LOST_STREAMS.labels(reason=reason).inc()
 
 
@@ -77,6 +80,7 @@ manager = StreamLeaseManager(
         lease_seconds=15.0,
         on_acquired=on_acquired,
         on_rejected=on_rejected,
+        on_released=on_released,
         on_lost=on_lost,
         on_backend_error=on_backend_error,
     ),

@@ -261,18 +261,24 @@ class StreamLeaseManager:
         stream_lease = await self.acquire(user_id)
         renew_task: asyncio.Task[None] | None = None
         lease_lost = asyncio.Event()
+        reason = "completed"
         try:
             renew_task, lease_lost = stream_lease._start_auto_renew(renew_interval)
             yield stream_lease
         except asyncio.CancelledError:
             if lease_lost.is_set():
+                reason = "lost"
                 _safe_uncancel()
                 raise StreamLeaseLost(stream_lease.lease_id) from None
+            reason = "cancelled"
+            raise
+        except Exception:
+            reason = "error"
             raise
         finally:
             if renew_task is not None:
                 await stream_lease._stop_auto_renew(renew_task)
-            await stream_lease.release()
+            await stream_lease.release(reason=reason)
 
     async def stream(
         self,
