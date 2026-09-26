@@ -139,8 +139,18 @@ async def test_release_exception_handling(lease_manager):
 
 @pytest.mark.asyncio
 async def test_renew_exception_handling(lease_manager):
+    from fastapi_stream_lease import StreamLeaseUnavailable
+
     lease = await lease_manager.acquire("user_1")
+    # Network errors raise StreamLeaseUnavailable so callers can distinguish from loss
     lease_manager.redis.eval = AsyncMock(side_effect=ConnectionError("Redis timeout"))
+    with pytest.raises(StreamLeaseUnavailable):
+        await lease_manager.renew(lease)
+    with pytest.raises(StreamLeaseUnavailable):
+        await lease.renew()
+
+    # Redis returning 0 indicates definitive lease loss or expiration -> returns False
+    lease_manager.redis.eval = AsyncMock(return_value=0)
     assert await lease_manager.renew(lease) is False
     assert await lease.renew() is False
 

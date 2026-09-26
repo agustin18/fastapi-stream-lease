@@ -7,7 +7,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
 from httpx import ASGITransport, AsyncClient
 
-from fastapi_stream_lease import StreamLeaseRejected
+from fastapi_stream_lease import StreamLeaseRejected, StreamLeaseUnavailable
 
 
 @pytest.fixture
@@ -16,6 +16,10 @@ def fastapi_app(lease_manager):
 
     @app.exception_handler(StreamLeaseRejected)
     async def stream_lease_rejected_handler(request: Request, exc: StreamLeaseRejected):
+        return exc.as_response()
+
+    @app.exception_handler(StreamLeaseUnavailable)
+    async def stream_lease_unavailable_handler(request: Request, exc: StreamLeaseUnavailable):
         return exc.as_response()
 
     @app.get("/stream/{user_id}")
@@ -133,3 +137,29 @@ def test_stream_lease_unavailable_methods(monkeypatch):
     monkeypatch.setitem(sys.modules, "starlette.exceptions", None)
     with pytest.raises(RuntimeError, match="FastAPI or Starlette must be installed"):
         exc.as_http_exception()
+
+
+@pytest.mark.asyncio
+async def test_fastapi_unavailable_503_response(fastapi_app, lease_manager):
+    from unittest.mock import AsyncMock
+
+    lease_manager.redis.eval = AsyncMock(side_effect=ConnectionError("Host unreachable"))
+    transport = ASGITransport(app=fastapi_app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get("/stream/alice")
+        assert resp.status_code == 503
+        assert resp.headers.get("retry-after") == "5"
+        payload = resp.json()
+        assert payload["code"] == "stream_lease_backend_unavailable"
+        assert "temporarily unavailable" in payload["detail"]
+        assert "Host unreachable" not in payload["detail"]
+
+
+def test_stream_lease_base_error_not_implemented():
+    from fastapi_stream_lease.exceptions import StreamLeaseError
+
+    base_exc = StreamLeaseError()
+    with pytest.raises(NotImplementedError):
+        base_exc.as_response()
+    with pytest.raises(NotImplementedError):
+        base_exc.as_http_exception()
