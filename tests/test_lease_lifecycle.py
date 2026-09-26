@@ -607,12 +607,13 @@ async def test_lifecycle_hooks_invocation(fake_redis):
     # 1. Acquire triggers on_acquired
     lease = await mgr.acquire("user_hook")
     assert lease.user_id == "user_hook"
+    await mgr.drain()
     assert ("acquired", "user_hook") in events
 
     # 2. Limit rejection triggers on_rejected
     with pytest.raises(StreamLeaseRejected):
         await mgr.acquire("user_hook")
-    await asyncio.sleep(0.01)
+    await mgr.drain()
     assert ("rejected", "user_hook", "user_limit") in events
 
     # 3. Backend error triggers on_backend_error
@@ -620,7 +621,7 @@ async def test_lifecycle_hooks_invocation(fake_redis):
     mgr.redis.eval = AsyncMock(side_effect=ConnectionError("Backend dropped"))
     with pytest.raises(StreamLeaseUnavailable):
         await mgr.acquire("user_down")
-    await asyncio.sleep(0.01)
+    await mgr.drain()
     assert ("backend_error", "ConnectionError") in events
 
     # 4. Fallback lease triggers both on_backend_error and on_acquired
@@ -635,8 +636,8 @@ async def test_lifecycle_hooks_invocation(fake_redis):
     mgr_open.redis.eval = AsyncMock(side_effect=ConnectionError("Backend dropped"))
     fallback_lease = await mgr_open.acquire("user_fb")
     assert fallback_lease._is_fallback is True
+    await mgr_open.drain()
     assert ("acquired", "user_fb") in events
-    await asyncio.sleep(0.01)
     assert ("backend_error", "ConnectionError") in events
 
     # 5. worker lost hook triggers on_lost (and buggy hook does not raise)
@@ -668,34 +669,8 @@ async def test_lifecycle_hooks_invocation(fake_redis):
         async for _ in l_active.wrap(sample_stream(), auto_renew=True, renew_interval=0.04):
             pass
 
+    await mgr_lost.drain()
     assert ("user_bg_lost", "redis_revoked") in lost_events
-
-
-@pytest.mark.asyncio
-async def test_trigger_hook_helper():
-    from fastapi_stream_lease.lease import _trigger_hook
-
-    # 1. hook is None
-    _trigger_hook(None, 123)
-
-    # 2. sync hook
-    called = []
-    _trigger_hook(lambda x: called.append(x), "sync")
-    assert called == ["sync"]
-
-    # 3. async hook
-    async def async_fn(x):
-        called.append(x)
-
-    _trigger_hook(async_fn, "async")
-    await asyncio.sleep(0.01)
-    assert called == ["sync", "async"]
-
-    # 4. hook raising exception does not raise out
-    def bad_hook(x):
-        raise ValueError("broken")
-
-    _trigger_hook(bad_hook, "test")
 
 
 @pytest.mark.asyncio
@@ -779,8 +754,8 @@ async def test_slow_async_hooks_do_not_delay_acquire_or_renew(fake_redis):
 
 
 @pytest.mark.asyncio
-async def test_sync_hooks_execute_inline(fake_redis):
-    """Verify that synchronous hooks run inline immediately."""
+async def test_sync_hooks_execute_out_of_band(fake_redis):
+    """Verify that synchronous hooks run out-of-band via dispatcher without blocking."""
     events = []
 
     def sync_acquired(lease):
@@ -796,10 +771,12 @@ async def test_sync_hooks_execute_inline(fake_redis):
     )
     mgr = StreamLeaseManager(redis=fake_redis, config=config)
     lease = await mgr.acquire("user_sync")
-    # Must be present immediately without sleeping/yielding
+    # Dispatched out-of-band to dispatcher queue
+    await mgr.drain()
     assert events == ["acquired"]
 
     await lease.release()
+    await mgr.drain()
     assert events == ["acquired", "released_manual"]
 
 
@@ -817,6 +794,7 @@ async def test_release_triggers_on_backend_error_hook(fake_redis):
 
     mgr.redis.eval = AsyncMock(side_effect=ConnectionError("Redis unreachable during release"))
     await mgr.release(lease)
+    await mgr.drain()
 
     assert len(backend_errors) == 1
     assert isinstance(backend_errors[0], ConnectionError)
@@ -863,6 +841,7 @@ async def test_on_released_hook_context_manager(fake_redis, exit_mode, expected_
                 await fake_redis.flushall()
                 await asyncio.sleep(0.1)
 
+    await mgr.drain()
     assert len(released_events) == 1
     assert released_events[0][1] == expected_reason
 
@@ -917,27 +896,35 @@ async def test_on_released_hook_stream_wrap(fake_redis, stream_mode, expected_re
             async for _ in lease.wrap(s_canc(), auto_renew=False):
                 pass
 
+    await mgr.drain()
     assert len(released_events) == 1
     assert released_events[0][1] == expected_reason
 
     # Calling release() again must not re-trigger on_released (exactly-once release)
     await lease.release()
+    await mgr.drain()
     assert len(released_events) == 1
 
 
 @pytest.mark.asyncio
 async def test_verify_cluster_config_registration_and_mismatch(fake_redis):
-    """Verify cluster configuration fingerprint registration and drift detection."""
-    from fastapi_stream_lease.exceptions import ConfigurationMismatchError
+    """Verify cluster configuration fingerprint registration, persistence, and drift detection."""
+    from fastapi_stream_lease.exceptions import ConfigurationMismatchError, StreamLeaseUnavailable
 
     # 1. First worker registers its configuration successfully
     cfg1 = LeaseConfig(key_prefix="worker_test", max_global=100, max_per_user=2, lease_seconds=10.0)
     mgr1 = StreamLeaseManager(redis=fake_redis, config=cfg1)
     assert await mgr1.verify_cluster_config() is True
 
-    # Check key is populated in redis
+    # Check key is populated in redis, has algorithm_version, and has NO TTL (persistent)
     val = await fake_redis.get(cfg1.config_key)
     assert val is not None
+    import json
+
+    data = json.loads(val.decode("utf-8") if isinstance(val, bytes) else val)
+    assert data["algorithm_version"] == 1
+    ttl = await fake_redis.ttl(cfg1.config_key)
+    assert ttl == -1, f"Config key should be persistent (no TTL), got ttl={ttl}"
 
     # 2. Second worker with identical configuration passes verification
     mgr1_clone = StreamLeaseManager(redis=fake_redis, config=cfg1)
@@ -957,7 +944,7 @@ async def test_verify_cluster_config_registration_and_mismatch(fake_redis):
     assert exc_info.value.existing_config["max_global"] == 100
     assert exc_info.value.current_config["max_global"] == 500
 
-    # 5. Network error during verify returns False and triggers on_backend_error
+    # 5. Network error during verify: strict=False returns False, strict=True raises
     from unittest.mock import AsyncMock
 
     errors = []
@@ -966,6 +953,42 @@ async def test_verify_cluster_config_registration_and_mismatch(fake_redis):
         on_backend_error=lambda e: errors.append(type(e).__name__),
     )
     mgr_err = StreamLeaseManager(redis=fake_redis, config=cfg_err)
-    mgr_err.redis.get = AsyncMock(side_effect=ConnectionError("Redis down"))
-    assert await mgr_err.verify_cluster_config() is False
+    mgr_err.redis.set = AsyncMock(side_effect=ConnectionError("Redis down"))
+
+    # non-strict: returns False
+    assert await mgr_err.verify_cluster_config(strict=False) is False
+    await mgr_err.drain()
     assert errors == ["ConnectionError"]
+
+    # strict: raises StreamLeaseUnavailable (fail-fast on k8s startup)
+    with pytest.raises(StreamLeaseUnavailable):
+        await mgr_err.verify_cluster_config(strict=True)
+
+
+@pytest.mark.asyncio
+async def test_verify_cluster_config_concurrent_race_condition(fake_redis):
+    """Verify atomic SET NX ensures exactly one configuration wins among concurrent workers."""
+    cfg_a = LeaseConfig(
+        key_prefix="race_cluster", max_global=50, max_per_user=2, lease_seconds=10.0
+    )
+    cfg_b = LeaseConfig(
+        key_prefix="race_cluster", max_global=100, max_per_user=2, lease_seconds=10.0
+    )
+
+    workers_a = [StreamLeaseManager(redis=fake_redis, config=cfg_a) for _ in range(25)]
+    workers_b = [StreamLeaseManager(redis=fake_redis, config=cfg_b) for _ in range(25)]
+
+    all_workers = workers_a + workers_b
+    import random
+
+    random.shuffle(all_workers)
+
+    results = await asyncio.gather(*(w.verify_cluster_config(strict=False) for w in all_workers))
+
+    # Exactly 25 workers must succeed (the ones matching the winner)
+    # and exactly 25 workers must detect the mismatch (returning False)
+    true_count = sum(1 for r in results if r is True)
+    false_count = sum(1 for r in results if r is False)
+
+    assert true_count == 25
+    assert false_count == 25

@@ -62,7 +62,10 @@ class StreamLeaseManager:
     def __init__(self, redis: Any, config: LeaseConfig | None = None) -> None:
         self.redis = redis
         self.config: LeaseConfig = config or LeaseConfig()
-        self.dispatcher = HookDispatcher(max_queue_size=self.config.hook_queue_size)
+        self.dispatcher = HookDispatcher(
+            max_queue_size=self.config.hook_queue_size,
+            sync_inline=False,
+        )
 
     async def __aenter__(self) -> StreamLeaseManager:
         return self
@@ -340,24 +343,37 @@ class StreamLeaseManager:
         """
         Verify that this worker's configuration matches cluster configuration in Redis.
 
-        If no configuration is registered yet, this worker's fingerprint is recorded.
+        If no configuration is registered yet, this worker's fingerprint is recorded atomically.
         If a mismatch is detected:
           - If strict=True: raises ConfigurationMismatchError.
           - If strict=False: logs a warning and returns False.
 
+        If a backend network error occurs:
+          - If strict=True: raises StreamLeaseUnavailable (fail-fast on k8s startup).
+          - If strict=False: logs a warning, triggers on_backend_error, and returns False.
+
         Returns:
-            bool: True if configuration matches or was registered; False on mismatch.
+            bool: True if configuration matches or was registered; False otherwise.
         """
         fingerprint = self.config.fingerprint_dict()
         fingerprint_json = json.dumps(fingerprint, sort_keys=True)
         config_key = self.config.config_key
-        ttl = max(int(self.config.redis_ttl), 86400)
 
         try:
+            # Atomic canonical registration: only sets if key does not exist (NX=True), no TTL
+            registered = await self.redis.set(config_key, fingerprint_json, nx=True)
+            if registered:
+                return True
+
             existing = await self.redis.get(config_key)
             if existing is None:
-                await self.redis.set(config_key, fingerprint_json, ex=ttl)
-                return True
+                # Key was flushed or disappeared in between; retry registration once
+                registered = await self.redis.set(config_key, fingerprint_json, nx=True)
+                if registered:
+                    return True
+                existing = await self.redis.get(config_key)
+                if existing is None:
+                    return True
 
             if isinstance(existing, bytes):
                 existing = existing.decode("utf-8")
@@ -390,5 +406,13 @@ class StreamLeaseManager:
                     "Could not verify cluster configuration due to network error: %s",
                     exc,
                 )
+                if strict:
+                    raise StreamLeaseUnavailable(
+                        detail=(
+                            "Stream lease coordination backend is unavailable during "
+                            "cluster config verification"
+                        ),
+                        retry_after=self.config.retry_after_seconds,
+                    ) from exc
                 return False
             raise
