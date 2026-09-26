@@ -1,8 +1,15 @@
 """
 Prometheus Observability Demo with fastapi-stream-lease
 
-Demonstrates wiring zero-dependency lifecycle hooks (`on_acquired`, `on_rejected`,
-`on_lost`, `on_backend_error`) into Prometheus counters and gauges.
+Demonstrates wiring zero-dependency lifecycle hooks (`on_acquired`, `on_released`,
+`on_rejected`, `on_lost`, `on_backend_error`) into Prometheus counters and gauges.
+
+Note on multi-worker deployments:
+    This demo uses the default in-memory Prometheus registry reflecting streams on the
+    current worker process. For multi-worker deployments (e.g. Gunicorn/Uvicorn with
+    multiple worker processes), configure Prometheus Multiprocess Mode
+    (PROMETHEUS_MULTIPROC_DIR) or export metrics to an aggregated telemetry backend
+    (Datadog, StatsD, OpenTelemetry).
 
 Requirements:
     pip install prometheus-client fastapi uvicorn redis

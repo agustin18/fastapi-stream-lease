@@ -609,6 +609,7 @@ async def test_lifecycle_hooks_invocation(fake_redis):
     # 2. Limit rejection triggers on_rejected
     with pytest.raises(StreamLeaseRejected):
         await mgr.acquire("user_hook")
+    await asyncio.sleep(0.01)
     assert ("rejected", "user_hook", "user_limit") in events
 
     # 3. Backend error triggers on_backend_error
@@ -616,6 +617,7 @@ async def test_lifecycle_hooks_invocation(fake_redis):
     mgr.redis.eval = AsyncMock(side_effect=ConnectionError("Backend dropped"))
     with pytest.raises(StreamLeaseUnavailable):
         await mgr.acquire("user_down")
+    await asyncio.sleep(0.01)
     assert ("backend_error", "ConnectionError") in events
 
     # 4. Fallback lease triggers both on_backend_error and on_acquired
@@ -631,6 +633,8 @@ async def test_lifecycle_hooks_invocation(fake_redis):
     fallback_lease = await mgr_open.acquire("user_fb")
     assert fallback_lease._is_fallback is True
     assert ("acquired", "user_fb") in events
+    await asyncio.sleep(0.01)
+    assert ("backend_error", "ConnectionError") in events
 
     # 5. worker lost hook triggers on_lost (and buggy hook does not raise)
     fake_redis.eval = original_eval
@@ -669,31 +673,32 @@ async def test_trigger_hook_helper():
     from fastapi_stream_lease.lease import _trigger_hook
 
     # 1. hook is None
-    await _trigger_hook(None, 123)
+    _trigger_hook(None, 123)
 
     # 2. sync hook
     called = []
-    await _trigger_hook(lambda x: called.append(x), "sync")
+    _trigger_hook(lambda x: called.append(x), "sync")
     assert called == ["sync"]
 
     # 3. async hook
     async def async_fn(x):
         called.append(x)
 
-    await _trigger_hook(async_fn, "async")
+    _trigger_hook(async_fn, "async")
+    await asyncio.sleep(0.01)
     assert called == ["sync", "async"]
 
     # 4. hook raising exception does not raise out
     def bad_hook(x):
         raise ValueError("broken")
 
-    await _trigger_hook(bad_hook, "test")
+    _trigger_hook(bad_hook, "test")
 
 
 @pytest.mark.asyncio
 async def test_slow_on_lost_does_not_delay_stream_cancellation(fake_redis):
     """
-    Ensure slow telemetry hooks (e.g. Datadog/CloudWatch taking hundreds of ms)
+    Ensure slow async telemetry hooks (e.g. Datadog/CloudWatch taking hundreds of ms)
     do NOT delay cancelling the stream when a lease is lost.
 
     Cancellation must be issued immediately before or concurrently with the hook.
@@ -733,6 +738,66 @@ async def test_slow_on_lost_does_not_delay_stream_cancellation(fake_redis):
     # Cancellation must occur immediately when loss is detected, NOT after the slow hook finishes
     assert elapsed < 0.25, f"Stream cancellation was delayed by slow hook: elapsed={elapsed:.3f}s"
     assert chunks_after_loss <= 1, f"Stream kept running during hook: {chunks_after_loss} chunks"
+
+
+@pytest.mark.asyncio
+async def test_slow_async_hooks_do_not_delay_acquire_or_renew(fake_redis):
+    """Ensure slow async telemetry callbacks do not delay acquire() or renew()."""
+
+    async def slow_acquired(lease):
+        await asyncio.sleep(0.3)
+
+    async def slow_backend_err(exc):
+        await asyncio.sleep(0.3)
+
+    config = LeaseConfig(
+        lease_seconds=2.0,
+        on_acquired=slow_acquired,
+        on_backend_error=slow_backend_err,
+    )
+    mgr = StreamLeaseManager(redis=fake_redis, config=config)
+
+    start = time.monotonic()
+    lease = await mgr.acquire("user_slow_acquire")
+    elapsed = time.monotonic() - start
+    assert elapsed < 0.20, f"Acquisition was delayed by async hook: elapsed={elapsed:.3f}s"
+
+    # Simulate slow backend error on renew()
+    mgr.redis.eval = AsyncMock(side_effect=ConnectionError("Redis timed out"))
+    start_renew = time.monotonic()
+    with pytest.raises(StreamLeaseUnavailable):
+        await mgr.renew(lease)
+    elapsed_renew = time.monotonic() - start_renew
+    assert elapsed_renew < 0.20, (
+        f"Renewal was delayed by slow async hook: elapsed={elapsed_renew:.3f}s"
+    )
+
+    await lease.release()
+
+
+@pytest.mark.asyncio
+async def test_sync_hooks_execute_inline(fake_redis):
+    """Verify that synchronous hooks run inline immediately."""
+    events = []
+
+    def sync_acquired(lease):
+        events.append("acquired")
+
+    def sync_released(lease, reason):
+        events.append(f"released_{reason}")
+
+    config = LeaseConfig(
+        lease_seconds=2.0,
+        on_acquired=sync_acquired,
+        on_released=sync_released,
+    )
+    mgr = StreamLeaseManager(redis=fake_redis, config=config)
+    lease = await mgr.acquire("user_sync")
+    # Must be present immediately without sleeping/yielding
+    assert events == ["acquired"]
+
+    await lease.release()
+    assert events == ["acquired", "released_manual"]
 
 
 @pytest.mark.asyncio

@@ -1,8 +1,6 @@
 services:
   redis:
     image: redis:7-alpine
-    ports:
-      - "6379:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 2s
@@ -23,10 +21,5 @@ services:
         condition: service_healthy
     command: uv run pytest
 
-networks:
-  default:
-    ipam:
-      config:
-        - subnet: 10.100.0.0/24
 
 

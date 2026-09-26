@@ -159,12 +159,13 @@ jobs:
           print(f"Version consistency verified: {pkg_version}")
           PY
 
-      - name: Clean environment wheel smoke test
+      - name: Clean environment wheel smoke test (core and fastapi extra)
         run: |
           mkdir -p /tmp/smoke-test
           cd /tmp/smoke-test
           uv venv
-          uv pip install $GITHUB_WORKSPACE/dist/*.whl
+          WHEEL_PATH=$(ls $GITHUB_WORKSPACE/dist/*.whl)
+          uv pip install "$WHEEL_PATH[fastapi]"
           uv run python - <<'PY'
           import fastapi_stream_lease
           from fastapi_stream_lease import (
@@ -179,5 +180,18 @@ jobs:
 
           config = LeaseConfig(max_per_user=1, max_global=10)
           assert config.max_per_user == 1
-          print(f"Smoke test passed on fastapi-stream-lease {fastapi_stream_lease.__version__}")
+
+          # Verify Starlette/FastAPI integration works with installed extra
+          err = StreamLeaseRejected("user_limit")
+          resp = err.as_response()
+          assert resp.status_code == 429
+          print(f"Smoke test passed on fastapi-stream-lease {fastapi_stream_lease.__version__} with [fastapi] extra")
           PY
+
+      - name: Upload dist artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist-packages
+          path: dist/
+          if-no-files-found: error
+

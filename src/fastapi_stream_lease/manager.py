@@ -16,7 +16,7 @@ from fastapi_stream_lease.exceptions import (
     StreamLeaseRejected,
     StreamLeaseUnavailable,
 )
-from fastapi_stream_lease.lease import StreamLease, _safe_uncancel, _trigger_hook
+from fastapi_stream_lease.lease import StreamLease, _safe_uncancel, _trigger_hook_background
 from fastapi_stream_lease.lua import (
     ACQUIRE_SCRIPT,
     COUNT_SCRIPT,
@@ -86,7 +86,7 @@ class StreamLeaseManager:
             )
         except Exception as exc:
             if is_network_error(exc):
-                await _trigger_hook(self.config.on_backend_error, exc)
+                _trigger_hook_background(self.config.on_backend_error, exc)
                 if self.config.fail_open:
                     logger.warning(
                         "Redis backend unavailable during acquire; "
@@ -104,7 +104,7 @@ class StreamLeaseManager:
                         created_monotonic=start_monotonic,
                     )
                     lease._is_fallback = True
-                    await _trigger_hook(self.config.on_acquired, lease)
+                    _trigger_hook_background(self.config.on_acquired, lease)
                     return lease
                 logger.warning(
                     "Redis backend unavailable during acquire for user %s: %s",
@@ -125,10 +125,10 @@ class StreamLeaseManager:
 
         code = int(result)
         if code == 2:
-            await _trigger_hook(self.config.on_rejected, user_id, "user_limit")
+            _trigger_hook_background(self.config.on_rejected, user_id, "user_limit")
             raise StreamLeaseRejected(reason="user_limit")
         if code == 3:
-            await _trigger_hook(self.config.on_rejected, user_id, "global_limit")
+            _trigger_hook_background(self.config.on_rejected, user_id, "global_limit")
             raise StreamLeaseRejected(reason="global_limit")
         if code != 1:
             raise RuntimeError(f"Unexpected stream lease acquisition return code: {code}")
@@ -142,7 +142,7 @@ class StreamLeaseManager:
             created_at=time.time(),
             created_monotonic=start_monotonic,
         )
-        await _trigger_hook(self.config.on_acquired, lease)
+        _trigger_hook_background(self.config.on_acquired, lease)
         return lease
 
     async def renew(self, lease: StreamLease) -> bool:
@@ -169,7 +169,7 @@ class StreamLeaseManager:
             return int(result) == 1
         except Exception as exc:
             if is_network_error(exc):
-                await _trigger_hook(self.config.on_backend_error, exc)
+                _trigger_hook_background(self.config.on_backend_error, exc)
                 logger.warning(
                     "Network error renewing stream lease %s: %s",
                     lease.lease_id,
@@ -201,7 +201,7 @@ class StreamLeaseManager:
             )
         except Exception as exc:
             if is_network_error(exc):
-                await _trigger_hook(self.config.on_backend_error, exc)
+                _trigger_hook_background(self.config.on_backend_error, exc)
                 logger.warning("Network error releasing stream lease %s: %s", lease.lease_id, exc)
             else:
                 logger.error(
@@ -223,7 +223,7 @@ class StreamLeaseManager:
             return int(count)
         except Exception as exc:
             if is_network_error(exc):
-                await _trigger_hook(self.config.on_backend_error, exc)
+                _trigger_hook_background(self.config.on_backend_error, exc)
                 logger.warning(
                     "Network error querying active stream count for %s: %s",
                     target_key,
@@ -315,5 +315,5 @@ class StreamLeaseManager:
                 **kwargs,
             )
         except Exception:
-            await lease.release()
+            await lease.release(reason="error")
             raise
