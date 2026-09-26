@@ -225,3 +225,34 @@ class StreamLease:
             if renew_task is not None:
                 await self._stop_auto_renew(renew_task)
             await self.release()
+
+    def as_streaming_response(
+        self,
+        stream: AsyncIterable[Any],
+        media_type: str = "text/event-stream",
+        status_code: int = 200,
+        headers: dict[str, str] | None = None,
+        auto_renew: bool = True,
+        renew_interval: float | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        """
+        Wrap an async stream and return a Starlette/FastAPI StreamingResponse.
+
+        Automatically manages lease renewal during iteration and releases Redis
+        resources when the stream closes or client disconnects.
+        """
+        try:
+            from starlette.responses import StreamingResponse
+        except ImportError:
+            raise RuntimeError(
+                "Starlette or FastAPI must be installed to use as_streaming_response()."
+            ) from None
+
+        return StreamingResponse(
+            self.wrap(stream, auto_renew=auto_renew, renew_interval=renew_interval),
+            media_type=media_type,
+            status_code=status_code,
+            headers=headers,
+            **kwargs,
+        )

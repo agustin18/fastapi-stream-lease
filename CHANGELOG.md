@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.5 — 2026-09-26
+
+- **1-Line Protected Streaming Helper (`manager.stream`)**: Added `await manager.stream(user_id, generator)` and `lease.as_streaming_response(generator)` returning protected Starlette/FastAPI `StreamingResponse` objects in a single call with automatic error cleanup to prevent lingering ghost leases.
+- **Redis Sentinel & Master Failover Resilience (`ReadOnlyError`)**: Classified `ReadOnlyError` as a transient condition in `is_network_error()`, allowing adaptive renewal retries to ride out Sentinel master failover without dropping active streams.
+- **Production LLM Token Streaming Example**: Added `examples/openai_streaming_demo.py` showcasing how to protect OpenAI, Anthropic, and Ollama streaming endpoints with strict per-user concurrency limits.
+- **Prometheus Observability Example**: Added `examples/prometheus_metrics_demo.py` showing how to wire zero-dependency lifecycle hooks into Prometheus counters and gauges.
+
 ## 0.1.4 — 2026-09-26
 
 - **Worker Crash Resilience (P1 Fix)**: Background auto-renewal worker catches unhandled execution and Redis errors (e.g. `ResponseError`, `NOPERM`, `WRONGTYPE`), logs the incident with traceback, marks the lease as lost, and cleanly terminates the stream/context instead of crashing silently and leaving unmanaged streams running.

@@ -163,3 +163,50 @@ def test_stream_lease_base_error_not_implemented():
         base_exc.as_response()
     with pytest.raises(NotImplementedError):
         base_exc.as_http_exception()
+
+
+@pytest.mark.asyncio
+async def test_as_streaming_response_and_manager_stream(lease_manager, monkeypatch):
+    import sys
+    from unittest.mock import patch
+
+    async def token_gen():
+        yield "token_1\n"
+        yield "token_2\n"
+
+    # 1. lease.as_streaming_response()
+    lease = await lease_manager.acquire("direct_resp_user")
+    resp = lease.as_streaming_response(token_gen(), media_type="text/plain")
+    assert resp.status_code == 200
+    assert resp.media_type == "text/plain"
+
+    chunks = []
+    async for chunk in resp.body_iterator:
+        chunks.append(chunk)
+    assert chunks == ["token_1\n", "token_2\n"]
+    assert await lease_manager.get_active_count("direct_resp_user") == 0
+
+    # 2. manager.stream() success
+    resp2 = await lease_manager.stream("manager_stream_user", token_gen())
+    assert resp2.status_code == 200
+    assert resp2.media_type == "text/event-stream"
+    chunks2 = []
+    async for chunk in resp2.body_iterator:
+        chunks2.append(chunk)
+    assert chunks2 == ["token_1\n", "token_2\n"]
+    assert await lease_manager.get_active_count("manager_stream_user") == 0
+
+    # 3. manager.stream() setup error cleans up lease
+    lease_err = await lease_manager.acquire("cleanup_user")
+    with patch.object(lease_err, "as_streaming_response", side_effect=ValueError("stream error")):
+        with patch.object(lease_manager, "acquire", return_value=lease_err):
+            with pytest.raises(ValueError, match="stream error"):
+                await lease_manager.stream("cleanup_user", token_gen())
+    assert await lease_manager.get_active_count("cleanup_user") == 0
+
+    # 4. as_streaming_response without starlette
+    lease_no_starlette = await lease_manager.acquire("no_starlette_user")
+    monkeypatch.setitem(sys.modules, "starlette.responses", None)
+    with pytest.raises(RuntimeError, match="Starlette or FastAPI must be installed"):
+        lease_no_starlette.as_streaming_response(token_gen())
+    await lease_no_starlette.release()
