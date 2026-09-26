@@ -1,0 +1,137 @@
+services:
+  redis-master:
+    image: redis:7-alpine
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        cat << 'EOF' > /tmp/redis.conf
+        port 6379
+        save ""
+        replica-announce-ip redis-master
+        EOF
+        exec redis-server /tmp/redis.conf
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 1s
+      timeout: 1s
+      retries: 5
+
+  redis-replica:
+    image: redis:7-alpine
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        cat << 'EOF' > /tmp/redis.conf
+        port 6379
+        save ""
+        replicaof redis-master 6379
+        replica-announce-ip redis-replica
+        EOF
+        exec redis-server /tmp/redis.conf
+    depends_on:
+      redis-master:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 1s
+      timeout: 1s
+      retries: 5
+
+  sentinel-1:
+    image: redis:7-alpine
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        cat << 'EOF' > /tmp/sentinel.conf
+        port 26379
+        sentinel monitor mymaster redis-master 6379 2
+        sentinel down-after-milliseconds mymaster 1000
+        sentinel failover-timeout mymaster 10000
+        sentinel parallel-syncs mymaster 1
+        sentinel resolve-hostnames yes
+        sentinel announce-hostnames yes
+        EOF
+        exec redis-server /tmp/sentinel.conf --sentinel
+    depends_on:
+      redis-master:
+        condition: service_healthy
+      redis-replica:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "26379", "ping"]
+      interval: 1s
+      timeout: 1s
+      retries: 5
+
+  sentinel-2:
+    image: redis:7-alpine
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        cat << 'EOF' > /tmp/sentinel.conf
+        port 26379
+        sentinel monitor mymaster redis-master 6379 2
+        sentinel down-after-milliseconds mymaster 1000
+        sentinel failover-timeout mymaster 10000
+        sentinel parallel-syncs mymaster 1
+        sentinel resolve-hostnames yes
+        sentinel announce-hostnames yes
+        EOF
+        exec redis-server /tmp/sentinel.conf --sentinel
+    depends_on:
+      redis-master:
+        condition: service_healthy
+      redis-replica:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "26379", "ping"]
+      interval: 1s
+      timeout: 1s
+      retries: 5
+
+  sentinel-3:
+    image: redis:7-alpine
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        cat << 'EOF' > /tmp/sentinel.conf
+        port 26379
+        sentinel monitor mymaster redis-master 6379 2
+        sentinel down-after-milliseconds mymaster 1000
+        sentinel failover-timeout mymaster 10000
+        sentinel parallel-syncs mymaster 1
+        sentinel resolve-hostnames yes
+        sentinel announce-hostnames yes
+        EOF
+        exec redis-server /tmp/sentinel.conf --sentinel
+    depends_on:
+      redis-master:
+        condition: service_healthy
+      redis-replica:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "26379", "ping"]
+      interval: 1s
+      timeout: 1s
+      retries: 5
+
+  backend:
+    build: .
+    volumes:
+      - ./src:/app/src
+      - ./tests:/app/tests
+      - ./examples:/app/examples
+      - ./benchmarks:/app/benchmarks
+      - ./pyproject.toml:/app/pyproject.toml
+      - ./uv.lock:/app/uv.lock
+    environment:
+      - REDIS_SENTINEL_HOSTS=sentinel-1:26379,sentinel-2:26379,sentinel-3:26379
+      - REDIS_SENTINEL_SERVICE=mymaster
+    depends_on:
+      sentinel-1:
+        condition: service_healthy
+      sentinel-2:
+        condition: service_healthy
+      sentinel-3:
+        condition: service_healthy
+    command: uv run pytest tests/test_sentinel.py

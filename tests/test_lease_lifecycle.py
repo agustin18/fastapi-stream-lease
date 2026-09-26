@@ -966,6 +966,10 @@ async def test_verify_cluster_config_registration_and_mismatch(fake_redis):
     with pytest.raises(StreamLeaseUnavailable):
         await mgr_err.verify_cluster_config(strict=True)
 
+    fake_redis.set = AsyncMock(side_effect=RuntimeError("Unexpected error"))
+    with pytest.raises(RuntimeError, match="Unexpected error"):
+        await mgr_err.verify_cluster_config(strict=False)
+
     fake_redis.set = orig_set
 
     # 6. Config mismatch on fail_open

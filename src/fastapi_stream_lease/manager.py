@@ -359,9 +359,9 @@ class StreamLeaseManager:
         fingerprint_json = json.dumps(fingerprint, sort_keys=True)
         config_key = self.config.config_key
 
-        try:
-            existing_data: dict[str, Any] | None = None
-            for _ in range(3):
+        existing_data: dict[str, Any] | None = None
+        for attempt in range(3):
+            try:
                 # Atomic canonical registration: only sets if key does not exist (NX=True), no TTL
                 registered = await self.redis.set(config_key, fingerprint_json, nx=True)
                 if registered:
@@ -373,53 +373,55 @@ class StreamLeaseManager:
                         existing = existing.decode("utf-8")
                     existing_data = json.loads(existing)
                     break
-
-            if existing_data is None:
-                msg = (
-                    f"Unable to establish or read canonical cluster configuration on '{config_key}'"
-                )
-                if strict:
-                    raise StreamLeaseUnavailable(
-                        detail=msg,
-                        retry_after=self.config.retry_after_seconds,
-                    )
-                logger.warning(msg)
-                return False
-
-            mismatches = {
-                k: (v, existing_data.get(k))
-                for k, v in fingerprint.items()
-                if existing_data.get(k) != v
-            }
-
-            if mismatches:
-                msg = (
-                    f"Cluster configuration mismatch on key '{config_key}': "
-                    f"worker has {fingerprint}, but cluster registered {existing_data}. "
-                    f"Mismatches: {mismatches}"
-                )
-                if strict:
-                    raise ConfigurationMismatchError(msg, existing_data, fingerprint)
-                logger.warning(msg)
-                return False
-
-            return True
-        except ConfigurationMismatchError:
-            raise
-        except Exception as exc:
-            if is_network_error(exc):
-                self.dispatcher.dispatch(self.config.on_backend_error, exc)
-                logger.warning(
-                    "Could not verify cluster configuration due to network error: %s",
+            except Exception as exc:
+                if is_network_error(exc):
+                    if attempt < 2:
+                        await asyncio.sleep(0.1)
+                        continue
+                    self.dispatcher.dispatch(self.config.on_backend_error, exc)
+                    if strict:
+                        raise StreamLeaseUnavailable(
+                            detail=(
+                                "Stream lease coordination backend is unavailable during "
+                                "cluster config verification"
+                            ),
+                            retry_after=self.config.retry_after_seconds,
+                        ) from exc
+                    logger.warning("Network error verifying cluster configuration: %s", exc)
+                    return False
+                logger.error(
+                    "Execution error verifying cluster configuration on %s: %s",
+                    config_key,
                     exc,
+                    exc_info=True,
                 )
-                if strict:
-                    raise StreamLeaseUnavailable(
-                        detail=(
-                            "Stream lease coordination backend is unavailable during "
-                            "cluster config verification"
-                        ),
-                        retry_after=self.config.retry_after_seconds,
-                    ) from exc
-                return False
-            raise
+                raise
+
+        if existing_data is None:
+            msg = f"Unable to establish or read canonical cluster configuration on '{config_key}'"
+            if strict:
+                raise StreamLeaseUnavailable(
+                    detail=msg,
+                    retry_after=self.config.retry_after_seconds,
+                )
+            logger.warning(msg)
+            return False
+
+        mismatches = {
+            k: (v, existing_data.get(k))
+            for k, v in fingerprint.items()
+            if existing_data.get(k) != v
+        }
+
+        if mismatches:
+            msg = (
+                f"Cluster configuration mismatch on key '{config_key}': "
+                f"worker has {fingerprint}, but cluster registered {existing_data}. "
+                f"Mismatches: {mismatches}"
+            )
+            if strict:
+                raise ConfigurationMismatchError(msg, existing_data, fingerprint)
+            logger.warning(msg)
+            return False
+
+        return True
