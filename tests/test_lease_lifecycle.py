@@ -484,6 +484,7 @@ def test_is_network_error_helper():
     assert is_network_error(ConnectionResetError("reset")) is True
     assert is_network_error(asyncio.TimeoutError()) is True
     assert is_network_error(OSError("os err")) is True
+    assert is_network_error(redis.exceptions.ReadOnlyError("READONLY replica")) is True
 
     # Excluded errors
     assert is_network_error(redis.exceptions.AuthenticationError("bad auth")) is False

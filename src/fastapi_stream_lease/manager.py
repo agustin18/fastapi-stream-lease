@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterable, AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
 from uuid import uuid4
@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 
 def is_network_error(exc: BaseException) -> bool:
-    """Return True if an exception represents a transient network or timeout condition."""
+    """Return True for transient network, timeout, or failover conditions."""
     if isinstance(
         exc,
         (
@@ -37,7 +37,14 @@ def is_network_error(exc: BaseException) -> bool:
         ),
     ):
         return False
-    if isinstance(exc, (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError)):
+    if isinstance(
+        exc,
+        (
+            redis.exceptions.ConnectionError,
+            redis.exceptions.TimeoutError,
+            getattr(redis.exceptions, "ReadOnlyError", ()),
+        ),
+    ):
         return True
     if isinstance(exc, (ConnectionError, TimeoutError, asyncio.TimeoutError, OSError)):
         return True
@@ -265,3 +272,41 @@ class StreamLeaseManager:
             if renew_task is not None:
                 await stream_lease._stop_auto_renew(renew_task)
             await stream_lease.release()
+
+    async def stream(
+        self,
+        user_id: str | int,
+        stream: AsyncIterable[Any],
+        media_type: str = "text/event-stream",
+        status_code: int = 200,
+        headers: dict[str, str] | None = None,
+        auto_renew: bool = True,
+        renew_interval: float | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        """
+        Acquire a lease and return a protected Starlette/FastAPI StreamingResponse.
+
+        Provides 1-line streaming integration:
+            @app.get("/stream")
+            async def stream_view(user_id: str = Depends(auth)):
+                return await manager.stream(user_id, token_generator())
+
+        If lease acquisition fails (e.g. 429 Too Many Requests or 503 Unavailable),
+        an exception is raised immediately. If stream setup fails before returning,
+        the acquired lease is safely released to prevent lingering ghost leases.
+        """
+        lease = await self.acquire(user_id)
+        try:
+            return lease.as_streaming_response(
+                stream,
+                media_type=media_type,
+                status_code=status_code,
+                headers=headers,
+                auto_renew=auto_renew,
+                renew_interval=renew_interval,
+                **kwargs,
+            )
+        except Exception:
+            await lease.release()
+            raise
