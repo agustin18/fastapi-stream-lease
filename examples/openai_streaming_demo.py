@@ -1,0 +1,112 @@
+"""
+OpenAI & LLM Token Streaming Demo with fastapi-stream-lease
+
+Demonstrates protecting an AI chat streaming endpoint with 1-line lease management:
+- Strictly limits concurrent AI generation streams per user.
+- Automatically releases leases on completion, abort, or network disconnect.
+- Protects LLM token generation budget from multi-tab abuse or runaway scrapers.
+
+Run with:
+    STREAM_DEMO_TOKEN=secret python -m uvicorn examples.openai_streaming_demo:app --port 8000
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hmac
+import os
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+
+import redis.asyncio as redis
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.security import APIKeyHeader
+
+from fastapi_stream_lease import (
+    LeaseConfig,
+    StreamLeaseManager,
+    StreamLeaseRejected,
+    StreamLeaseUnavailable,
+)
+
+api_key_header = APIKeyHeader(name="X-API-Key")
+redis_client = redis.from_url(
+    os.environ.get("REDIS_URL", "redis://localhost:6379/0"),
+    socket_timeout=2.0,
+    socket_connect_timeout=2.0,
+)
+manager = StreamLeaseManager(
+    redis_client,
+    LeaseConfig(
+        max_per_user=1,  # Strictly allow only 1 active LLM generation stream per user
+        max_global=100,  # Cluster-wide safeguard against total LLM capacity exhaustion
+        lease_seconds=30.0,
+    ),
+)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    yield
+    await redis_client.aclose()
+
+
+app = FastAPI(title="LLM Streaming Protection Demo", lifespan=lifespan)
+
+
+async def authenticated_user(api_key: str = Depends(api_key_header)) -> str:
+    expected = os.environ.get("STREAM_DEMO_TOKEN", "local-secret")
+    if not hmac.compare_digest(api_key, expected):
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    return "user-enterprise-1"
+
+
+@app.exception_handler(StreamLeaseRejected)
+async def rejected_handler(request: Request, exc: StreamLeaseRejected):
+    return exc.as_response()
+
+
+@app.exception_handler(StreamLeaseUnavailable)
+async def unavailable_handler(request: Request, exc: StreamLeaseUnavailable):
+    return exc.as_response()
+
+
+async def mock_llm_token_stream(prompt: str) -> AsyncIterator[str]:
+    """Simulates an OpenAI / Anthropic / Ollama streaming completion."""
+    tokens = [
+        "Hello",
+        "!",
+        " I",
+        " am",
+        " your",
+        " AI",
+        " assistant",
+        ".",
+        " This",
+        " stream",
+        " is",
+        " concurrency",
+        "-managed",
+        " by",
+        " Redis",
+        " leases",
+        ".\n\n",
+    ]
+    for token in tokens:
+        yield f"data: {token}\n\n"
+        await asyncio.sleep(0.08)
+
+
+@app.get("/v1/chat/stream")
+async def chat_stream(prompt: str = "Hello", user_id: str = Depends(authenticated_user)):
+    """
+    Protected LLM chat completion endpoint.
+
+    Uses `await manager.stream(...)` to acquire the lease, wrap the generator,
+    and return an SSE StreamingResponse in a single, safe call.
+    """
+    return await manager.stream(
+        user_id=user_id,
+        stream=mock_llm_token_stream(prompt),
+        media_type="text/event-stream",
+    )

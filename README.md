@@ -86,13 +86,15 @@ async def unavailable(request: Request, exc: StreamLeaseUnavailable):
 
 @app.get("/stream")
 async def stream(user_id: str = Depends(authenticated_user_id)):
-    lease = await manager.acquire(user_id)
-
     async def events():
-        yield "data: first event\n\n"
-        # Yield tokens or events here...
+        yield "data: token or event\n\n"
 
-    return StreamingResponse(lease.wrap(events()), media_type="text/event-stream")
+    # 1-Line Protected StreamingResponse (auto-acquires, wraps, and cleans up on errors)
+    return await manager.stream(user_id, events())
+
+    # Or manually acquire and convert:
+    # lease = await manager.acquire(user_id)
+    # return lease.as_streaming_response(events())
 ```
 
 Close the Redis client in your application's lifespan shutdown handler. Reuse the same `StreamLeaseManager` and `key_prefix` across workers that share limits. `max_per_user=0` or `max_global=0` disables that limit; the global count is unavailable when global tracking is disabled.
@@ -134,7 +136,16 @@ The manager context and `async with lease` both renew while open. Handle normal 
       on_backend_error=lambda exc: PROMETHEUS_BACKEND_ERRORS.inc(),
   )
   ```
+- **Redis Failover & Sentinel Support:** Automatically classifies `ReadOnlyError` (thrown when hitting a replica during master election) as a transient condition, enabling adaptive renewal retries to ride out failovers without dropping active streams.
 - **Redis Cluster:** All keys use Redis hash tags (`{prefix}:user:...` and `{prefix}:global`), guaranteeing user and global sorted sets reside on the same hash slot for multi-key atomic Lua operations. As with any multi-key Lua coordination, evaluate slot contention and failover behavior under your specific topology.
+
+## Examples directory
+
+- [`examples/sse_demo.py`](examples/sse_demo.py): Server-Sent Events with API key authentication.
+- [`examples/websocket_demo.py`](examples/websocket_demo.py): WebSocket streams with standard close codes (`1008 Policy Violation`, `1013 Try Again Later`).
+- [`examples/openai_streaming_demo.py`](examples/openai_streaming_demo.py): LLM token streaming (OpenAI / Claude / Ollama) with 1-line stream protection.
+- [`examples/prometheus_metrics_demo.py`](examples/prometheus_metrics_demo.py): Prometheus metrics integration with zero-dependency lifecycle hooks.
+- [`examples/sse_client_resilient.py`](examples/sse_client_resilient.py): Resilient Python SSE client with exponential backoff & jitter.
 
 ## Contributing and security
 
