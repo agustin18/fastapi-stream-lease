@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from collections.abc import AsyncIterator
@@ -8,7 +9,7 @@ from typing import Any
 from uuid import uuid4
 
 from fastapi_stream_lease.config import LeaseConfig
-from fastapi_stream_lease.exceptions import StreamLeaseRejected
+from fastapi_stream_lease.exceptions import StreamLeaseLost, StreamLeaseRejected
 from fastapi_stream_lease.lease import StreamLease
 from fastapi_stream_lease.lua import (
     ACQUIRE_SCRIPT,
@@ -40,16 +41,12 @@ class StreamLeaseManager:
         lease_id = uuid4().hex
         user_key = self.config.user_key(user_id)
         global_key = self.config.global_key
-        now = time.time()
-        expires = now + self.config.lease_seconds
-
         result = await self.redis.eval(
             ACQUIRE_SCRIPT,
             2,
             user_key,
             global_key,
-            now,
-            expires,
+            self.config.lease_seconds,
             lease_id,
             self.config.max_per_user,
             self.config.max_global,
@@ -70,7 +67,7 @@ class StreamLeaseManager:
             user_key=user_key,
             global_key=global_key,
             manager=self,
-            created_at=now,
+            created_at=time.time(),
         )
 
     async def renew(self, lease: StreamLease) -> bool:
@@ -81,7 +78,6 @@ class StreamLeaseManager:
             bool: True if successfully extended, False if the lease expired, was evicted,
                   or if a Redis error occurred.
         """
-        new_expires = time.time() + self.config.lease_seconds
         check_global = 1 if self.config.max_global > 0 else 0
         try:
             result = await self.redis.eval(
@@ -90,7 +86,7 @@ class StreamLeaseManager:
                 lease.user_key,
                 lease.global_key,
                 lease.lease_id,
-                new_expires,
+                self.config.lease_seconds,
                 self.config.redis_ttl,
                 check_global,
             )
@@ -121,8 +117,7 @@ class StreamLeaseManager:
         target_key = (
             self.config.user_key(user_id) if user_id is not None else self.config.global_key
         )
-        now = time.time()
-        count = await self.redis.eval(COUNT_SCRIPT, 1, target_key, now)
+        count = await self.redis.eval(COUNT_SCRIPT, 1, target_key)
         return int(count)
 
     @asynccontextmanager
@@ -141,7 +136,16 @@ class StreamLeaseManager:
                     ...
         """
         stream_lease = await self.acquire(user_id)
+        renew_task: asyncio.Task[None] | None = None
+        lease_lost = asyncio.Event()
         try:
+            renew_task, lease_lost = stream_lease._start_auto_renew()
             yield stream_lease
+        except asyncio.CancelledError:
+            if lease_lost.is_set():
+                raise StreamLeaseLost(stream_lease.lease_id) from None
+            raise
         finally:
+            if renew_task is not None:
+                await stream_lease._stop_auto_renew(renew_task)
             await stream_lease.release()

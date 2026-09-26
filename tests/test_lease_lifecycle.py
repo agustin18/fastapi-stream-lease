@@ -5,6 +5,8 @@ from contextlib import aclosing
 
 import pytest
 
+from fastapi_stream_lease import StreamLeaseLost
+
 
 @pytest.mark.asyncio
 async def test_context_manager_lifecycle(lease_manager):
@@ -124,10 +126,11 @@ async def test_wrap_stream_auto_renew_lost_lease(lease_manager, fake_redis):
     await fake_redis.flushall()
 
     chunks = []
-    async for chunk in lease.wrap(lingering_generator(), auto_renew=True, renew_interval=0.05):
-        chunks.append(chunk)
+    with pytest.raises(StreamLeaseLost):
+        async for chunk in lease.wrap(lingering_generator(), auto_renew=True, renew_interval=0.05):
+            chunks.append(chunk)
 
-    assert chunks == ["start", "end"]
+    assert chunks == ["start"]
 
 
 @pytest.mark.asyncio
@@ -143,17 +146,32 @@ async def test_stream_lease_as_context_manager(lease_manager):
 
 
 @pytest.mark.asyncio
-async def test_wrap_renew_interval_large_warning(lease_manager, caplog):
+async def test_wrap_rejects_invalid_renew_interval_and_releases(lease_manager):
     async def quick_generator():
         yield "data"
 
     lease = await lease_manager.acquire("user_warn")
-    import logging
+    with pytest.raises(ValueError, match="renew_interval"):
+        async for _chunk in lease.wrap(quick_generator(), renew_interval=10.0):
+            pass
 
-    with caplog.at_level(logging.WARNING):
-        chunks = []
-        async for chunk in lease.wrap(quick_generator(), auto_renew=False, renew_interval=10.0):
-            chunks.append(chunk)
+    assert await lease_manager.get_active_count("user_warn") == 0
 
-    assert chunks == ["data"]
-    assert any("renew_interval" in r.message for r in caplog.records)
+
+@pytest.mark.asyncio
+async def test_context_manager_renews_long_lived_connection(lease_manager):
+    async with lease_manager.lease("websocket"):
+        await asyncio.sleep(2.4)
+        assert await lease_manager.get_active_count("websocket") == 1
+
+    assert await lease_manager.get_active_count("websocket") == 0
+
+
+@pytest.mark.asyncio
+async def test_context_manager_interrupts_after_lease_loss(lease_manager, fake_redis):
+    with pytest.raises(StreamLeaseLost):
+        async with lease_manager.lease("websocket"):
+            await fake_redis.flushall()
+            await asyncio.sleep(2.0)
+
+    assert await lease_manager.get_active_count("websocket") == 0

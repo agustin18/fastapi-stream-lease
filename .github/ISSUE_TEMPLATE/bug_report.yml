@@ -1,0 +1,26 @@
+name: Bug report
+description: Report incorrect lease or integration behavior
+body:
+  - type: markdown
+    attributes:
+      value: For security vulnerabilities, use the private reporting link in SECURITY.md.
+  - type: input
+    id: version
+    attributes:
+      label: Package version
+      placeholder: 0.1.1
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Python, Redis, and framework versions
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction and expected behavior
+      description: Share a small code example and what happened. Remove credentials first.
+    validations:
+      required: true
