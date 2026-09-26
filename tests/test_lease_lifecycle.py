@@ -122,10 +122,8 @@ async def test_wrap_stream_auto_renew_lost_lease(lease_manager, fake_redis):
         yield "end"
 
     lease = await lease_manager.acquire("user_1")
-    # Simulate deadline expiring soon so retries exhaust grace period
-    lease.expires_at = time.time() + 0.05
 
-    # Wipe redis so renewal fails during stream
+    # Wipe redis so renewal returns 0 (lease expired/evicted) during stream
     await fake_redis.flushall()
 
     chunks = []
@@ -267,21 +265,86 @@ async def test_auto_renew_grace_period_recovers_from_transient_redis_outage(
 async def test_acquire_fail_open_and_closed(fake_redis):
     from unittest.mock import AsyncMock
 
+    import redis.exceptions
+
     from fastapi_stream_lease import LeaseConfig, StreamLeaseManager, StreamLeaseUnavailable
 
-    # Fail-closed (default)
+    # Fail-closed (default) with network error
     mgr_closed = StreamLeaseManager(fake_redis, LeaseConfig(fail_open=False))
     mgr_closed.redis.eval = AsyncMock(side_effect=ConnectionError("Redis down"))
-    with pytest.raises(StreamLeaseUnavailable):
+    with pytest.raises(StreamLeaseUnavailable) as exc_info:
         await mgr_closed.acquire("user_err")
+    assert "temporarily unavailable" in exc_info.value.detail
+    # Verify no raw socket exception leakage in detail
+    assert "Redis down" not in exc_info.value.detail
 
-    # Fail-open
+    # Fail-open with network error
     mgr_open = StreamLeaseManager(fake_redis, LeaseConfig(fail_open=True))
     mgr_open.redis.eval = AsyncMock(side_effect=ConnectionError("Redis down"))
     fallback_lease = await mgr_open.acquire("user_fallback")
     assert fallback_lease._is_fallback is True
     assert await fallback_lease.renew() is True
     await fallback_lease.release()
+
+    # Fail-open MUST NOT swallow auth, permission, or script execution errors
+    mgr_open.redis.eval = AsyncMock(side_effect=redis.exceptions.AuthenticationError("Bad pass"))
+    with pytest.raises(redis.exceptions.AuthenticationError):
+        await mgr_open.acquire("user_auth_err")
+
+    mgr_open.redis.eval = AsyncMock(side_effect=redis.exceptions.ResponseError("WRONGTYPE"))
+    with pytest.raises(redis.exceptions.ResponseError):
+        await mgr_open.acquire("user_type_err")
+
+
+@pytest.mark.asyncio
+async def test_wrap_stream_auto_renew_grace_period_exhausted(lease_manager):
+    from unittest.mock import AsyncMock
+
+    async def slow_generator():
+        yield "start"
+        await asyncio.sleep(0.25)
+        yield "end"
+
+    lease = await lease_manager.acquire("user_gp")
+    # Simulate deadline expiring very shortly so grace period retries exhaust remaining window
+    lease.expires_at = time.monotonic() + 0.05
+    lease_manager.redis.eval = AsyncMock(side_effect=ConnectionError("Redis down"))
+
+    chunks = []
+    with pytest.raises(StreamLeaseLost):
+        async for chunk in lease.wrap(slow_generator(), auto_renew=True, renew_interval=0.04):
+            chunks.append(chunk)
+
+    assert chunks == ["start"]
+
+
+@pytest.mark.asyncio
+async def test_manager_network_errors_in_renew_and_count(lease_manager):
+    from unittest.mock import AsyncMock
+
+    from fastapi_stream_lease import StreamLeaseUnavailable
+
+    lease = await lease_manager.acquire("err_user")
+    lease_manager.redis.eval = AsyncMock(side_effect=ConnectionError("Redis connection lost"))
+
+    with pytest.raises(StreamLeaseUnavailable):
+        await lease.renew()
+
+    with pytest.raises(StreamLeaseUnavailable):
+        await lease_manager.get_active_count("err_user")
+
+
+@pytest.mark.asyncio
+async def test_monotonic_deadline_tracking(lease_manager):
+    lease = await lease_manager.acquire("mono_user")
+    assert lease.expires_at > time.monotonic()
+    initial_expires = lease.expires_at
+
+    await asyncio.sleep(0.05)
+    renewed = await lease.renew()
+    assert renewed is True
+    assert lease.expires_at > initial_expires
+    await lease.release()
 
 
 @pytest.mark.asyncio
@@ -381,3 +444,57 @@ async def test_worker_not_started_if_already_released(lease_manager):
     await asyncio.sleep(0.01)
     assert task.done()
     await lease.release()
+
+
+@pytest.mark.asyncio
+async def test_manager_non_network_errors_in_renew_release_and_count(lease_manager):
+    from unittest.mock import AsyncMock
+
+    import redis.exceptions
+
+    lease = await lease_manager.acquire("err_user_non_net")
+
+    # Non-network error in renew raises ResponseError
+    lease_manager.redis.eval = AsyncMock(side_effect=redis.exceptions.ResponseError("WRONGTYPE"))
+    with pytest.raises(redis.exceptions.ResponseError):
+        await lease.renew()
+
+    # Non-network error in release logs error but does not re-raise
+    await lease.release()
+
+    # Non-network error in get_active_count raises ResponseError
+    with pytest.raises(redis.exceptions.ResponseError):
+        await lease_manager.get_active_count("err_user_non_net")
+
+
+def test_is_network_error_helper():
+    import redis.exceptions
+
+    from fastapi_stream_lease.manager import is_network_error
+
+    assert is_network_error(redis.exceptions.ConnectionError("down")) is True
+    assert is_network_error(redis.exceptions.TimeoutError("timed out")) is True
+    assert is_network_error(ConnectionResetError("reset")) is True
+    assert is_network_error(asyncio.TimeoutError()) is True
+    assert is_network_error(OSError("os err")) is True
+
+    # Excluded errors
+    assert is_network_error(redis.exceptions.AuthenticationError("bad auth")) is False
+    assert is_network_error(redis.exceptions.AuthorizationError("no perm")) is False
+    assert is_network_error(redis.exceptions.ResponseError("syntax")) is False
+    assert is_network_error(ValueError("bad value")) is False
+
+
+def test_safe_uncancel_edge_cases(monkeypatch):
+    from fastapi_stream_lease.lease import _safe_uncancel
+
+    # Test when task is None
+    monkeypatch.setattr(asyncio, "current_task", lambda: None)
+    _safe_uncancel()
+
+    # Test when task has no uncancel method (Python 3.10)
+    class DummyTask:
+        pass
+
+    monkeypatch.setattr(asyncio, "current_task", lambda: DummyTask())
+    _safe_uncancel()

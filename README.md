@@ -48,10 +48,20 @@ from fastapi import Depends, FastAPI, Request
 from fastapi.responses import StreamingResponse
 import redis.asyncio as redis
 
-from fastapi_stream_lease import LeaseConfig, StreamLeaseManager, StreamLeaseRejected
+from fastapi_stream_lease import (
+    LeaseConfig,
+    StreamLeaseManager,
+    StreamLeaseRejected,
+    StreamLeaseUnavailable,
+)
 
 app = FastAPI()
-redis_client = redis.from_url("redis://localhost:6379")
+# Set explicit timeouts so slow Redis calls do not block worker threads
+redis_client = redis.from_url(
+    "redis://localhost:6379",
+    socket_timeout=1.0,
+    socket_connect_timeout=1.0,
+)
 manager = StreamLeaseManager(
     redis_client,
     LeaseConfig(max_per_user=2, max_global=500, lease_seconds=30),
@@ -59,12 +69,18 @@ manager = StreamLeaseManager(
 
 
 async def authenticated_user_id() -> str:
-    # Replace this function with your existing authentication dependency.
-    raise NotImplementedError
+    # Illustrative placeholder: replace with your auth dependency (e.g. API key or JWT sub).
+    # For fully runnable code, see examples/sse_demo.py and examples/websocket_demo.py.
+    return "user-123"
 
 
 @app.exception_handler(StreamLeaseRejected)
 async def rejected(request: Request, exc: StreamLeaseRejected):
+    return exc.as_response()
+
+
+@app.exception_handler(StreamLeaseUnavailable)
+async def unavailable(request: Request, exc: StreamLeaseUnavailable):
     return exc.as_response()
 
 
@@ -74,7 +90,7 @@ async def stream(user_id: str = Depends(authenticated_user_id)):
 
     async def events():
         yield "data: first event\n\n"
-        # Yield more events here.
+        # Yield tokens or events here...
 
     return StreamingResponse(lease.wrap(events()), media_type="text/event-stream")
 ```
@@ -100,6 +116,20 @@ The manager context and `async with lease` both renew while open. Handle normal 
 - Normal completion or cancellation attempts immediate release. If Redis is unavailable during release, the lease is removed after expiration; cleanup of the key itself uses a longer TTL. An async iterator abandoned without being closed may also hold its slot until expiration. Use `contextlib.aclosing()` if your own consumer stops iteration early.
 - `get_active_count(user_id)` counts active leases for one identity; `get_active_count()` counts globally when `max_global` is enabled. Neither is a historical usage metric.
 - All workers sharing limits must use the same key prefix and compatible limit settings. Lease expiration is measured by Redis, avoiding clock differences among application workers.
+
+## Production and Operational Guide
+
+- **Redis Client Timeouts:** Always configure explicit timeouts on your Redis client (e.g. `socket_timeout=1.0, socket_connect_timeout=1.0`). Without timeouts, an unreachable Redis instance can block asyncio event loop execution indefinitely.
+- **Fail-Open vs. Fail-Closed Strategy:**
+  - `fail_open=False` (Default): Raises `StreamLeaseUnavailable` (HTTP 503) when Redis is down. Ensures concurrency limits are strictly enforced under all conditions, at the cost of service availability during infrastructure outages.
+  - `fail_open=True`: Automatically grants in-memory fallback leases when Redis encounters network or timeout errors. Keeps streaming endpoints open to users during outages, with the operational cost that limits are not coordinated across workers until Redis recovers. Authentication, authorization, and script syntax errors never fail open.
+- **Definitive Revocation vs. Network Errors:** If Redis explicitly reports that a lease is missing or expired (`renew()` returning 0), `wrap()` and `lease()` cancel the stream immediately to prevent exceeding limits. Transient network disconnects trigger rapid retries until the monotonic lease deadline is reached.
+- **Recommended Observability Metrics:**
+  - `stream_leases_active` (Gauge): Current concurrent streams per worker.
+  - `stream_lease_rejected_total` (Counter): Concurrency rejections (HTTP 429).
+  - `stream_lease_unavailable_total` (Counter): Redis backend outage errors (HTTP 503).
+  - `stream_lease_lost_total` (Counter): Streams terminated mid-flight due to lease expiration or revocation.
+- **Redis Cluster:** All keys use Redis hash tags (`{prefix}:user:...` and `{prefix}:global`), guaranteeing user and global sorted sets reside on the same hash slot. As with any multi-key Lua script, test failover behavior in staging under your specific Cluster topology.
 
 ## Contributing and security
 

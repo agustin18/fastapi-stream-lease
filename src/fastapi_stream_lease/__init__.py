@@ -10,7 +10,7 @@ from fastapi_stream_lease.exceptions import (
 from fastapi_stream_lease.lease import StreamLease
 from fastapi_stream_lease.manager import StreamLeaseManager
 
-__version__ = "0.1.2"
+__version__ = "0.1.3"
 
 __all__ = [
     "LeaseConfig",

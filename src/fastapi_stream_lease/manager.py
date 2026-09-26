@@ -8,13 +8,15 @@ from contextlib import asynccontextmanager
 from typing import Any
 from uuid import uuid4
 
+import redis.exceptions
+
 from fastapi_stream_lease.config import LeaseConfig
 from fastapi_stream_lease.exceptions import (
     StreamLeaseLost,
     StreamLeaseRejected,
     StreamLeaseUnavailable,
 )
-from fastapi_stream_lease.lease import StreamLease
+from fastapi_stream_lease.lease import StreamLease, _safe_uncancel
 from fastapi_stream_lease.lua import (
     ACQUIRE_SCRIPT,
     COUNT_SCRIPT,
@@ -23,6 +25,23 @@ from fastapi_stream_lease.lua import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def is_network_error(exc: BaseException) -> bool:
+    """Return True if an exception represents a transient network or timeout condition."""
+    if isinstance(
+        exc,
+        (
+            redis.exceptions.AuthenticationError,
+            getattr(redis.exceptions, "AuthorizationError", ()),
+        ),
+    ):
+        return False
+    if isinstance(exc, (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError)):
+        return True
+    if isinstance(exc, (ConnectionError, TimeoutError, asyncio.TimeoutError, OSError)):
+        return True
+    return False
 
 
 class StreamLeaseManager:
@@ -45,6 +64,7 @@ class StreamLeaseManager:
         lease_id = uuid4().hex
         user_key = self.config.user_key(user_id)
         global_key = self.config.global_key
+        start_monotonic = time.monotonic()
         try:
             result = await self.redis.eval(
                 ACQUIRE_SCRIPT,
@@ -58,23 +78,40 @@ class StreamLeaseManager:
                 self.config.redis_ttl,
             )
         except Exception as exc:
-            if self.config.fail_open:
+            if is_network_error(exc):
+                if self.config.fail_open:
+                    logger.warning(
+                        "Redis backend unavailable during acquire; "
+                        "fail_open=True allows fallback lease %s: %s",
+                        lease_id,
+                        exc,
+                    )
+                    lease = StreamLease(
+                        lease_id=lease_id,
+                        user_id=user_id,
+                        user_key=user_key,
+                        global_key=global_key,
+                        manager=self,
+                        created_at=time.time(),
+                        created_monotonic=start_monotonic,
+                    )
+                    lease._is_fallback = True
+                    return lease
                 logger.warning(
-                    "Redis backend unavailable during acquire; fail_open=True allows lease %s: %s",
-                    lease_id,
+                    "Redis backend unavailable during acquire for user %s: %s",
+                    user_id,
                     exc,
                 )
-                lease = StreamLease(
-                    lease_id=lease_id,
-                    user_id=user_id,
-                    user_key=user_key,
-                    global_key=global_key,
-                    manager=self,
-                    created_at=time.time(),
-                )
-                lease._is_fallback = True
-                return lease
-            raise StreamLeaseUnavailable(detail=f"Redis backend unavailable: {exc}") from exc
+                raise StreamLeaseUnavailable(
+                    detail="Stream lease coordination backend is temporarily unavailable"
+                ) from exc
+            logger.error(
+                "Execution error during stream lease acquire for user %s: %s",
+                user_id,
+                exc,
+                exc_info=True,
+            )
+            raise
 
         code = int(result)
         if code == 2:
@@ -91,6 +128,7 @@ class StreamLeaseManager:
             global_key=global_key,
             manager=self,
             created_at=time.time(),
+            created_monotonic=start_monotonic,
         )
 
     async def renew(self, lease: StreamLease) -> bool:
@@ -98,8 +136,9 @@ class StreamLeaseManager:
         Renew an active lease, extending its TTL in Redis.
 
         Returns:
-            bool: True if successfully extended, False if the lease expired, was evicted,
-                  or if a Redis error occurred.
+            bool: True if successfully extended, False if the lease expired or was evicted in Redis.
+        Raises:
+            StreamLeaseUnavailable: If the Redis backend is unreachable.
         """
         check_global = 1 if self.config.max_global > 0 else 0
         try:
@@ -115,8 +154,22 @@ class StreamLeaseManager:
             )
             return int(result) == 1
         except Exception as exc:
-            logger.warning("Failed to renew stream lease %s: %s", lease.lease_id, exc)
-            return False
+            if is_network_error(exc):
+                logger.warning(
+                    "Network error renewing stream lease %s: %s",
+                    lease.lease_id,
+                    exc,
+                )
+                raise StreamLeaseUnavailable(
+                    detail="Stream lease coordination backend is temporarily unavailable"
+                ) from exc
+            logger.error(
+                "Execution error renewing stream lease %s: %s",
+                lease.lease_id,
+                exc,
+                exc_info=True,
+            )
+            raise
 
     async def release(self, lease: StreamLease) -> None:
         """
@@ -131,7 +184,15 @@ class StreamLeaseManager:
                 lease.lease_id,
             )
         except Exception as exc:
-            logger.warning("Failed to release stream lease %s: %s", lease.lease_id, exc)
+            if is_network_error(exc):
+                logger.warning("Network error releasing stream lease %s: %s", lease.lease_id, exc)
+            else:
+                logger.error(
+                    "Execution error releasing stream lease %s: %s",
+                    lease.lease_id,
+                    exc,
+                    exc_info=True,
+                )
 
     async def get_active_count(self, user_id: str | int | None = None) -> int:
         """
@@ -140,8 +201,26 @@ class StreamLeaseManager:
         target_key = (
             self.config.user_key(user_id) if user_id is not None else self.config.global_key
         )
-        count = await self.redis.eval(COUNT_SCRIPT, 1, target_key)
-        return int(count)
+        try:
+            count = await self.redis.eval(COUNT_SCRIPT, 1, target_key)
+            return int(count)
+        except Exception as exc:
+            if is_network_error(exc):
+                logger.warning(
+                    "Network error querying active stream count for %s: %s",
+                    target_key,
+                    exc,
+                )
+                raise StreamLeaseUnavailable(
+                    detail="Stream lease coordination backend is temporarily unavailable"
+                ) from exc
+            logger.error(
+                "Execution error querying active stream count for %s: %s",
+                target_key,
+                exc,
+                exc_info=True,
+            )
+            raise
 
     @asynccontextmanager
     async def lease(self, user_id: str | int) -> AsyncIterator[StreamLease]:
@@ -166,6 +245,7 @@ class StreamLeaseManager:
             yield stream_lease
         except asyncio.CancelledError:
             if lease_lost.is_set():
+                _safe_uncancel()
                 raise StreamLeaseLost(stream_lease.lease_id) from None
             raise
         finally:

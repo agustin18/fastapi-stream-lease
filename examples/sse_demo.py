@@ -12,7 +12,12 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from fastapi.security import APIKeyHeader
 
-from fastapi_stream_lease import LeaseConfig, StreamLeaseManager, StreamLeaseRejected
+from fastapi_stream_lease import (
+    LeaseConfig,
+    StreamLeaseManager,
+    StreamLeaseRejected,
+    StreamLeaseUnavailable,
+)
 
 api_key_header = APIKeyHeader(name="X-API-Key")
 redis_client = redis.from_url(os.environ.get("REDIS_URL", "redis://localhost:6379/0"))
@@ -37,6 +42,11 @@ async def authenticated_user(api_key: str = Depends(api_key_header)) -> str:
 
 @app.exception_handler(StreamLeaseRejected)
 async def rejected(request: Request, exc: StreamLeaseRejected):
+    return exc.as_response()
+
+
+@app.exception_handler(StreamLeaseUnavailable)
+async def unavailable(request: Request, exc: StreamLeaseUnavailable):
     return exc.as_response()
 
 

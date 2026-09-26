@@ -10,7 +10,13 @@ from uuid import uuid4
 import pytest
 import redis.asyncio as redis
 
-from fastapi_stream_lease import LeaseConfig, StreamLeaseManager, StreamLeaseRejected
+from fastapi_stream_lease import (
+    LeaseConfig,
+    StreamLeaseLost,
+    StreamLeaseManager,
+    StreamLeaseRejected,
+    StreamLeaseUnavailable,
+)
 
 
 @pytest.fixture
@@ -127,3 +133,55 @@ asyncio.run(main())
         assert stdout.strip() == b"global_limit"
     finally:
         await asyncio.gather(*(lease.release() for lease in leases))
+
+
+@pytest.mark.asyncio
+async def test_real_redis_nonexistent_lease_renewal_returns_false(real_manager):
+    lease = await real_manager.acquire("phantom")
+    # Release early so the lease is permanently removed from Redis
+    await lease.release()
+    assert await lease.renew() is False
+    assert await real_manager.get_active_count("phantom") == 0
+
+
+@pytest.mark.asyncio
+async def test_real_redis_stream_auto_renew_lost_lease_terminates(real_manager):
+    async def lingering_stream():
+        yield "chunk_start"
+        await asyncio.sleep(0.4)
+        yield "chunk_never"
+
+    lease = await real_manager.acquire("victim")
+    # Wipe the lease directly in Redis so renewal returns 0
+    await real_manager.release(lease)
+
+    chunks = []
+    with pytest.raises(StreamLeaseLost):
+        async for chunk in lease.wrap(lingering_stream(), auto_renew=True, renew_interval=0.05):
+            chunks.append(chunk)
+
+    assert chunks == ["chunk_start"]
+
+
+@pytest.mark.asyncio
+async def test_real_redis_network_failure_fail_open_and_closed():
+    # Use an unroutable port with short timeout to simulate network outage
+    broken_client = redis.from_url(
+        "redis://127.0.0.1:65530/0",
+        socket_timeout=0.1,
+        socket_connect_timeout=0.1,
+    )
+    try:
+        # Fail-closed
+        mgr_closed = StreamLeaseManager(broken_client, LeaseConfig(fail_open=False))
+        with pytest.raises(StreamLeaseUnavailable):
+            await mgr_closed.acquire("unreachable_user")
+
+        # Fail-open
+        mgr_open = StreamLeaseManager(broken_client, LeaseConfig(fail_open=True))
+        fallback = await mgr_open.acquire("unreachable_user")
+        assert fallback._is_fallback is True
+        assert await fallback.renew() is True
+        await fallback.release()
+    finally:
+        await broken_client.aclose()
