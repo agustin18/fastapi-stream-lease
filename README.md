@@ -119,6 +119,26 @@ The manager context and `async with lease` both renew while open. Handle normal 
 - `get_active_count(user_id)` counts active leases for one identity; `get_active_count()` counts globally when `max_global` is enabled. Neither is a historical usage metric.
 - All workers sharing limits must use the same key prefix and compatible limit settings. Lease expiration is measured by Redis, avoiding clock differences among application workers.
 
+## Distributed Guarantees & Failure Model
+
+| Failure Mode | System Behavior | Guarantee Level | Operational Trade-off |
+|---|---|---|---|
+| **Worker Process Crash (`SIGKILL`)** | Lease expires in Redis after `lease_seconds` via Redis `TIME` score. Subsequent acquisitions automatically sweep expired members. | **Strong (Self-healing within $TTL$)** | Slot remains held until `lease_seconds` elapses; no zombie leases persist permanently. |
+| **Transient Redis Disconnect (Renewal)** | Renewal worker enters Adaptive Grace Period, retrying across the remaining TTL. If connection recovers before deadline, stream proceeds normally. | **High Availability** | If outage exceeds remaining TTL, lease is revoked, cancelling stream immediately. |
+| **Redis Outage on Acquire (`fail_open=False`)** | Immediate fail-closed rejection raising `StreamLeaseUnavailable` (`HTTP 503 Service Unavailable`). | **Strict Safety** | Limits strictly enforced; incoming streams rejected until Redis is reachable. |
+| **Redis Outage on Acquire (`fail_open=True`)** | Grants an uncoordinated in-memory fallback lease using worker monotonic clock (`time.monotonic()`). | **Graceful Degradation** | Limits are uncoordinated across workers during Redis outage; fallback leases do not retroactively register upon Redis recovery. |
+| **Worker Clock Drift** | All lease evaluations and expiration purges use `redis.call('TIME')`. | **Absolute** | Worker system clock or NTP skew cannot cause premature expiration or lingering leases. |
+| **Slow Observability / Metric Hooks** | All lifecycle hooks (`on_acquired`, `on_released`, `on_lost`, etc.) run out-of-band via background tasks. Stream cancellation executes immediately. | **Strong Guarantee** | Slow APM/Datadog/StatsD calls cannot delay stream termination or consume renewal retry windows. |
+| **Redis Sentinel Master Failover** | `ReadOnlyError` during replica write is classified as transient, triggering adaptive retry until promotion completes. | **High Availability** | Seamlessly rides out master elections shorter than remaining `lease_seconds`. |
+| **Redis Cluster Multi-Key Coordination** | Keys share hash tag `{prefix}` (`{prefix}:user:...` and `{prefix}:global`), guaranteeing identical slot placement. | **Atomic Lua Execution** | Atomically validates both per-user and global capacity in a single Redis round-trip without `CROSSSLOT` errors. |
+
+### Fail-Open Fallback Lease Lifecycle
+
+When `fail_open=True` is enabled in `LeaseConfig`, the manager grants fallback leases during Redis outages to maintain service availability:
+- **Local Time Basis:** Fallback leases use `time.monotonic()` locally and are isolated to the executing worker process.
+- **Uncoordinated Concurrency:** Concurrency limits cannot be enforced across multiple worker processes while Redis is unreachable.
+- **No Retroactive Registration:** Active fallback leases do not attempt retroactive registration into Redis when connectivity returns. They complete locally and release normally.
+
 ## Production and Operational Guide
 
 - **Redis Client Timeouts:** Always configure explicit timeouts on your Redis client (e.g. `socket_timeout=1.0, socket_connect_timeout=1.0`). Without timeouts, an unreachable Redis instance can block asyncio event loop execution indefinitely.
@@ -140,12 +160,16 @@ The manager context and `async with lease` both renew while open. Handle normal 
   `on_released` receives the release reason (`completed`, `cancelled`, `error`, `lost`, or `manual`), guaranteeing that active connection gauges decrement accurately across all stream terminations.
 - **Redis Failover & Sentinel Support:** Automatically classifies `ReadOnlyError` (thrown when hitting a replica during master election) as a transient condition, enabling adaptive renewal retries to ride out failovers without dropping active streams.
 - **Redis Cluster:** All keys use Redis hash tags (`{prefix}:user:...` and `{prefix}:global`), guaranteeing user and global sorted sets reside on the same hash slot for multi-key atomic Lua operations. As with any multi-key Lua coordination, evaluate slot contention and failover behavior under your specific topology.
+- **Docker Compose Testing Stack:** Run the test suite and Redis dependency cleanly across Linux, macOS, and Windows:
+  ```bash
+  docker compose run --rm backend uv run pytest
+  ```
 
 ## Examples directory
 
 - [`examples/sse_demo.py`](examples/sse_demo.py): Server-Sent Events with API key authentication.
 - [`examples/websocket_demo.py`](examples/websocket_demo.py): WebSocket streams with standard close codes (`1008 Policy Violation`, `1013 Try Again Later`).
-- [`examples/openai_streaming_demo.py`](examples/openai_streaming_demo.py): LLM token streaming (OpenAI / Claude / Ollama) with 1-line stream protection.
+- [`examples/openai_streaming_demo.py`](examples/openai_streaming_demo.py): LLM token streaming with official `openai` SDK and simulated fallback.
 - [`examples/prometheus_metrics_demo.py`](examples/prometheus_metrics_demo.py): Prometheus metrics integration with zero-dependency lifecycle hooks.
 - [`examples/sse_client_resilient.py`](examples/sse_client_resilient.py): Resilient Python SSE client with exponential backoff & jitter.
 
