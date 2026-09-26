@@ -53,7 +53,7 @@ async def test_fastapi_concurrency_limit_429(fastapi_app, lease_manager):
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         # Start 2 slow concurrent streams for user bob (max_per_user=2)
         async def fetch_stream():
-            res = await client.get("/stream/bob?count=5&delay=0.2")
+            res = await client.get("/stream/bob?count=5&delay=0.1")
             return res.status_code
 
         # Launch 2 background requests

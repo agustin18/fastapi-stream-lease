@@ -29,12 +29,28 @@ class StreamLease:
     manager: StreamLeaseManager
     created_at: float = field(default_factory=time.time)
     _is_released: bool = field(default=False, init=False)
+    _context_renew_task: asyncio.Task[None] | None = field(default=None, init=False, repr=False)
+    _context_lease_lost: asyncio.Event = field(
+        default_factory=asyncio.Event, init=False, repr=False
+    )
 
     async def __aenter__(self) -> StreamLease:
+        if self._is_released:
+            raise StreamLeaseLost(self.lease_id)
+        if self._context_renew_task is not None:
+            raise RuntimeError("A stream lease cannot enter the same context twice")
+        self._context_renew_task, self._context_lease_lost = self._start_auto_renew()
         return self
 
     async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-        await self.release()
+        try:
+            if self._context_lease_lost.is_set():
+                raise StreamLeaseLost(self.lease_id) from None
+        finally:
+            if self._context_renew_task is not None:
+                await self._stop_auto_renew(self._context_renew_task)
+                self._context_renew_task = None
+            await self.release()
 
     async def renew(self) -> bool:
         """Manually renew this lease, extending its TTL in Redis."""

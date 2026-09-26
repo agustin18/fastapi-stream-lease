@@ -12,6 +12,8 @@ Request rate limiters answer “how many requests arrived this minute?” This p
 
 Requires Python 3.10+ and Redis 5.0+.
 
+With Redis 5 and redis-py 8+, construct your client with `redis.from_url(url, protocol=2)`: redis-py 8 defaults to RESP3, which Redis 5 does not support. See the [redis-py protocol documentation](https://github.com/redis/redis-py#resp3-support).
+
 ```bash
 pip install 'fastapi-stream-lease[fastapi]'
 ```
@@ -88,7 +90,7 @@ async with manager.lease(user_id) as lease:
         await websocket.send_text(message)
 ```
 
-The context renews the lease while it is open. Handle normal WebSocket disconnects in your route as usual. If renewal fails or the lease expires, `StreamLeaseLost` interrupts the stream or context. Catch it at the application boundary if you want to record a metric or send an application-specific WebSocket close code.
+The manager context and `async with lease` both renew while open. Handle normal WebSocket disconnects in your route as usual. If renewal fails or the lease expires, `StreamLeaseLost` interrupts the stream or context. Catch it at the application boundary if you want to record a metric or send an application-specific WebSocket close code. `wrap(auto_renew=False)` disables automatic renewal; use it only if you renew the lease yourself.
 
 ## Behavior and limits
 
@@ -101,3 +103,5 @@ The context renews the lease while it is open. Handle normal WebSocket disconnec
 ## Contributing and security
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the local workflow and [SECURITY.md](SECURITY.md) for private vulnerability reports. Changes are proposed through pull requests and merged by the maintainer after CI passes. The package is licensed under [MIT](LICENSE).
+
+CI checks formatting, lint, types, Redis 5 and 7 behavior, package build, and a minimum of 95% combined line and branch coverage. This is a small beta project; reports from real deployments are especially helpful for documenting operational limits.

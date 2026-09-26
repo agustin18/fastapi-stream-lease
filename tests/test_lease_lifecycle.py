@@ -146,6 +146,58 @@ async def test_stream_lease_as_context_manager(lease_manager):
 
 
 @pytest.mark.asyncio
+async def test_direct_lease_context_renews(lease_manager):
+    lease = await lease_manager.acquire("direct_context")
+    async with lease:
+        await asyncio.sleep(2.4)
+        assert await lease_manager.get_active_count("direct_context") == 1
+
+    assert await lease_manager.get_active_count("direct_context") == 0
+
+
+@pytest.mark.asyncio
+async def test_direct_lease_context_stops_when_lost(lease_manager, fake_redis):
+    lease = await lease_manager.acquire("direct_context")
+    with pytest.raises(StreamLeaseLost):
+        async with lease:
+            await fake_redis.flushall()
+            await asyncio.sleep(2)
+
+    assert await lease_manager.get_active_count("direct_context") == 0
+
+
+@pytest.mark.asyncio
+async def test_direct_lease_context_rejects_reentry(lease_manager):
+    lease = await lease_manager.acquire("direct_context")
+    async with lease:
+        with pytest.raises(RuntimeError, match="cannot enter"):
+            async with lease:
+                pass
+
+    with pytest.raises(StreamLeaseLost):
+        async with lease:
+            pass
+
+
+@pytest.mark.asyncio
+async def test_direct_lease_context_releases_on_cancellation(lease_manager):
+    entered = asyncio.Event()
+
+    async def wait_inside_context():
+        lease = await lease_manager.acquire("direct_context")
+        async with lease:
+            entered.set()
+            await asyncio.sleep(10)
+
+    task = asyncio.create_task(wait_inside_context())
+    await entered.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert await lease_manager.get_active_count("direct_context") == 0
+
+
+@pytest.mark.asyncio
 async def test_wrap_rejects_invalid_renew_interval_and_releases(lease_manager):
     async def quick_generator():
         yield "data"
