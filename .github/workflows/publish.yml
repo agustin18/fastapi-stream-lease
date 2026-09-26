@@ -37,11 +37,19 @@ jobs:
           python - <<'PY'
           import os
           import pathlib
+          import sys
           import tomllib
 
           version = tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"]
           if os.environ["RELEASE_TAG"] != f"v{version}":
-              raise SystemExit("Release tag does not match pyproject.toml version")
+              raise SystemExit(f"Release tag ({os.environ['RELEASE_TAG']}) does not match pyproject.toml version (v{version})")
+
+          # Verify __init__.py __version__ matches pyproject.toml
+          sys.path.insert(0, "src")
+          import fastapi_stream_lease
+          if fastapi_stream_lease.__version__ != version:
+              raise SystemExit(f"Version mismatch: __init__.py ({fastapi_stream_lease.__version__}) != pyproject.toml ({version})")
+          print(f"Release tag and package __version__ verified for v{version}")
           PY
           git fetch origin main
           git merge-base --is-ancestor HEAD origin/main
