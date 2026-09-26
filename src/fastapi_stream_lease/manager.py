@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from collections.abc import AsyncIterable, AsyncIterator
@@ -13,6 +14,7 @@ import redis.exceptions
 from fastapi_stream_lease.config import LeaseConfig
 from fastapi_stream_lease.dispatcher import HookDispatcher
 from fastapi_stream_lease.exceptions import (
+    ConfigurationMismatchError,
     StreamLeaseLost,
     StreamLeaseRejected,
     StreamLeaseUnavailable,
@@ -332,4 +334,61 @@ class StreamLeaseManager:
             )
         except Exception:
             await lease.release(reason="error")
+            raise
+
+    async def verify_cluster_config(self, strict: bool = False) -> bool:
+        """
+        Verify that this worker's configuration matches cluster configuration in Redis.
+
+        If no configuration is registered yet, this worker's fingerprint is recorded.
+        If a mismatch is detected:
+          - If strict=True: raises ConfigurationMismatchError.
+          - If strict=False: logs a warning and returns False.
+
+        Returns:
+            bool: True if configuration matches or was registered; False on mismatch.
+        """
+        fingerprint = self.config.fingerprint_dict()
+        fingerprint_json = json.dumps(fingerprint, sort_keys=True)
+        config_key = self.config.config_key
+        ttl = max(int(self.config.redis_ttl), 86400)
+
+        try:
+            existing = await self.redis.get(config_key)
+            if existing is None:
+                await self.redis.set(config_key, fingerprint_json, ex=ttl)
+                return True
+
+            if isinstance(existing, bytes):
+                existing = existing.decode("utf-8")
+            existing_data = json.loads(existing)
+
+            mismatches = {
+                k: (v, existing_data.get(k))
+                for k, v in fingerprint.items()
+                if existing_data.get(k) != v
+            }
+
+            if mismatches:
+                msg = (
+                    f"Cluster configuration mismatch on key '{config_key}': "
+                    f"worker has {fingerprint}, but cluster registered {existing_data}. "
+                    f"Mismatches: {mismatches}"
+                )
+                if strict:
+                    raise ConfigurationMismatchError(msg, existing_data, fingerprint)
+                logger.warning(msg)
+                return False
+
+            return True
+        except ConfigurationMismatchError:
+            raise
+        except Exception as exc:
+            if is_network_error(exc):
+                self.dispatcher.dispatch(self.config.on_backend_error, exc)
+                logger.warning(
+                    "Could not verify cluster configuration due to network error: %s",
+                    exc,
+                )
+                return False
             raise

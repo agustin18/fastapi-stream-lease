@@ -97,3 +97,17 @@ class LeaseConfig:
     def redis_ttl(self) -> int:
         """TTL set on Redis keys to ensure dead keys self-clean (twice lease duration)."""
         return max(60, int(self.lease_seconds * 2))
+
+    @property
+    def config_key(self) -> str:
+        """Redis key for storing and verifying cluster configuration fingerprint."""
+        return f"{self._cluster_prefix}:config"
+
+    def fingerprint_dict(self) -> dict[str, Any]:
+        """Return critical cluster configuration parameters for consistency verification."""
+        return {
+            "key_prefix": self.key_prefix,
+            "max_per_user": self.max_per_user,
+            "max_global": self.max_global,
+            "lease_seconds": self.lease_seconds,
+        }
