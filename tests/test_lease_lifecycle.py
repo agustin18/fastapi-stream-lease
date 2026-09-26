@@ -952,8 +952,9 @@ async def test_verify_cluster_config_registration_and_mismatch(fake_redis):
         key_prefix="worker_err",
         on_backend_error=lambda e: errors.append(type(e).__name__),
     )
+    orig_set = fake_redis.set
     mgr_err = StreamLeaseManager(redis=fake_redis, config=cfg_err)
-    mgr_err.redis.set = AsyncMock(side_effect=ConnectionError("Redis down"))
+    fake_redis.set = AsyncMock(side_effect=ConnectionError("Redis down"))
 
     # non-strict: returns False
     assert await mgr_err.verify_cluster_config(strict=False) is False
@@ -963,6 +964,30 @@ async def test_verify_cluster_config_registration_and_mismatch(fake_redis):
     # strict: raises StreamLeaseUnavailable (fail-fast on k8s startup)
     with pytest.raises(StreamLeaseUnavailable):
         await mgr_err.verify_cluster_config(strict=True)
+
+    fake_redis.set = orig_set
+
+    # 6. Config mismatch on fail_open
+    cfg_fo_mismatch = LeaseConfig(
+        key_prefix="worker_test",
+        max_global=100,
+        max_per_user=2,
+        lease_seconds=10.0,
+        fail_open=True,
+    )
+    mgr_fo = StreamLeaseManager(redis=fake_redis, config=cfg_fo_mismatch)
+    assert await mgr_fo.verify_cluster_config(strict=False) is False
+    with pytest.raises(ConfigurationMismatchError) as exc_info_fo:
+        await mgr_fo.verify_cluster_config(strict=True)
+    assert "fail_open" in str(exc_info_fo.value)
+
+    # 7. Disappearing/unresolvable config key must NEVER return True
+    mgr_unresolvable = StreamLeaseManager(redis=fake_redis, config=cfg1)
+    mgr_unresolvable.redis.set = AsyncMock(return_value=None)
+    mgr_unresolvable.redis.get = AsyncMock(return_value=None)
+    assert await mgr_unresolvable.verify_cluster_config(strict=False) is False
+    with pytest.raises(StreamLeaseUnavailable):
+        await mgr_unresolvable.verify_cluster_config(strict=True)
 
 
 @pytest.mark.asyncio

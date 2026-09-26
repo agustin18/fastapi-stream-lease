@@ -360,24 +360,31 @@ class StreamLeaseManager:
         config_key = self.config.config_key
 
         try:
-            # Atomic canonical registration: only sets if key does not exist (NX=True), no TTL
-            registered = await self.redis.set(config_key, fingerprint_json, nx=True)
-            if registered:
-                return True
-
-            existing = await self.redis.get(config_key)
-            if existing is None:
-                # Key was flushed or disappeared in between; retry registration once
+            existing_data: dict[str, Any] | None = None
+            for _ in range(3):
+                # Atomic canonical registration: only sets if key does not exist (NX=True), no TTL
                 registered = await self.redis.set(config_key, fingerprint_json, nx=True)
                 if registered:
                     return True
-                existing = await self.redis.get(config_key)
-                if existing is None:
-                    return True
 
-            if isinstance(existing, bytes):
-                existing = existing.decode("utf-8")
-            existing_data = json.loads(existing)
+                existing = await self.redis.get(config_key)
+                if existing is not None:
+                    if isinstance(existing, bytes):
+                        existing = existing.decode("utf-8")
+                    existing_data = json.loads(existing)
+                    break
+
+            if existing_data is None:
+                msg = (
+                    f"Unable to establish or read canonical cluster configuration on '{config_key}'"
+                )
+                if strict:
+                    raise StreamLeaseUnavailable(
+                        detail=msg,
+                        retry_after=self.config.retry_after_seconds,
+                    )
+                logger.warning(msg)
+                return False
 
             mismatches = {
                 k: (v, existing_data.get(k))

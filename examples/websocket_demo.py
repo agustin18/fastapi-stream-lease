@@ -33,7 +33,11 @@ manager = StreamLeaseManager(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Verify cluster configuration consistency at startup
+    await manager.verify_cluster_config(strict=True)
     yield
+    # Gracefully drain background tasks and close Redis client
+    await manager.close(drain=True, timeout=5.0)
     await redis_client.aclose()
 
 

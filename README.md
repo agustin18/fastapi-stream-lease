@@ -174,7 +174,7 @@ When `fail_open=True` is enabled in `LeaseConfig`, the manager grants fallback l
   )
   ```
   - **Best-Effort Delivery:** Lifecycle callbacks are designed strictly for out-of-band telemetry and monitoring. If callbacks execute slower than event arrival and fill `hook_queue_size`, new events are dropped with a rate-limited log warning to preserve event-loop responsiveness. **Never rely on lifecycle hooks for financial billing, credit deduction, or security-critical audits.**
-  - `on_released` receives the release reason (`completed`, `cancelled`, `error`, `lost`, or `manual`), guaranteeing that active connection gauges decrement accurately across all stream terminations.
+  - `on_released` receives a deterministic termination reason when delivered (`completed`, `cancelled`, `error`, `lost`, or `manual`). Lifecycle hooks remain best-effort telemetry signals and should not be treated as an authoritative source of active lease state.
   - Dispatcher telemetry properties for operational monitoring: `manager.dispatcher.queued_count`, `manager.dispatcher.dropped_count`, `manager.dispatcher.error_count`, and `manager.dispatcher.queue_depth`.
   - On application shutdown, flush all pending telemetry events gracefully:
   ```python
@@ -187,6 +187,22 @@ When `fail_open=True` is enabled in `LeaseConfig`, the manager grants fallback l
   # When strict=True, network errors raise StreamLeaseUnavailable to fail-fast on pod startup.
   await manager.verify_cluster_config(strict=True)
   ```
+
+### Changing Cluster Configuration Safely
+
+Because `{prefix}:config` is persistent (stored with `SET ... NX` without TTL expiration) to prevent transient split-brain during normal rolling deployments, changing limit settings (e.g. updating `max_global`, `max_per_user`, `lease_seconds`, or `fail_open`) across an active cluster requires an intentional operational migration:
+
+1. **Option A: Prefix Versioning (Recommended for Zero-Downtime Blue/Green):**
+   Update your configuration's `key_prefix` (e.g. from `myapp:streams:v1` to `myapp:streams:v2`). New worker pods establish and register their new canonical configuration immediately under the new prefix, while old pods gracefully drain active leases under the old prefix.
+2. **Option B: Configuration Reset for In-Place Rolling Updates:**
+   If you need to keep the exact same prefix:
+   - Drain or stop existing worker instances.
+   - Wait for remaining active leases to naturally expire (or revoke them).
+   - Delete the canonical configuration key in Redis:
+     ```bash
+     redis-cli DEL "{my_prefix}:config"
+     ```
+   - Start the updated worker instances. The first new pod will atomically register the updated configuration fingerprint with `SET ... NX`, and subsequent pods will verify compatibility against it.
 - **Redis Failover & Sentinel Support:** Automatically classifies `ReadOnlyError` (thrown when hitting a replica during master election) as a transient condition, enabling adaptive renewal retries to ride out failovers without dropping active streams.
 - **Redis Cluster:** All keys use Redis hash tags (`{prefix}:user:...` and `{prefix}:global`), guaranteeing user and global sorted sets reside on the same hash slot for multi-key atomic Lua operations. As with any multi-key Lua coordination, evaluate slot contention and failover behavior under your specific topology.
 - **Reproducible Concurrency Benchmarks:**

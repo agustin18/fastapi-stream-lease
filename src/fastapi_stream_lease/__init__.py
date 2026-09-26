@@ -11,7 +11,7 @@ from fastapi_stream_lease.exceptions import (
 from fastapi_stream_lease.lease import StreamLease
 from fastapi_stream_lease.manager import StreamLeaseManager
 
-__version__ = "0.1.5"
+__version__ = "0.2.0b1"
 
 __all__ = [
     "ConfigurationMismatchError",

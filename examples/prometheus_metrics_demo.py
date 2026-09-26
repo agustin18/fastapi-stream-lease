@@ -4,6 +4,12 @@ Prometheus Observability Demo with fastapi-stream-lease
 Demonstrates wiring zero-dependency lifecycle hooks (`on_acquired`, `on_released`,
 `on_rejected`, `on_lost`, `on_backend_error`) into Prometheus counters and gauges.
 
+Note on telemetry guarantees:
+    Lifecycle hooks are executed asynchronously out-of-band via an internal bounded dispatcher.
+    They provide best-effort telemetry signals (useful for metric counters and latency tracking).
+    For authoritative active lease count across a cluster, query Redis directly via
+    `manager.get_active_count()`.
+
 Note on multi-worker deployments:
     This demo uses the default in-memory Prometheus registry reflecting streams on the
     current worker process. For multi-worker deployments (e.g. Gunicorn/Uvicorn with
@@ -96,7 +102,11 @@ manager = StreamLeaseManager(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Verify cluster configuration consistency at startup
+    await manager.verify_cluster_config(strict=True)
     yield
+    # Gracefully drain background hook tasks and close Redis client
+    await manager.close(drain=True, timeout=5.0)
     await redis_client.aclose()
 
 
