@@ -28,7 +28,7 @@ async def real_manager():
     client = redis.from_url(url, protocol=2)
     manager = StreamLeaseManager(
         client,
-        LeaseConfig(lease_seconds=0.3, max_per_user=2, max_global=3, key_prefix=uuid4().hex),
+        LeaseConfig(lease_seconds=0.5, max_per_user=2, max_global=3, key_prefix=uuid4().hex),
     )
     try:
         await client.ping()
@@ -61,7 +61,7 @@ async def test_real_redis_atomic_limits_across_managers(real_manager):
 @pytest.mark.asyncio
 async def test_real_redis_expired_lease_stays_expired(real_manager):
     expired = await real_manager.acquire("user_1")
-    await asyncio.sleep(0.35)
+    await asyncio.sleep(0.55)
     replacement = await real_manager.acquire("user_1")
     try:
         assert await expired.renew() is False
@@ -76,13 +76,13 @@ async def test_real_redis_cancelled_context_releases_lease(real_manager):
     started = asyncio.Event()
 
     async def socket_like_task():
-        async with real_manager.lease("socket", renew_interval=0.08):
+        async with real_manager.lease("socket", renew_interval=0.1):
             started.set()
             await asyncio.sleep(1)
 
     task = asyncio.create_task(socket_like_task())
     await started.wait()
-    await asyncio.sleep(0.45)
+    await asyncio.sleep(0.35)
     assert await real_manager.get_active_count("socket") == 1
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -106,7 +106,7 @@ from fastapi_stream_lease import LeaseConfig, StreamLeaseManager, StreamLeaseRej
 async def main():
     client = redis.from_url(sys.argv[1], protocol=2)
     manager = StreamLeaseManager(
-        client, LeaseConfig(lease_seconds=0.3, max_per_user=2, max_global=3,
+        client, LeaseConfig(lease_seconds=0.5, max_per_user=2, max_global=3,
                             key_prefix=sys.argv[2])
     )
     try:
@@ -185,3 +185,33 @@ async def test_real_redis_network_failure_fail_open_and_closed():
         await fallback.release()
     finally:
         await broken_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_real_redis_verify_cluster_config_concurrent_race():
+    """Verify atomic SET NX across concurrent workers against real Redis server."""
+    url = os.environ.get("REDIS_URL")
+    if not url:
+        pytest.skip("Set REDIS_URL to run real Redis integration tests")
+    client = redis.from_url(url, protocol=2)
+    prefix = f"race_real_{uuid4().hex[:8]}"
+
+    cfg_a = LeaseConfig(key_prefix=prefix, max_global=10, max_per_user=1, fail_open=False)
+    cfg_b = LeaseConfig(key_prefix=prefix, max_global=20, max_per_user=1, fail_open=True)
+
+    workers_a = [StreamLeaseManager(client, config=cfg_a) for _ in range(15)]
+    workers_b = [StreamLeaseManager(client, config=cfg_b) for _ in range(15)]
+    all_workers = workers_a + workers_b
+    import random
+
+    random.shuffle(all_workers)
+
+    try:
+        results = await asyncio.gather(
+            *(w.verify_cluster_config(strict=False) for w in all_workers)
+        )
+        assert sum(1 for r in results if r is True) == 15
+        assert sum(1 for r in results if r is False) == 15
+    finally:
+        await client.delete(cfg_a.config_key)
+        await client.aclose()

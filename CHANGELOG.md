@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.0b1 — 2026-09-26
+
+- **Asynchronous Bounded Hook Dispatcher (`HookDispatcher`)**: Decoupled all lifecycle telemetry hooks (`on_acquired`, `on_released`, `on_lost`, `on_rejected`, `on_backend_error`) into an isolated, bounded, out-of-band FIFO worker. Sync callbacks execute in threadpools via `asyncio.to_thread` without blocking the asyncio event loop or delaying stream cancellations. Telemetry queue overflow drops excess events gracefully with rate-limited logging.
+- **Immediate Task Cancellation on Lease Revocation**: Stream and WebSocket owner tasks are cancelled immediately upon lease loss or disconnect *prior* to enqueuing background telemetry hooks, guaranteeing zero-latency stream cut-offs.
+- **Atomic Cluster Configuration Consistency (`verify_cluster_config`)**: Added startup fingerprint verification using persistent atomic Redis `SET NX` (`{prefix}:config`), detecting limit drift across pods (including `max_global`, `max_per_user`, `lease_seconds`, and `fail_open`) without TTL expiration races. A 3-attempt retry loop safely verifies canonical state even under concurrent node initialization.
+- **Graceful Telemetry Drain (`manager.close`)**: Added `await manager.close(drain=True, timeout=5.0)` to allow applications to flush pending observability events before terminating worker processes or closing Redis connections.
+- **Standardized Lifespan Patterns in Examples**: Aligned all runnable examples (`sse_demo.py`, `websocket_demo.py`, `openai_streaming_demo.py`, `prometheus_metrics_demo.py`) with startup cluster verification and shutdown draining.
+- **Documented Safe Cluster Migration & Telemetry Semantics**: Added step-by-step guides for zero-downtime cluster configuration changes and documented the best-effort nature of out-of-band telemetry hooks.
+- **Hardened CI/CD Supply Chain**: Configured matrix testing across Python 3.10 through 3.14 on Redis 5, 7, and 8, with single-build artifact verification and PyPI publishing.
+
 ## 0.1.5 — 2026-09-26
 
 - **1-Line Protected Streaming Helper (`manager.stream`)**: Added `await manager.stream(user_id, generator)` and `lease.as_streaming_response(generator)` returning protected Starlette/FastAPI `StreamingResponse` objects in a single call with automatic error cleanup to prevent lingering ghost leases.

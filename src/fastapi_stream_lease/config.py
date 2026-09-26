@@ -111,4 +111,5 @@ class LeaseConfig:
             "max_per_user": self.max_per_user,
             "max_global": self.max_global,
             "lease_seconds": self.lease_seconds,
+            "fail_open": self.fail_open,
         }

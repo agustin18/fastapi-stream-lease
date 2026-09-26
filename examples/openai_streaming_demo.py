@@ -58,6 +58,8 @@ manager = StreamLeaseManager(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Verify cluster configuration consistency at startup
+    await manager.verify_cluster_config(strict=True)
     api_key = os.environ.get("OPENAI_API_KEY")
     client: Any = None
     if _HAS_OPENAI and api_key and AsyncOpenAI is not None:
@@ -67,6 +69,8 @@ async def lifespan(app: FastAPI):
     yield
     if client is not None:
         await client.close()
+    # Gracefully drain background tasks and close Redis client
+    await manager.close(drain=True, timeout=5.0)
     await redis_client.aclose()
 
 
