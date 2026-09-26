@@ -1,7 +1,8 @@
 services:
   redis:
     image: redis:7-alpine
-    network_mode: host
+    ports:
+      - "6379:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 2s
@@ -10,16 +11,22 @@ services:
 
   backend:
     build: .
-    network_mode: host
     volumes:
       - ./src:/app/src
       - ./tests:/app/tests
       - ./examples:/app/examples
       - ./pyproject.toml:/app/pyproject.toml
     environment:
-      - REDIS_URL=redis://127.0.0.1:6379/15
+      - REDIS_URL=redis://redis:6379/15
     depends_on:
       redis:
         condition: service_healthy
     command: uv run pytest
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 10.100.0.0/24
+
 

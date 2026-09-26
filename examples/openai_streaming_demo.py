@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import logging
 import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -22,6 +23,14 @@ import redis.asyncio as redis
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.security import APIKeyHeader
 
+try:
+    from openai import AsyncOpenAI
+
+    _HAS_OPENAI = True
+except ImportError:
+    AsyncOpenAI = None  # type: ignore[assignment,misc]
+    _HAS_OPENAI = False
+
 from fastapi_stream_lease import (
     LeaseConfig,
     StreamLeaseManager,
@@ -29,6 +38,7 @@ from fastapi_stream_lease import (
     StreamLeaseUnavailable,
 )
 
+logger = logging.getLogger("openai_streaming_demo")
 api_key_header = APIKeyHeader(name="X-API-Key")
 redis_client = redis.from_url(
     os.environ.get("REDIS_URL", "redis://localhost:6379/0"),
@@ -71,8 +81,29 @@ async def unavailable_handler(request: Request, exc: StreamLeaseUnavailable):
     return exc.as_response()
 
 
-async def mock_llm_token_stream(prompt: str) -> AsyncIterator[str]:
-    """Simulates an OpenAI / Anthropic / Ollama streaming completion."""
+async def llm_token_stream(prompt: str) -> AsyncIterator[str]:
+    """Streams LLM tokens using the official OpenAI SDK when OPENAI_API_KEY is present,
+
+    or falls back to a simulated token stream if unconfigured.
+    """
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if _HAS_OPENAI and api_key and AsyncOpenAI is not None:
+        client = AsyncOpenAI(api_key=api_key)
+        model = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+        response = await client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            stream=True,
+        )
+        async for chunk in response:
+            content = chunk.choices[0].delta.content or ""
+            if content:
+                yield f"data: {content}\n\n"
+        yield "data: [DONE]\n\n"
+        return
+
+    # Fallback simulation when openai package or OPENAI_API_KEY is not configured
+    logger.info("OPENAI_API_KEY not detected; running simulated token stream")
     tokens = [
         "Hello",
         "!",
@@ -107,6 +138,6 @@ async def chat_stream(prompt: str = "Hello", user_id: str = Depends(authenticate
     """
     return await manager.stream(
         user_id=user_id,
-        stream=mock_llm_token_stream(prompt),
+        stream=llm_token_stream(prompt),
         media_type="text/event-stream",
     )
