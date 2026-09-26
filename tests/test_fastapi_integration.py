@@ -107,3 +107,29 @@ def test_stream_lease_missing_starlette_raises_runtime_error(monkeypatch):
     monkeypatch.setitem(sys.modules, "starlette.exceptions", None)
     with pytest.raises(RuntimeError, match="FastAPI or Starlette must be installed"):
         exc.as_http_exception()
+
+
+def test_stream_lease_unavailable_methods(monkeypatch):
+    import sys
+
+    from fastapi_stream_lease import StreamLeaseUnavailable
+
+    exc = StreamLeaseUnavailable(retry_after=7, detail="Redis down")
+    assert str(exc) == "Redis down"
+
+    resp = exc.as_response()
+    assert resp.status_code == 503
+    assert resp.headers["Retry-After"] == "7"
+
+    http_exc = exc.as_http_exception()
+    assert http_exc.status_code == 503
+    assert http_exc.headers["Retry-After"] == "7"
+    assert http_exc.detail == "Redis down"
+
+    monkeypatch.setitem(sys.modules, "starlette.responses", None)
+    with pytest.raises(RuntimeError, match="Starlette or FastAPI must be installed"):
+        exc.as_response()
+
+    monkeypatch.setitem(sys.modules, "starlette.exceptions", None)
+    with pytest.raises(RuntimeError, match="FastAPI or Starlette must be installed"):
+        exc.as_http_exception()

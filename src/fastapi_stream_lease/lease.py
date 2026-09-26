@@ -28,11 +28,16 @@ class StreamLease:
     global_key: str
     manager: StreamLeaseManager
     created_at: float = field(default_factory=time.time)
+    expires_at: float = field(init=False)
     _is_released: bool = field(default=False, init=False)
+    _is_fallback: bool = field(default=False, init=False)
     _context_renew_task: asyncio.Task[None] | None = field(default=None, init=False, repr=False)
     _context_lease_lost: asyncio.Event = field(
         default_factory=asyncio.Event, init=False, repr=False
     )
+
+    def __post_init__(self) -> None:
+        self.expires_at = self.created_at + self.manager.config.lease_seconds
 
     async def __aenter__(self) -> StreamLease:
         if self._is_released:
@@ -56,32 +61,68 @@ class StreamLease:
         """Manually renew this lease, extending its TTL in Redis."""
         if self._is_released:
             return False
-        return await self.manager.renew(self)
+        if self._is_fallback:
+            self.expires_at = time.time() + self.manager.config.lease_seconds
+            return True
+        success = await self.manager.renew(self)
+        if success:
+            self.expires_at = time.time() + self.manager.config.lease_seconds
+        return success
 
     async def release(self) -> None:
         """Explicitly release this lease from Redis."""
         if self._is_released:
             return
         self._is_released = True
-        await self.manager.release(self)
+        if not self._is_fallback:
+            await self.manager.release(self)
 
     def _start_auto_renew(
         self, interval: float | None = None
     ) -> tuple[asyncio.Task[None], asyncio.Event]:
-        interval = self.manager.config.lease_seconds / 2 if interval is None else interval
+        nominal_interval = self.manager.config.lease_seconds / 2
+        interval = nominal_interval if interval is None else interval
         if not 0 < interval < self.manager.config.lease_seconds:
             raise ValueError("renew_interval must be positive and shorter than lease_seconds")
 
-        owner = asyncio.current_task()
+        try:
+            owner = asyncio.current_task()
+        except RuntimeError:
+            owner = None
         if owner is None:
             raise RuntimeError("Auto-renewal requires a running asyncio task")
         lease_lost = asyncio.Event()
 
         async def worker() -> None:
+            current_interval = interval
             while not self._is_released:
-                await asyncio.sleep(interval)
-                if not await self.renew():
-                    logger.warning("Stream lease %s was lost during auto-renewal", self.lease_id)
+                await asyncio.sleep(current_interval)
+                if self._is_released:
+                    return
+
+                if await self.renew():
+                    current_interval = interval
+                    continue
+
+                # Renewal failed: check remaining TTL grace period before cancelling
+                now = time.time()
+                remaining = self.expires_at - now
+                min_window = max(0.05, interval / 4)
+                if remaining > min_window:
+                    retry_interval = max(0.05, min(remaining / 3, 2.0))
+                    logger.warning(
+                        "Stream lease %s renewal attempt failed; "
+                        "retrying in %.2fs (%.2fs remaining)",
+                        self.lease_id,
+                        retry_interval,
+                        remaining,
+                    )
+                    current_interval = retry_interval
+                else:
+                    logger.error(
+                        "Stream lease %s expired and could not be renewed; cancelling stream",
+                        self.lease_id,
+                    )
                     lease_lost.set()
                     owner.cancel()
                     return
