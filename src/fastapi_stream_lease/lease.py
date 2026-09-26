@@ -26,6 +26,34 @@ def _safe_uncancel() -> None:
             uncancel()
 
 
+_BACKGROUND_HOOK_TASKS: set[asyncio.Task[Any]] = set()
+
+
+async def _run_async_hook(coro: Any, hook: Any) -> None:
+    try:
+        await coro
+    except Exception as exc:
+        logger.warning("Error executing lease lifecycle callback %s: %s", hook, exc)
+
+
+def _trigger_hook_background(hook: Any, *args: Any) -> None:
+    """Safely trigger an optional lifecycle callback in the background without blocking."""
+    if hook is None:
+        return
+    try:
+        res = hook(*args)
+        if asyncio.iscoroutine(res):
+            try:
+                loop = asyncio.get_running_loop()
+                task = loop.create_task(_run_async_hook(res, hook))
+                _BACKGROUND_HOOK_TASKS.add(task)
+                task.add_done_callback(_BACKGROUND_HOOK_TASKS.discard)
+            except RuntimeError:
+                res.close()
+    except Exception as exc:
+        logger.warning("Error executing lease lifecycle callback %s: %s", hook, exc)
+
+
 async def _trigger_hook(hook: Any, *args: Any) -> None:
     """Safely trigger an optional sync or async lifecycle callback without raising."""
     if hook is None:
@@ -155,8 +183,10 @@ class StreamLease:
                             self.lease_id,
                         )
                         lease_lost.set()
-                        await _trigger_hook(self.manager.config.on_lost, self, "backend_timeout")
                         owner.cancel()
+                        _trigger_hook_background(
+                            self.manager.config.on_lost, self, "backend_timeout"
+                        )
                         return
                 except Exception as exc:
                     logger.error(
@@ -167,8 +197,8 @@ class StreamLease:
                         exc_info=True,
                     )
                     lease_lost.set()
-                    await _trigger_hook(self.manager.config.on_lost, self, "unexpected_error")
                     owner.cancel()
+                    _trigger_hook_background(self.manager.config.on_lost, self, "unexpected_error")
                     return
 
                 if renewed:
@@ -183,8 +213,8 @@ class StreamLease:
                     self.lease_id,
                 )
                 lease_lost.set()
-                await _trigger_hook(self.manager.config.on_lost, self, "redis_revoked")
                 owner.cancel()
+                _trigger_hook_background(self.manager.config.on_lost, self, "redis_revoked")
                 return
 
         return asyncio.create_task(worker()), lease_lost
