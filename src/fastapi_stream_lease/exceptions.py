@@ -116,3 +116,17 @@ class StreamLeaseUnavailable(StreamLeaseError):
             detail=self.detail,
             headers={"Retry-After": str(self.retry_after)},
         )
+
+
+class ConfigurationMismatchError(StreamLeaseError):
+    """Raised when worker configuration conflicts with existing cluster configuration."""
+
+    def __init__(
+        self,
+        message: str,
+        existing_config: dict[str, Any],
+        current_config: dict[str, Any],
+    ) -> None:
+        super().__init__(message)
+        self.existing_config = existing_config
+        self.current_config = current_config

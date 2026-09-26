@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from fastapi_stream_lease.config import LeaseConfig
+from fastapi_stream_lease.dispatcher import HookDispatcher
 from fastapi_stream_lease.exceptions import (
+    ConfigurationMismatchError,
     StreamLeaseError,
     StreamLeaseLost,
     StreamLeaseRejected,
@@ -13,6 +15,8 @@ from fastapi_stream_lease.manager import StreamLeaseManager
 __version__ = "0.1.5"
 
 __all__ = [
+    "ConfigurationMismatchError",
+    "HookDispatcher",
     "LeaseConfig",
     "StreamLease",
     "StreamLeaseError",

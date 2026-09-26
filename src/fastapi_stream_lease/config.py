@@ -42,6 +42,9 @@ class LeaseConfig:
     on_backend_error: Any = None
     """Optional callback hook: on_backend_error(exc: Exception) -> None | Awaitable[None]"""
 
+    hook_queue_size: int = 1024
+    """Maximum capacity of the background hook queue before dropping telemetry events."""
+
     def __post_init__(self) -> None:
         if not isfinite(self.lease_seconds) or self.lease_seconds <= 0:
             raise ValueError("lease_seconds must be finite and greater than 0")
@@ -53,6 +56,8 @@ class LeaseConfig:
             raise ValueError("key_prefix cannot be empty")
         if self.retry_after_seconds < 0:
             raise ValueError("retry_after_seconds cannot be negative")
+        if self.hook_queue_size <= 0:
+            raise ValueError("hook_queue_size must be greater than 0")
         for hook_name in (
             "on_acquired",
             "on_rejected",
@@ -92,3 +97,17 @@ class LeaseConfig:
     def redis_ttl(self) -> int:
         """TTL set on Redis keys to ensure dead keys self-clean (twice lease duration)."""
         return max(60, int(self.lease_seconds * 2))
+
+    @property
+    def config_key(self) -> str:
+        """Redis key for storing and verifying cluster configuration fingerprint."""
+        return f"{self._cluster_prefix}:config"
+
+    def fingerprint_dict(self) -> dict[str, Any]:
+        """Return critical cluster configuration parameters for consistency verification."""
+        return {
+            "key_prefix": self.key_prefix,
+            "max_per_user": self.max_per_user,
+            "max_global": self.max_global,
+            "lease_seconds": self.lease_seconds,
+        }

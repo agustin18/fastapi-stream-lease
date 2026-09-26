@@ -571,6 +571,9 @@ def test_lease_config_validation_hooks_and_retry_after():
     with pytest.raises(TypeError, match="on_released must be callable"):
         LeaseConfig(on_released="not_a_callable")
 
+    with pytest.raises(ValueError, match="hook_queue_size must be greater than 0"):
+        LeaseConfig(hook_queue_size=0)
+
 
 @pytest.mark.asyncio
 async def test_lifecycle_hooks_invocation(fake_redis):
@@ -920,3 +923,49 @@ async def test_on_released_hook_stream_wrap(fake_redis, stream_mode, expected_re
     # Calling release() again must not re-trigger on_released (exactly-once release)
     await lease.release()
     assert len(released_events) == 1
+
+
+@pytest.mark.asyncio
+async def test_verify_cluster_config_registration_and_mismatch(fake_redis):
+    """Verify cluster configuration fingerprint registration and drift detection."""
+    from fastapi_stream_lease.exceptions import ConfigurationMismatchError
+
+    # 1. First worker registers its configuration successfully
+    cfg1 = LeaseConfig(key_prefix="worker_test", max_global=100, max_per_user=2, lease_seconds=10.0)
+    mgr1 = StreamLeaseManager(redis=fake_redis, config=cfg1)
+    assert await mgr1.verify_cluster_config() is True
+
+    # Check key is populated in redis
+    val = await fake_redis.get(cfg1.config_key)
+    assert val is not None
+
+    # 2. Second worker with identical configuration passes verification
+    mgr1_clone = StreamLeaseManager(redis=fake_redis, config=cfg1)
+    assert await mgr1_clone.verify_cluster_config() is True
+
+    # 3. Third worker with conflicting configuration fails non-strict verification (returns False)
+    cfg_conflicting = LeaseConfig(
+        key_prefix="worker_test", max_global=500, max_per_user=2, lease_seconds=10.0
+    )
+    mgr_conflict = StreamLeaseManager(redis=fake_redis, config=cfg_conflicting)
+    assert await mgr_conflict.verify_cluster_config(strict=False) is False
+
+    # 4. Strict mode raises ConfigurationMismatchError
+    with pytest.raises(ConfigurationMismatchError) as exc_info:
+        await mgr_conflict.verify_cluster_config(strict=True)
+    assert "max_global" in str(exc_info.value)
+    assert exc_info.value.existing_config["max_global"] == 100
+    assert exc_info.value.current_config["max_global"] == 500
+
+    # 5. Network error during verify returns False and triggers on_backend_error
+    from unittest.mock import AsyncMock
+
+    errors = []
+    cfg_err = LeaseConfig(
+        key_prefix="worker_err",
+        on_backend_error=lambda e: errors.append(type(e).__name__),
+    )
+    mgr_err = StreamLeaseManager(redis=fake_redis, config=cfg_err)
+    mgr_err.redis.get = AsyncMock(side_effect=ConnectionError("Redis down"))
+    assert await mgr_err.verify_cluster_config() is False
+    assert errors == ["ConnectionError"]

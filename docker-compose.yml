@@ -13,6 +13,7 @@ services:
       - ./src:/app/src
       - ./tests:/app/tests
       - ./examples:/app/examples
+      - ./benchmarks:/app/benchmarks
       - ./pyproject.toml:/app/pyproject.toml
     environment:
       - REDIS_URL=redis://redis:6379/15

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from collections.abc import AsyncIterable, AsyncIterator
@@ -11,12 +12,14 @@ from uuid import uuid4
 import redis.exceptions
 
 from fastapi_stream_lease.config import LeaseConfig
+from fastapi_stream_lease.dispatcher import HookDispatcher
 from fastapi_stream_lease.exceptions import (
+    ConfigurationMismatchError,
     StreamLeaseLost,
     StreamLeaseRejected,
     StreamLeaseUnavailable,
 )
-from fastapi_stream_lease.lease import StreamLease, _safe_uncancel, _trigger_hook_background
+from fastapi_stream_lease.lease import StreamLease, _safe_uncancel
 from fastapi_stream_lease.lua import (
     ACQUIRE_SCRIPT,
     COUNT_SCRIPT,
@@ -59,6 +62,21 @@ class StreamLeaseManager:
     def __init__(self, redis: Any, config: LeaseConfig | None = None) -> None:
         self.redis = redis
         self.config: LeaseConfig = config or LeaseConfig()
+        self.dispatcher = HookDispatcher(max_queue_size=self.config.hook_queue_size)
+
+    async def __aenter__(self) -> StreamLeaseManager:
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        await self.close()
+
+    async def drain(self, timeout: float = 5.0) -> None:
+        """Wait for all queued lifecycle callbacks to complete execution."""
+        await self.dispatcher.drain(timeout=timeout)
+
+    async def close(self, drain: bool = True, timeout: float = 5.0) -> None:
+        """Shut down the background lifecycle hook dispatcher."""
+        await self.dispatcher.close(drain=drain, timeout=timeout)
 
     async def acquire(self, user_id: str | int) -> StreamLease:
         """
@@ -86,7 +104,7 @@ class StreamLeaseManager:
             )
         except Exception as exc:
             if is_network_error(exc):
-                _trigger_hook_background(self.config.on_backend_error, exc)
+                self.dispatcher.dispatch(self.config.on_backend_error, exc)
                 if self.config.fail_open:
                     logger.warning(
                         "Redis backend unavailable during acquire; "
@@ -104,7 +122,7 @@ class StreamLeaseManager:
                         created_monotonic=start_monotonic,
                     )
                     lease._is_fallback = True
-                    _trigger_hook_background(self.config.on_acquired, lease)
+                    self.dispatcher.dispatch(self.config.on_acquired, lease)
                     return lease
                 logger.warning(
                     "Redis backend unavailable during acquire for user %s: %s",
@@ -125,10 +143,10 @@ class StreamLeaseManager:
 
         code = int(result)
         if code == 2:
-            _trigger_hook_background(self.config.on_rejected, user_id, "user_limit")
+            self.dispatcher.dispatch(self.config.on_rejected, user_id, "user_limit")
             raise StreamLeaseRejected(reason="user_limit")
         if code == 3:
-            _trigger_hook_background(self.config.on_rejected, user_id, "global_limit")
+            self.dispatcher.dispatch(self.config.on_rejected, user_id, "global_limit")
             raise StreamLeaseRejected(reason="global_limit")
         if code != 1:
             raise RuntimeError(f"Unexpected stream lease acquisition return code: {code}")
@@ -142,7 +160,7 @@ class StreamLeaseManager:
             created_at=time.time(),
             created_monotonic=start_monotonic,
         )
-        _trigger_hook_background(self.config.on_acquired, lease)
+        self.dispatcher.dispatch(self.config.on_acquired, lease)
         return lease
 
     async def renew(self, lease: StreamLease) -> bool:
@@ -169,7 +187,7 @@ class StreamLeaseManager:
             return int(result) == 1
         except Exception as exc:
             if is_network_error(exc):
-                _trigger_hook_background(self.config.on_backend_error, exc)
+                self.dispatcher.dispatch(self.config.on_backend_error, exc)
                 logger.warning(
                     "Network error renewing stream lease %s: %s",
                     lease.lease_id,
@@ -201,7 +219,7 @@ class StreamLeaseManager:
             )
         except Exception as exc:
             if is_network_error(exc):
-                _trigger_hook_background(self.config.on_backend_error, exc)
+                self.dispatcher.dispatch(self.config.on_backend_error, exc)
                 logger.warning("Network error releasing stream lease %s: %s", lease.lease_id, exc)
             else:
                 logger.error(
@@ -223,7 +241,7 @@ class StreamLeaseManager:
             return int(count)
         except Exception as exc:
             if is_network_error(exc):
-                _trigger_hook_background(self.config.on_backend_error, exc)
+                self.dispatcher.dispatch(self.config.on_backend_error, exc)
                 logger.warning(
                     "Network error querying active stream count for %s: %s",
                     target_key,
@@ -316,4 +334,61 @@ class StreamLeaseManager:
             )
         except Exception:
             await lease.release(reason="error")
+            raise
+
+    async def verify_cluster_config(self, strict: bool = False) -> bool:
+        """
+        Verify that this worker's configuration matches cluster configuration in Redis.
+
+        If no configuration is registered yet, this worker's fingerprint is recorded.
+        If a mismatch is detected:
+          - If strict=True: raises ConfigurationMismatchError.
+          - If strict=False: logs a warning and returns False.
+
+        Returns:
+            bool: True if configuration matches or was registered; False on mismatch.
+        """
+        fingerprint = self.config.fingerprint_dict()
+        fingerprint_json = json.dumps(fingerprint, sort_keys=True)
+        config_key = self.config.config_key
+        ttl = max(int(self.config.redis_ttl), 86400)
+
+        try:
+            existing = await self.redis.get(config_key)
+            if existing is None:
+                await self.redis.set(config_key, fingerprint_json, ex=ttl)
+                return True
+
+            if isinstance(existing, bytes):
+                existing = existing.decode("utf-8")
+            existing_data = json.loads(existing)
+
+            mismatches = {
+                k: (v, existing_data.get(k))
+                for k, v in fingerprint.items()
+                if existing_data.get(k) != v
+            }
+
+            if mismatches:
+                msg = (
+                    f"Cluster configuration mismatch on key '{config_key}': "
+                    f"worker has {fingerprint}, but cluster registered {existing_data}. "
+                    f"Mismatches: {mismatches}"
+                )
+                if strict:
+                    raise ConfigurationMismatchError(msg, existing_data, fingerprint)
+                logger.warning(msg)
+                return False
+
+            return True
+        except ConfigurationMismatchError:
+            raise
+        except Exception as exc:
+            if is_network_error(exc):
+                self.dispatcher.dispatch(self.config.on_backend_error, exc)
+                logger.warning(
+                    "Could not verify cluster configuration due to network error: %s",
+                    exc,
+                )
+                return False
             raise
