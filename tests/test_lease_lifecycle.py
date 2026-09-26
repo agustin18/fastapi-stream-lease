@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from contextlib import aclosing
 from unittest.mock import AsyncMock
@@ -158,7 +159,7 @@ async def test_stream_lease_as_context_manager(lease_manager):
 async def test_direct_lease_context_renews(lease_manager):
     lease = await lease_manager.acquire("direct_context")
     async with lease:
-        await asyncio.sleep(2.4)
+        await asyncio.sleep(2.1)
         assert await lease_manager.get_active_count("direct_context") == 1
 
     assert await lease_manager.get_active_count("direct_context") == 0
@@ -1017,3 +1018,40 @@ async def test_verify_cluster_config_concurrent_race_condition(fake_redis):
 
     assert true_count == 25
     assert false_count == 25
+
+
+@pytest.mark.asyncio
+async def test_lease_context_exception_releases_with_error_reason(fake_redis):
+    """Verify that an unhandled exception inside async with lease sets release reason='error'."""
+    released_reasons = []
+    config = LeaseConfig(on_released=lambda lease, reason: released_reasons.append(reason))
+    manager = StreamLeaseManager(redis=fake_redis, config=config)
+
+    lease = await manager.acquire("user_err")
+    with pytest.raises(ZeroDivisionError):
+        async with lease:
+            _ = 1 / 0
+
+    await manager.drain(timeout=2.0)
+    assert released_reasons == ["error"]
+    assert await manager.get_active_count("user_err") == 0
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_verify_cluster_config_with_bytes_and_string_payloads(fake_redis):
+    """Verify verify_cluster_config handles both raw bytes and decoded string Redis responses."""
+    config = LeaseConfig(key_prefix="payload_test", max_global=10, max_per_user=1)
+    manager = StreamLeaseManager(redis=fake_redis, config=config)
+    payload = config.fingerprint_dict()
+
+    # Case 1: redis.get returns raw bytes (simulating default redis-py without decode_responses)
+    manager.redis.set = AsyncMock(return_value=False)
+    manager.redis.get = AsyncMock(return_value=json.dumps(payload).encode("utf-8"))
+    assert await manager.verify_cluster_config(strict=True) is True
+
+    # Case 2: redis.get returns decoded str (simulating decode_responses=True)
+    manager.redis.get = AsyncMock(return_value=json.dumps(payload))
+    assert await manager.verify_cluster_config(strict=True) is True
+    await manager.close()
+

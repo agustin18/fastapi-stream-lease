@@ -175,6 +175,7 @@ When `fail_open=True` is enabled in `LeaseConfig`, the manager grants fallback l
   ```
   - **Best-Effort Delivery:** Lifecycle callbacks are designed strictly for out-of-band telemetry and monitoring. If callbacks execute slower than event arrival and fill `hook_queue_size`, new events are dropped with a rate-limited log warning to preserve event-loop responsiveness. **Never rely on lifecycle hooks for financial billing, credit deduction, or security-critical audits.**
   - `on_released` receives a deterministic termination reason when delivered (`completed`, `cancelled`, `error`, `lost`, or `manual`). Lifecycle hooks remain best-effort telemetry signals and should not be treated as an authoritative source of active lease state.
+  - **Async vs Sync Hook Execution:** Synchronous hooks are offloaded to an internal thread pool via `asyncio.to_thread` to protect the event loop. Asynchronous hooks execute directly on the event loop and must remain cooperative (do not perform blocking synchronous calls like `time.sleep()` or blocking I/O inside an async callback). If a synchronous callback is already executing in the thread pool, `manager.close(timeout=...)` will wait up to the timeout, but Python cannot forcibly terminate an active OS thread.
   - Dispatcher telemetry properties for operational monitoring: `manager.dispatcher.queued_count`, `manager.dispatcher.dropped_count`, `manager.dispatcher.error_count`, and `manager.dispatcher.queue_depth`.
   - On application shutdown, flush all pending telemetry events gracefully:
   ```python
@@ -194,6 +195,8 @@ Because `{prefix}:config` is persistent (stored with `SET ... NX` without TTL ex
 
 1. **Option A: Prefix Versioning (Recommended for Zero-Downtime Blue/Green):**
    Update your configuration's `key_prefix` (e.g. from `myapp:streams:v1` to `myapp:streams:v2`). New worker pods establish and register their new canonical configuration immediately under the new prefix, while old pods gracefully drain active leases under the old prefix.
+   > [!WARNING]
+   > During Blue/Green overlap, old and new prefixes represent independent concurrency domains in Redis. Per-user and global limits are not shared across distinct prefixes, so aggregate concurrency may temporarily exceed either deployment's configured limit until old pods finish draining. Use Option B if a single strict cluster-wide limit must be maintained throughout migration.
 2. **Option B: Configuration Reset for In-Place Rolling Updates:**
    If you need to keep the exact same prefix:
    - Drain or stop existing worker instances.
