@@ -201,6 +201,7 @@ class StreamLeaseManager:
             )
         except Exception as exc:
             if is_network_error(exc):
+                await _trigger_hook(self.config.on_backend_error, exc)
                 logger.warning("Network error releasing stream lease %s: %s", lease.lease_id, exc)
             else:
                 logger.error(

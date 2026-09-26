@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import time
 from contextlib import aclosing
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -684,3 +685,68 @@ async def test_trigger_hook_helper():
         raise ValueError("broken")
 
     await _trigger_hook(bad_hook, "test")
+
+
+@pytest.mark.asyncio
+async def test_slow_on_lost_does_not_delay_stream_cancellation(fake_redis):
+    """
+    Ensure slow telemetry hooks (e.g. Datadog/CloudWatch taking hundreds of ms)
+    do NOT delay cancelling the stream when a lease is lost.
+
+    Cancellation must be issued immediately before or concurrently with the hook.
+    """
+    hook_started = asyncio.Event()
+    hook_finished = asyncio.Event()
+
+    async def slow_on_lost(lease, reason):
+        hook_started.set()
+        await asyncio.sleep(0.3)
+        hook_finished.set()
+
+    config = LeaseConfig(lease_seconds=2.0, on_lost=slow_on_lost)
+    mgr = StreamLeaseManager(redis=fake_redis, config=config)
+    lease = await mgr.acquire("user_slow_hook")
+
+    chunks_after_loss = 0
+
+    async def infinite_generator():
+        nonlocal chunks_after_loss
+        yield "chunk_1"
+        while True:
+            await asyncio.sleep(0.04)
+            if hook_started.is_set():
+                chunks_after_loss += 1
+            yield f"chunk_{chunks_after_loss}"
+
+    # Invalidate lease in redis
+    await fake_redis.flushall()
+
+    start_time = time.monotonic()
+    with pytest.raises(StreamLeaseLost):
+        async for _ in lease.wrap(infinite_generator(), auto_renew=True, renew_interval=0.04):
+            pass
+    elapsed = time.monotonic() - start_time
+
+    # Cancellation must occur immediately when loss is detected, NOT after the slow hook finishes
+    assert elapsed < 0.25, f"Stream cancellation was delayed by slow hook: elapsed={elapsed:.3f}s"
+    assert chunks_after_loss <= 1, f"Stream kept running during hook: {chunks_after_loss} chunks"
+
+
+@pytest.mark.asyncio
+async def test_release_triggers_on_backend_error_hook(fake_redis):
+    """Ensure manager.release() notifies on_backend_error when a network error occurs."""
+    backend_errors = []
+
+    def on_backend_err(exc):
+        backend_errors.append(exc)
+
+    config = LeaseConfig(on_backend_error=on_backend_err)
+    mgr = StreamLeaseManager(redis=fake_redis, config=config)
+    lease = await mgr.acquire("user_release_err")
+
+    mgr.redis.eval = AsyncMock(side_effect=ConnectionError("Redis unreachable during release"))
+    await mgr.release(lease)
+
+    assert len(backend_errors) == 1
+    assert isinstance(backend_errors[0], ConnectionError)
+

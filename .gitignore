@@ -28,3 +28,6 @@ htmlcov/
 .vscode/
 .idea/
 .DS_Store
+
+# Internal private planning
+.roadmap.md
