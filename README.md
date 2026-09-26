@@ -156,11 +156,27 @@ When `fail_open=True` is enabled in `LeaseConfig`, the manager grants fallback l
       on_rejected=lambda uid, reason: PROMETHEUS_REJECTED.labels(reason=reason).inc(),
       on_lost=lambda lease, reason: PROMETHEUS_LOST.labels(reason=reason).inc(),
       on_backend_error=lambda exc: PROMETHEUS_BACKEND_ERRORS.inc(),
+      hook_queue_size=1024,
   )
   ```
   `on_released` receives the release reason (`completed`, `cancelled`, `error`, `lost`, or `manual`), guaranteeing that active connection gauges decrement accurately across all stream terminations.
+  All lifecycle hooks are managed by an internal bounded FIFO `HookDispatcher`. On application shutdown, flush all pending telemetry events gracefully:
+  ```python
+  await manager.drain(timeout=5.0)
+  ```
+- **Cluster Configuration Drift Detection:**
+  In distributed environments with multiple worker processes or Kubernetes pods, ensure all instances share identical limit configurations:
+  ```python
+  # Logs a warning on drift or raises ConfigurationMismatchError if strict=True
+  await manager.verify_cluster_config(strict=True)
+  ```
 - **Redis Failover & Sentinel Support:** Automatically classifies `ReadOnlyError` (thrown when hitting a replica during master election) as a transient condition, enabling adaptive renewal retries to ride out failovers without dropping active streams.
 - **Redis Cluster:** All keys use Redis hash tags (`{prefix}:user:...` and `{prefix}:global`), guaranteeing user and global sorted sets reside on the same hash slot for multi-key atomic Lua operations. As with any multi-key Lua coordination, evaluate slot contention and failover behavior under your specific topology.
+- **Reproducible Concurrency Benchmarks:**
+  Run throughput and latency benchmarks against your local Redis instance:
+  ```bash
+  docker compose run --rm backend uv run python benchmarks/bench_lease_concurrency.py --count 1000 --concurrency 50
+  ```
 - **Docker Compose Testing Stack:** Run the test suite and Redis dependency cleanly across Linux, macOS, and Windows:
   ```bash
   docker compose run --rm backend uv run pytest
