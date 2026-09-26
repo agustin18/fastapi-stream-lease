@@ -14,7 +14,11 @@ uv run mypy src
 uv run pytest
 ```
 
-Tests in `tests/test_real_redis.py` run when `REDIS_URL` points to an isolated Redis database. CI supplies Redis automatically. For local integration testing, start Redis and run `REDIS_URL=redis://localhost:6379/15 uv run pytest tests/test_real_redis.py`.
+Tests in `tests/test_real_redis.py` run when `REDIS_URL` points to an isolated Redis database. CI supplies Redis automatically. For local integration testing, start Redis and run `REDIS_URL=redis://localhost:6379/15 uv run pytest -o addopts='' tests/test_real_redis.py`.
+
+The default test command requires at least 95% combined line and branch coverage. CI also checks Redis 5 and 7, builds both distributions, and validates package metadata.
+
+GitHub Actions are pinned to full commit hashes so a changed version tag cannot silently change the release pipeline. The comment beside each hash shows the readable release version, and Dependabot proposes grouped updates.
 
 Add a focused test for changed behavior. Update the README for public API or failure-mode changes. Keep PRs small enough to review and describe the user-visible effect. CI must pass before merge.
 

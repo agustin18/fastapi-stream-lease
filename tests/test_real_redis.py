@@ -18,7 +18,8 @@ async def real_manager():
     url = os.environ.get("REDIS_URL")
     if not url:
         pytest.skip("Set REDIS_URL to run real Redis integration tests")
-    client = redis.from_url(url)
+    # redis-py 8 defaults to RESP3; Redis 5 only supports RESP2.
+    client = redis.from_url(url, protocol=2)
     manager = StreamLeaseManager(
         client,
         LeaseConfig(lease_seconds=0.3, max_per_user=2, max_global=3, key_prefix=uuid4().hex),
@@ -97,7 +98,7 @@ import redis.asyncio as redis
 from fastapi_stream_lease import LeaseConfig, StreamLeaseManager, StreamLeaseRejected
 
 async def main():
-    client = redis.from_url(sys.argv[1])
+    client = redis.from_url(sys.argv[1], protocol=2)
     manager = StreamLeaseManager(
         client, LeaseConfig(lease_seconds=0.3, max_per_user=2, max_global=3,
                             key_prefix=sys.argv[2])
