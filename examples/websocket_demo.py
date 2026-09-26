@@ -20,7 +20,11 @@ from fastapi_stream_lease import (
 
 logger = logging.getLogger(__name__)
 
-redis_client = redis.from_url(os.environ.get("REDIS_URL", "redis://localhost:6379/0"))
+redis_client = redis.from_url(
+    os.environ.get("REDIS_URL", "redis://localhost:6379/0"),
+    socket_timeout=2.0,
+    socket_connect_timeout=2.0,
+)
 manager = StreamLeaseManager(
     redis_client,
     LeaseConfig(max_per_user=2, max_global=10, lease_seconds=15),

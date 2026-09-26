@@ -26,6 +26,18 @@ def _safe_uncancel() -> None:
             uncancel()
 
 
+async def _trigger_hook(hook: Any, *args: Any) -> None:
+    """Safely trigger an optional sync or async lifecycle callback without raising."""
+    if hook is None:
+        return
+    try:
+        res = hook(*args)
+        if asyncio.iscoroutine(res):
+            await res
+    except Exception as exc:
+        logger.warning("Error executing lease lifecycle callback %s: %s", hook, exc)
+
+
 @dataclass
 class StreamLease:
     """Represents an active, acquired stream lease."""
@@ -143,8 +155,21 @@ class StreamLease:
                             self.lease_id,
                         )
                         lease_lost.set()
+                        await _trigger_hook(self.manager.config.on_lost, self, "backend_timeout")
                         owner.cancel()
                         return
+                except Exception as exc:
+                    logger.error(
+                        "Stream lease %s unexpected failure during auto-renewal: %s; "
+                        "cancelling stream",
+                        self.lease_id,
+                        exc,
+                        exc_info=True,
+                    )
+                    lease_lost.set()
+                    await _trigger_hook(self.manager.config.on_lost, self, "unexpected_error")
+                    owner.cancel()
+                    return
 
                 if renewed:
                     current_interval = interval
@@ -158,6 +183,7 @@ class StreamLease:
                     self.lease_id,
                 )
                 lease_lost.set()
+                await _trigger_hook(self.manager.config.on_lost, self, "redis_revoked")
                 owner.cancel()
                 return
 

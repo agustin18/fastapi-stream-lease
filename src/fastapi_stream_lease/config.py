@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from math import isfinite
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -23,6 +24,21 @@ class LeaseConfig:
     fail_open: bool = False
     """If True, allows streams to proceed unthrottled with an emergency stub if Redis is down."""
 
+    retry_after_seconds: int = 5
+    """Default Retry-After header value (in seconds) for HTTP 503 responses."""
+
+    on_acquired: Any = None
+    """Optional callback hook: on_acquired(lease: StreamLease) -> None | Awaitable[None]"""
+
+    on_rejected: Any = None
+    """Optional callback hook: on_rejected(user_id, reason) -> None | Awaitable[None]"""
+
+    on_lost: Any = None
+    """Optional callback hook: on_lost(lease: StreamLease, reason: str) -> None | Awaitable[None]"""
+
+    on_backend_error: Any = None
+    """Optional callback hook: on_backend_error(exc: Exception) -> None | Awaitable[None]"""
+
     def __post_init__(self) -> None:
         if not isfinite(self.lease_seconds) or self.lease_seconds <= 0:
             raise ValueError("lease_seconds must be finite and greater than 0")
@@ -32,6 +48,12 @@ class LeaseConfig:
             raise ValueError("max_global cannot be negative")
         if not self.key_prefix:
             raise ValueError("key_prefix cannot be empty")
+        if self.retry_after_seconds < 0:
+            raise ValueError("retry_after_seconds cannot be negative")
+        for hook_name in ("on_acquired", "on_rejected", "on_lost", "on_backend_error"):
+            hook_val = getattr(self, hook_name)
+            if hook_val is not None and not callable(hook_val):
+                raise TypeError(f"{hook_name} must be callable if provided")
         if "{" in self.key_prefix or "}" in self.key_prefix:
             left = self.key_prefix.find("{")
             right = self.key_prefix.find("}")

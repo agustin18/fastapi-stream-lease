@@ -121,15 +121,20 @@ The manager context and `async with lease` both renew while open. Handle normal 
 
 - **Redis Client Timeouts:** Always configure explicit timeouts on your Redis client (e.g. `socket_timeout=1.0, socket_connect_timeout=1.0`). Without timeouts, an unreachable Redis instance can block asyncio event loop execution indefinitely.
 - **Fail-Open vs. Fail-Closed Strategy:**
-  - `fail_open=False` (Default): Raises `StreamLeaseUnavailable` (HTTP 503) when Redis is down. Ensures concurrency limits are strictly enforced under all conditions, at the cost of service availability during infrastructure outages.
-  - `fail_open=True`: Automatically grants in-memory fallback leases when Redis encounters network or timeout errors. Keeps streaming endpoints open to users during outages, with the operational cost that limits are not coordinated across workers until Redis recovers. Authentication, authorization, and script syntax errors never fail open.
-- **Definitive Revocation vs. Network Errors:** If Redis explicitly reports that a lease is missing or expired (`renew()` returning 0), `wrap()` and `lease()` cancel the stream immediately to prevent exceeding limits. Transient network disconnects trigger rapid retries until the monotonic lease deadline is reached.
-- **Recommended Observability Metrics:**
-  - `stream_leases_active` (Gauge): Current concurrent streams per worker.
-  - `stream_lease_rejected_total` (Counter): Concurrency rejections (HTTP 429).
-  - `stream_lease_unavailable_total` (Counter): Redis backend outage errors (HTTP 503).
-  - `stream_lease_lost_total` (Counter): Streams terminated mid-flight due to lease expiration or revocation.
-- **Redis Cluster:** All keys use Redis hash tags (`{prefix}:user:...` and `{prefix}:global`), guaranteeing user and global sorted sets reside on the same hash slot. As with any multi-key Lua script, test failover behavior in staging under your specific Cluster topology.
+  - `fail_open=False` (Default): Raises `StreamLeaseUnavailable` (HTTP 503) when Redis is unreachable. Enforces limits during transient network partitions at the cost of rejecting requests when the backend is down. (Note: asynchronous Redis replication or master failover can still lose recently acknowledged writes if a master fails before syncing to its replica).
+  - `fail_open=True`: Automatically grants in-memory fallback leases when Redis encounters network or timeout errors. Keeps streaming endpoints open during outages, with the operational trade-off that limits are not coordinated across workers until Redis recovers. Authentication, authorization, and script syntax errors never fail open.
+- **Definitive Revocation vs. Network Errors:** If Redis explicitly reports that a lease is missing or expired (`renew()` returning 0) or encounters an unhandled execution error, `wrap()` and `lease()` cancel the stream immediately to prevent exceeding limits. Transient network disconnects trigger rapid retries until the monotonic lease deadline is reached.
+- **Observability and Lifecycle Hooks:**
+  `LeaseConfig` provides zero-dependency callback hooks (supporting both sync and async callables) to plug directly into Prometheus, Datadog, StatsD, or Sentry:
+  ```python
+  config = LeaseConfig(
+      on_acquired=lambda lease: PROMETHEUS_ACQUIRED.inc(),
+      on_rejected=lambda uid, reason: PROMETHEUS_REJECTED.labels(reason=reason).inc(),
+      on_lost=lambda lease, reason: PROMETHEUS_LOST.labels(reason=reason).inc(),
+      on_backend_error=lambda exc: PROMETHEUS_BACKEND_ERRORS.inc(),
+  )
+  ```
+- **Redis Cluster:** All keys use Redis hash tags (`{prefix}:user:...` and `{prefix}:global`), guaranteeing user and global sorted sets reside on the same hash slot for multi-key atomic Lua operations. As with any multi-key Lua coordination, evaluate slot contention and failover behavior under your specific topology.
 
 ## Contributing and security
 
