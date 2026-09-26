@@ -76,7 +76,7 @@ async def test_real_redis_cancelled_context_releases_lease(real_manager):
     started = asyncio.Event()
 
     async def socket_like_task():
-        async with real_manager.lease("socket"):
+        async with real_manager.lease("socket", renew_interval=0.08):
             started.set()
             await asyncio.sleep(1)
 
