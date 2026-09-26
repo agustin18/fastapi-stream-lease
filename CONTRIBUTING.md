@@ -14,7 +14,17 @@ uv run mypy src
 uv run pytest
 ```
 
-Tests in `tests/test_real_redis.py` run when `REDIS_URL` points to an isolated Redis database. CI supplies Redis automatically. For local integration testing, start Redis and run `REDIS_URL=redis://localhost:6379/15 uv run pytest -o addopts='' tests/test_real_redis.py`.
+Tests in `tests/test_real_redis.py` run when `REDIS_URL` points to an isolated Redis database. CI supplies Redis automatically.
+
+For local integration testing, start Redis and run `REDIS_URL=redis://localhost:6379/15 uv run pytest -o addopts='' tests/test_real_redis.py`.
+
+Alternatively, run the entire test suite including real Redis integration without installing local dependencies via Docker Compose:
+
+```bash
+docker compose up -d redis
+docker compose run --rm backend uv run pytest
+docker compose down
+```
 
 The default test command requires at least 95% combined line and branch coverage. CI also checks Redis 5 and 7, builds both distributions, and validates package metadata.
 
