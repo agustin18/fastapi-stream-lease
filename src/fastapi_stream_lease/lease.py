@@ -198,9 +198,7 @@ class StreamLease:
                     )
                     lease_lost.set()
                     owner.cancel()
-                    _trigger_hook_background(
-                        self.manager.config.on_lost, self, "unexpected_error"
-                    )
+                    _trigger_hook_background(self.manager.config.on_lost, self, "unexpected_error")
                     return
 
                 if renewed:

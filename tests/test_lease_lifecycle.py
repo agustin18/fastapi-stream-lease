@@ -749,4 +749,3 @@ async def test_release_triggers_on_backend_error_hook(fake_redis):
 
     assert len(backend_errors) == 1
     assert isinstance(backend_errors[0], ConnectionError)
-
