@@ -110,7 +110,7 @@ class HookDispatcher:
         if self._queue is not None:
             try:
                 await asyncio.wait_for(self._queue.join(), timeout=timeout)
-            except TimeoutError:
+            except (TimeoutError, asyncio.TimeoutError):
                 logger.warning(
                     "Timed out waiting for lifecycle hook queue to drain (%d remaining)",
                     self._queue.qsize(),
@@ -136,5 +136,5 @@ class HookDispatcher:
             try:
                 self._queue.put_nowait(None)
                 await asyncio.wait_for(self._worker_task, timeout=timeout)
-            except (asyncio.QueueFull, TimeoutError):
+            except (asyncio.QueueFull, TimeoutError, asyncio.TimeoutError):
                 self._worker_task.cancel()
