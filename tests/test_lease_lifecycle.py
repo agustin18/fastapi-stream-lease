@@ -6,7 +6,14 @@ from contextlib import aclosing
 
 import pytest
 
-from fastapi_stream_lease import StreamLease, StreamLeaseLost
+from fastapi_stream_lease import (
+    LeaseConfig,
+    StreamLease,
+    StreamLeaseLost,
+    StreamLeaseManager,
+    StreamLeaseRejected,
+    StreamLeaseUnavailable,
+)
 
 
 @pytest.mark.asyncio
@@ -498,3 +505,181 @@ def test_safe_uncancel_edge_cases(monkeypatch):
 
     monkeypatch.setattr(asyncio, "current_task", lambda: DummyTask())
     _safe_uncancel()
+
+
+@pytest.mark.asyncio
+async def test_auto_renew_non_network_error_cancels_stream(lease_manager):
+    import redis.exceptions
+
+    async def infinite_stream():
+        yield "chunk_1"
+        await asyncio.sleep(0.2)
+        yield "chunk_2"
+
+    from fastapi_stream_lease.lua import RENEW_SCRIPT
+
+    lease = await lease_manager.acquire("unhandled_err_user")
+    original_eval = lease_manager.redis.eval
+
+    async def flaky_eval(script, *args, **kwargs):
+        if script == RENEW_SCRIPT:
+            raise redis.exceptions.ResponseError("NOPERM")
+        return await original_eval(script, *args, **kwargs)
+
+    lease_manager.redis.eval = flaky_eval
+
+    chunks = []
+    with pytest.raises(StreamLeaseLost):
+        async for chunk in lease.wrap(infinite_stream(), auto_renew=True, renew_interval=0.04):
+            chunks.append(chunk)
+
+    assert chunks == ["chunk_1"]
+    assert await lease_manager.get_active_count("unhandled_err_user") == 0
+
+
+@pytest.mark.asyncio
+async def test_manager_lease_context_auto_renew_non_network_error_cancels_context(lease_manager):
+    import redis.exceptions
+
+    from fastapi_stream_lease.lua import RENEW_SCRIPT
+
+    original_eval = lease_manager.redis.eval
+
+    async def flaky_eval(script, *args, **kwargs):
+        if script == RENEW_SCRIPT:
+            raise redis.exceptions.ResponseError("NOPERM")
+        return await original_eval(script, *args, **kwargs)
+
+    lease_manager.redis.eval = flaky_eval
+
+    with pytest.raises(StreamLeaseLost):
+        async with lease_manager.lease("ctx_unhandled_err", renew_interval=0.04):
+            await asyncio.sleep(0.2)
+
+    assert await lease_manager.get_active_count("ctx_unhandled_err") == 0
+
+
+def test_lease_config_validation_hooks_and_retry_after():
+    with pytest.raises(ValueError, match="retry_after_seconds cannot be negative"):
+        LeaseConfig(retry_after_seconds=-1)
+
+    with pytest.raises(TypeError, match="on_acquired must be callable"):
+        LeaseConfig(on_acquired="not_a_callable")
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_hooks_invocation(fake_redis):
+    from unittest.mock import AsyncMock
+
+    events = []
+
+    def sync_acquired(lease):
+        events.append(("acquired", lease.user_id))
+
+    async def async_rejected(user_id, reason):
+        events.append(("rejected", user_id, reason))
+
+    def buggy_lost(lease, reason):
+        events.append(("lost", lease.user_id, reason))
+        raise RuntimeError("Buggy hook error")
+
+    async def async_backend_err(exc):
+        events.append(("backend_error", type(exc).__name__))
+
+    config = LeaseConfig(
+        lease_seconds=2.0,
+        max_per_user=1,
+        on_acquired=sync_acquired,
+        on_rejected=async_rejected,
+        on_lost=buggy_lost,
+        on_backend_error=async_backend_err,
+    )
+    mgr = StreamLeaseManager(redis=fake_redis, config=config)
+
+    # 1. Acquire triggers on_acquired
+    lease = await mgr.acquire("user_hook")
+    assert lease.user_id == "user_hook"
+    assert ("acquired", "user_hook") in events
+
+    # 2. Limit rejection triggers on_rejected
+    with pytest.raises(StreamLeaseRejected):
+        await mgr.acquire("user_hook")
+    assert ("rejected", "user_hook", "user_limit") in events
+
+    # 3. Backend error triggers on_backend_error
+    original_eval = fake_redis.eval
+    mgr.redis.eval = AsyncMock(side_effect=ConnectionError("Backend dropped"))
+    with pytest.raises(StreamLeaseUnavailable):
+        await mgr.acquire("user_down")
+    assert ("backend_error", "ConnectionError") in events
+
+    # 4. Fallback lease triggers both on_backend_error and on_acquired
+    mgr_open = StreamLeaseManager(
+        redis=fake_redis,
+        config=LeaseConfig(
+            fail_open=True,
+            on_acquired=sync_acquired,
+            on_backend_error=async_backend_err,
+        ),
+    )
+    mgr_open.redis.eval = AsyncMock(side_effect=ConnectionError("Backend dropped"))
+    fallback_lease = await mgr_open.acquire("user_fb")
+    assert fallback_lease._is_fallback is True
+    assert ("acquired", "user_fb") in events
+
+    # 5. worker lost hook triggers on_lost (and buggy hook does not raise)
+    fake_redis.eval = original_eval
+    mgr_real = StreamLeaseManager(redis=fake_redis, config=config)
+    real_lease = await mgr_real.acquire("user_lost_hook")
+    # Expire immediately in redis
+    await fake_redis.flushall()
+    # Direct renew returns False
+    assert await real_lease.renew() is False
+
+    # 6. Test on_lost triggered in worker during wrap
+    lost_events = []
+
+    def track_lost(lost_lease, reason):
+        lost_events.append((lost_lease.user_id, reason))
+
+    config_lost = LeaseConfig(lease_seconds=2.0, on_lost=track_lost)
+    mgr_lost = StreamLeaseManager(redis=fake_redis, config=config_lost)
+    l_active = await mgr_lost.acquire("user_bg_lost")
+    await fake_redis.flushall()
+
+    async def sample_stream():
+        yield 1
+        await asyncio.sleep(0.1)
+        yield 2
+
+    with pytest.raises(StreamLeaseLost):
+        async for _ in l_active.wrap(sample_stream(), auto_renew=True, renew_interval=0.04):
+            pass
+
+    assert ("user_bg_lost", "redis_revoked") in lost_events
+
+
+@pytest.mark.asyncio
+async def test_trigger_hook_helper():
+    from fastapi_stream_lease.lease import _trigger_hook
+
+    # 1. hook is None
+    await _trigger_hook(None, 123)
+
+    # 2. sync hook
+    called = []
+    await _trigger_hook(lambda x: called.append(x), "sync")
+    assert called == ["sync"]
+
+    # 3. async hook
+    async def async_fn(x):
+        called.append(x)
+
+    await _trigger_hook(async_fn, "async")
+    assert called == ["sync", "async"]
+
+    # 4. hook raising exception does not raise out
+    def bad_hook(x):
+        raise ValueError("broken")
+
+    await _trigger_hook(bad_hook, "test")

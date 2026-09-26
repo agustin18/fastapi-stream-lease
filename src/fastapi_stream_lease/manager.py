@@ -16,7 +16,7 @@ from fastapi_stream_lease.exceptions import (
     StreamLeaseRejected,
     StreamLeaseUnavailable,
 )
-from fastapi_stream_lease.lease import StreamLease, _safe_uncancel
+from fastapi_stream_lease.lease import StreamLease, _safe_uncancel, _trigger_hook
 from fastapi_stream_lease.lua import (
     ACQUIRE_SCRIPT,
     COUNT_SCRIPT,
@@ -79,6 +79,7 @@ class StreamLeaseManager:
             )
         except Exception as exc:
             if is_network_error(exc):
+                await _trigger_hook(self.config.on_backend_error, exc)
                 if self.config.fail_open:
                     logger.warning(
                         "Redis backend unavailable during acquire; "
@@ -96,6 +97,7 @@ class StreamLeaseManager:
                         created_monotonic=start_monotonic,
                     )
                     lease._is_fallback = True
+                    await _trigger_hook(self.config.on_acquired, lease)
                     return lease
                 logger.warning(
                     "Redis backend unavailable during acquire for user %s: %s",
@@ -103,7 +105,8 @@ class StreamLeaseManager:
                     exc,
                 )
                 raise StreamLeaseUnavailable(
-                    detail="Stream lease coordination backend is temporarily unavailable"
+                    detail="Stream lease coordination backend is temporarily unavailable",
+                    retry_after=self.config.retry_after_seconds,
                 ) from exc
             logger.error(
                 "Execution error during stream lease acquire for user %s: %s",
@@ -115,13 +118,15 @@ class StreamLeaseManager:
 
         code = int(result)
         if code == 2:
+            await _trigger_hook(self.config.on_rejected, user_id, "user_limit")
             raise StreamLeaseRejected(reason="user_limit")
         if code == 3:
+            await _trigger_hook(self.config.on_rejected, user_id, "global_limit")
             raise StreamLeaseRejected(reason="global_limit")
         if code != 1:
             raise RuntimeError(f"Unexpected stream lease acquisition return code: {code}")
 
-        return StreamLease(
+        lease = StreamLease(
             lease_id=lease_id,
             user_id=user_id,
             user_key=user_key,
@@ -130,6 +135,8 @@ class StreamLeaseManager:
             created_at=time.time(),
             created_monotonic=start_monotonic,
         )
+        await _trigger_hook(self.config.on_acquired, lease)
+        return lease
 
     async def renew(self, lease: StreamLease) -> bool:
         """
@@ -155,13 +162,15 @@ class StreamLeaseManager:
             return int(result) == 1
         except Exception as exc:
             if is_network_error(exc):
+                await _trigger_hook(self.config.on_backend_error, exc)
                 logger.warning(
                     "Network error renewing stream lease %s: %s",
                     lease.lease_id,
                     exc,
                 )
                 raise StreamLeaseUnavailable(
-                    detail="Stream lease coordination backend is temporarily unavailable"
+                    detail="Stream lease coordination backend is temporarily unavailable",
+                    retry_after=self.config.retry_after_seconds,
                 ) from exc
             logger.error(
                 "Execution error renewing stream lease %s: %s",
@@ -206,13 +215,15 @@ class StreamLeaseManager:
             return int(count)
         except Exception as exc:
             if is_network_error(exc):
+                await _trigger_hook(self.config.on_backend_error, exc)
                 logger.warning(
                     "Network error querying active stream count for %s: %s",
                     target_key,
                     exc,
                 )
                 raise StreamLeaseUnavailable(
-                    detail="Stream lease coordination backend is temporarily unavailable"
+                    detail="Stream lease coordination backend is temporarily unavailable",
+                    retry_after=self.config.retry_after_seconds,
                 ) from exc
             logger.error(
                 "Execution error querying active stream count for %s: %s",
@@ -223,7 +234,9 @@ class StreamLeaseManager:
             raise
 
     @asynccontextmanager
-    async def lease(self, user_id: str | int) -> AsyncIterator[StreamLease]:
+    async def lease(
+        self, user_id: str | int, renew_interval: float | None = None
+    ) -> AsyncIterator[StreamLease]:
         """
         Context manager for acquiring and safely releasing a stream lease for scoped
         executions (such as WebSockets, background tasks, or pub/sub loops).
@@ -241,7 +254,7 @@ class StreamLeaseManager:
         renew_task: asyncio.Task[None] | None = None
         lease_lost = asyncio.Event()
         try:
-            renew_task, lease_lost = stream_lease._start_auto_renew()
+            renew_task, lease_lost = stream_lease._start_auto_renew(renew_interval)
             yield stream_lease
         except asyncio.CancelledError:
             if lease_lost.is_set():
