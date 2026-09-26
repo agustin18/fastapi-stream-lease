@@ -571,6 +571,9 @@ def test_lease_config_validation_hooks_and_retry_after():
     with pytest.raises(TypeError, match="on_released must be callable"):
         LeaseConfig(on_released="not_a_callable")
 
+    with pytest.raises(ValueError, match="hook_queue_size must be greater than 0"):
+        LeaseConfig(hook_queue_size=0)
+
 
 @pytest.mark.asyncio
 async def test_lifecycle_hooks_invocation(fake_redis):

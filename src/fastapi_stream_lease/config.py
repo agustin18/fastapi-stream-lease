@@ -42,6 +42,9 @@ class LeaseConfig:
     on_backend_error: Any = None
     """Optional callback hook: on_backend_error(exc: Exception) -> None | Awaitable[None]"""
 
+    hook_queue_size: int = 1024
+    """Maximum capacity of the background hook queue before dropping telemetry events."""
+
     def __post_init__(self) -> None:
         if not isfinite(self.lease_seconds) or self.lease_seconds <= 0:
             raise ValueError("lease_seconds must be finite and greater than 0")
@@ -53,6 +56,8 @@ class LeaseConfig:
             raise ValueError("key_prefix cannot be empty")
         if self.retry_after_seconds < 0:
             raise ValueError("retry_after_seconds cannot be negative")
+        if self.hook_queue_size <= 0:
+            raise ValueError("hook_queue_size must be greater than 0")
         for hook_name in (
             "on_acquired",
             "on_rejected",
