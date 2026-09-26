@@ -8,6 +8,9 @@ services:
         port 6379
         save ""
         replica-announce-ip redis-master
+        replica-announce-port 6379
+        repl-diskless-sync-delay 0
+        enable-debug-command yes
         EOF
         exec redis-server /tmp/redis.conf
     healthcheck:
@@ -26,6 +29,9 @@ services:
         save ""
         replicaof redis-master 6379
         replica-announce-ip redis-replica
+        replica-announce-port 6379
+        repl-diskless-sync-delay 0
+        enable-debug-command yes
         EOF
         exec redis-server /tmp/redis.conf
     depends_on:
@@ -45,11 +51,15 @@ services:
         cat << 'EOF' > /tmp/sentinel.conf
         port 26379
         sentinel monitor mymaster redis-master 6379 2
+        # Test-only aggressive timeout (1000ms); do not copy blindly to production (typically 5000-60000ms).
         sentinel down-after-milliseconds mymaster 1000
-        sentinel failover-timeout mymaster 10000
+        # Test-only fast failover timeout (5000ms); do not copy blindly to production (typically 60000-180000ms).
+        sentinel failover-timeout mymaster 5000
         sentinel parallel-syncs mymaster 1
         sentinel resolve-hostnames yes
         sentinel announce-hostnames yes
+        sentinel announce-ip sentinel-1
+        sentinel announce-port 26379
         EOF
         exec redis-server /tmp/sentinel.conf --sentinel
     depends_on:
@@ -71,11 +81,15 @@ services:
         cat << 'EOF' > /tmp/sentinel.conf
         port 26379
         sentinel monitor mymaster redis-master 6379 2
+        # Test-only aggressive timeout (1000ms); do not copy blindly to production (typically 5000-60000ms).
         sentinel down-after-milliseconds mymaster 1000
-        sentinel failover-timeout mymaster 10000
+        # Test-only fast failover timeout (5000ms); do not copy blindly to production (typically 60000-180000ms).
+        sentinel failover-timeout mymaster 5000
         sentinel parallel-syncs mymaster 1
         sentinel resolve-hostnames yes
         sentinel announce-hostnames yes
+        sentinel announce-ip sentinel-2
+        sentinel announce-port 26379
         EOF
         exec redis-server /tmp/sentinel.conf --sentinel
     depends_on:
@@ -97,11 +111,15 @@ services:
         cat << 'EOF' > /tmp/sentinel.conf
         port 26379
         sentinel monitor mymaster redis-master 6379 2
+        # Test-only aggressive timeout (1000ms); do not copy blindly to production (typically 5000-60000ms).
         sentinel down-after-milliseconds mymaster 1000
-        sentinel failover-timeout mymaster 10000
+        # Test-only fast failover timeout (5000ms); do not copy blindly to production (typically 60000-180000ms).
+        sentinel failover-timeout mymaster 5000
         sentinel parallel-syncs mymaster 1
         sentinel resolve-hostnames yes
         sentinel announce-hostnames yes
+        sentinel announce-ip sentinel-3
+        sentinel announce-port 26379
         EOF
         exec redis-server /tmp/sentinel.conf --sentinel
     depends_on:

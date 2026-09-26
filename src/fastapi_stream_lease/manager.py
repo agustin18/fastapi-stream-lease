@@ -339,7 +339,12 @@ class StreamLeaseManager:
             await lease.release(reason="error")
             raise
 
-    async def verify_cluster_config(self, strict: bool = False) -> bool:
+    async def verify_cluster_config(
+        self,
+        strict: bool = False,
+        retry_attempts: int = 3,
+        retry_delay: float = 0.1,
+    ) -> bool:
         """
         Verify that this worker's configuration matches cluster configuration in Redis.
 
@@ -348,8 +353,10 @@ class StreamLeaseManager:
           - If strict=True: raises ConfigurationMismatchError.
           - If strict=False: logs a warning and returns False.
 
-        If a backend network error occurs:
-          - If strict=True: raises StreamLeaseUnavailable (fail-fast on k8s startup).
+        Transient network errors during Sentinel election or network blips are retried up to
+        `retry_attempts` times (spaced by `retry_delay`). If the coordination backend remains
+        unavailable past all retry attempts:
+          - If strict=True: raises StreamLeaseUnavailable (fail-fast on k8s CrashLoopBackOff).
           - If strict=False: logs a warning, triggers on_backend_error, and returns False.
 
         Returns:
@@ -360,7 +367,7 @@ class StreamLeaseManager:
         config_key = self.config.config_key
 
         existing_data: dict[str, Any] | None = None
-        for attempt in range(3):
+        for attempt in range(retry_attempts):
             try:
                 # Atomic canonical registration: only sets if key does not exist (NX=True), no TTL
                 registered = await self.redis.set(config_key, fingerprint_json, nx=True)
@@ -375,8 +382,8 @@ class StreamLeaseManager:
                     break
             except Exception as exc:
                 if is_network_error(exc):
-                    if attempt < 2:
-                        await asyncio.sleep(0.1)
+                    if attempt < retry_attempts - 1:
+                        await asyncio.sleep(retry_delay)
                         continue
                     self.dispatcher.dispatch(self.config.on_backend_error, exc)
                     if strict:
