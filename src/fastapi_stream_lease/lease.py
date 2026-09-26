@@ -97,15 +97,21 @@ class StreamLease:
         return self
 
     async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        reason = "completed"
         try:
             if self._context_lease_lost.is_set():
+                reason = "lost"
                 _safe_uncancel()
                 raise StreamLeaseLost(self.lease_id) from None
+            if exc_type is asyncio.CancelledError:
+                reason = "cancelled"
+            elif exc_type is not None:
+                reason = "error"
         finally:
             if self._context_renew_task is not None:
                 await self._stop_auto_renew(self._context_renew_task)
                 self._context_renew_task = None
-            await self.release()
+            await self.release(reason=reason)
 
     async def renew(self) -> bool:
         """
@@ -127,13 +133,14 @@ class StreamLease:
             self.expires_at = start_monotonic + self.manager.config.lease_seconds
         return success
 
-    async def release(self) -> None:
+    async def release(self, reason: str = "manual") -> None:
         """Explicitly release this lease from Redis."""
         if self._is_released:
             return
         self._is_released = True
         if not self._is_fallback:
             await self.manager.release(self)
+        _trigger_hook_background(self.manager.config.on_released, self, reason)
 
     def _start_auto_renew(
         self, interval: float | None = None
@@ -240,6 +247,7 @@ class StreamLease:
         """
         renew_task: asyncio.Task[None] | None = None
         lease_lost = asyncio.Event()
+        reason = "completed"
 
         try:
             if auto_renew:
@@ -248,13 +256,18 @@ class StreamLease:
                 yield chunk
         except asyncio.CancelledError:
             if lease_lost.is_set():
+                reason = "lost"
                 _safe_uncancel()
                 raise StreamLeaseLost(self.lease_id) from None
+            reason = "cancelled"
+            raise
+        except Exception:
+            reason = "error"
             raise
         finally:
             if renew_task is not None:
                 await self._stop_auto_renew(renew_task)
-            await self.release()
+            await self.release(reason=reason)
 
     def as_streaming_response(
         self,

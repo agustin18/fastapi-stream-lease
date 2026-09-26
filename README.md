@@ -130,12 +130,14 @@ The manager context and `async with lease` both renew while open. Handle normal 
   `LeaseConfig` provides zero-dependency callback hooks (supporting both sync and async callables) to plug directly into Prometheus, Datadog, StatsD, or Sentry:
   ```python
   config = LeaseConfig(
-      on_acquired=lambda lease: PROMETHEUS_ACQUIRED.inc(),
+      on_acquired=lambda lease: PROMETHEUS_ACTIVE.inc(),
+      on_released=lambda lease, reason: PROMETHEUS_ACTIVE.dec(),
       on_rejected=lambda uid, reason: PROMETHEUS_REJECTED.labels(reason=reason).inc(),
       on_lost=lambda lease, reason: PROMETHEUS_LOST.labels(reason=reason).inc(),
       on_backend_error=lambda exc: PROMETHEUS_BACKEND_ERRORS.inc(),
   )
   ```
+  `on_released` receives the release reason (`completed`, `cancelled`, `error`, `lost`, or `manual`), guaranteeing that active connection gauges decrement accurately across all stream terminations.
 - **Redis Failover & Sentinel Support:** Automatically classifies `ReadOnlyError` (thrown when hitting a replica during master election) as a transient condition, enabling adaptive renewal retries to ride out failovers without dropping active streams.
 - **Redis Cluster:** All keys use Redis hash tags (`{prefix}:user:...` and `{prefix}:global`), guaranteeing user and global sorted sets reside on the same hash slot for multi-key atomic Lua operations. As with any multi-key Lua coordination, evaluate slot contention and failover behavior under your specific topology.
 

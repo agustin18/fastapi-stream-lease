@@ -568,6 +568,9 @@ def test_lease_config_validation_hooks_and_retry_after():
     with pytest.raises(TypeError, match="on_acquired must be callable"):
         LeaseConfig(on_acquired="not_a_callable")
 
+    with pytest.raises(TypeError, match="on_released must be callable"):
+        LeaseConfig(on_released="not_a_callable")
+
 
 @pytest.mark.asyncio
 async def test_lifecycle_hooks_invocation(fake_redis):
@@ -749,3 +752,106 @@ async def test_release_triggers_on_backend_error_hook(fake_redis):
 
     assert len(backend_errors) == 1
     assert isinstance(backend_errors[0], ConnectionError)
+
+
+@pytest.mark.parametrize(
+    "exit_mode,expected_reason",
+    [
+        ("normal", "completed"),
+        ("error", "error"),
+        ("cancelled", "cancelled"),
+        ("lost", "lost"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_on_released_hook_context_manager(fake_redis, exit_mode, expected_reason):
+    """Verify on_released hook receives correct reason on context manager exits."""
+    released_events = []
+
+    def on_rel(lease, reason):
+        released_events.append((lease.user_id, reason))
+
+    config = LeaseConfig(lease_seconds=2.0, on_released=on_rel)
+    mgr = StreamLeaseManager(redis=fake_redis, config=config)
+
+    if exit_mode == "normal":
+        async with mgr.lease("u_rel_norm"):
+            pass
+    elif exit_mode == "error":
+        with pytest.raises(RuntimeError, match="boom"):
+            async with mgr.lease("u_rel_err"):
+                raise RuntimeError("boom")
+    elif exit_mode == "cancelled":
+
+        async def cancel_block():
+            async with mgr.lease("u_rel_canc"):
+                raise asyncio.CancelledError()
+
+        with pytest.raises(asyncio.CancelledError):
+            await cancel_block()
+    elif exit_mode == "lost":
+        with pytest.raises(StreamLeaseLost):
+            async with mgr.lease("u_rel_lost", renew_interval=0.04):
+                await fake_redis.flushall()
+                await asyncio.sleep(0.1)
+
+    assert len(released_events) == 1
+    assert released_events[0][1] == expected_reason
+
+
+@pytest.mark.parametrize(
+    "stream_mode,expected_reason",
+    [
+        ("normal", "completed"),
+        ("error", "error"),
+        ("cancelled", "cancelled"),
+        ("manual", "manual"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_on_released_hook_stream_wrap(fake_redis, stream_mode, expected_reason):
+    """Verify on_released hook receives correct reason on stream wrap and manual release."""
+    released_events = []
+
+    def on_rel(lease, reason):
+        released_events.append((lease.user_id, reason))
+
+    config = LeaseConfig(lease_seconds=2.0, on_released=on_rel)
+    mgr = StreamLeaseManager(redis=fake_redis, config=config)
+    lease = await mgr.acquire("u_wrap_rel")
+
+    if stream_mode == "manual":
+        await lease.release()
+    elif stream_mode == "normal":
+
+        async def s_normal():
+            yield 1
+            yield 2
+
+        async for _ in lease.wrap(s_normal(), auto_renew=False):
+            pass
+    elif stream_mode == "error":
+
+        async def s_err():
+            yield 1
+            raise RuntimeError("stream fail")
+
+        with pytest.raises(RuntimeError, match="stream fail"):
+            async for _ in lease.wrap(s_err(), auto_renew=False):
+                pass
+    elif stream_mode == "cancelled":
+
+        async def s_canc():
+            yield 1
+            raise asyncio.CancelledError()
+
+        with pytest.raises(asyncio.CancelledError):
+            async for _ in lease.wrap(s_canc(), auto_renew=False):
+                pass
+
+    assert len(released_events) == 1
+    assert released_events[0][1] == expected_reason
+
+    # Calling release() again must not re-trigger on_released (exactly-once release)
+    await lease.release()
+    assert len(released_events) == 1
