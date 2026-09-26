@@ -44,6 +44,8 @@ The first two requests stream events; the third receives `429` with a `Retry-Aft
 ## FastAPI integration
 
 ```python
+from contextlib import asynccontextmanager
+
 from fastapi import Depends, FastAPI, Request
 from fastapi.responses import StreamingResponse
 import redis.asyncio as redis
@@ -55,7 +57,6 @@ from fastapi_stream_lease import (
     StreamLeaseUnavailable,
 )
 
-app = FastAPI()
 # Set explicit timeouts so slow Redis calls do not block worker threads
 redis_client = redis.from_url(
     "redis://localhost:6379",
@@ -66,6 +67,19 @@ manager = StreamLeaseManager(
     redis_client,
     LeaseConfig(max_per_user=2, max_global=500, lease_seconds=30),
 )
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Verify cluster configuration consistency on worker startup (fail-fast on mismatch or outage)
+    await manager.verify_cluster_config(strict=True)
+    yield
+    # Clean teardown: drain telemetry callbacks and close resources
+    await manager.close(drain=True, timeout=5.0)
+    await redis_client.aclose()
+
+
+app = FastAPI(lifespan=lifespan)
 
 
 async def authenticated_user_id() -> str:
@@ -125,11 +139,11 @@ The manager context and `async with lease` both renew while open. Handle normal 
 |---|---|---|---|
 | **Worker Process Crash (`SIGKILL`)** | Lease expires in Redis after `lease_seconds` via Redis `TIME` score. Subsequent acquisitions automatically sweep expired members. | **Strong (Self-healing within $TTL$)** | Slot remains held until `lease_seconds` elapses; no zombie leases persist permanently. |
 | **Transient Redis Disconnect (Renewal)** | Renewal worker enters Adaptive Grace Period, retrying across the remaining TTL. If connection recovers before deadline, stream proceeds normally. | **High Availability** | If outage exceeds remaining TTL, lease is revoked, cancelling stream immediately. |
-| **Event Loop Stalled / Process Paused > TTL** | Redis lease expires while local worker is stalled (e.g. extreme GC pause, VM suspension, CPU starvation). When execution resumes, the next renewal detects expiration and terminates the stream immediately. | **Eventual Safety** | Slots are preserved in Redis, but a local worker stalled past TTL cannot observe cancellation until its event loop resumes execution. |
+| **Event Loop Stalled / Process Paused > TTL** | Redis lease expires while local worker is stalled (e.g. extreme GC pause, VM suspension, CPU starvation). When execution resumes, the next renewal detects expiration and terminates the stream immediately with `StreamLeaseLost`. | **Eventual Safety** | Slots self-clean in Redis, but a local worker stalled past TTL cannot observe cancellation until its event loop resumes execution. |
 | **Redis Outage on Acquire (`fail_open=False`)** | Immediate fail-closed rejection raising `StreamLeaseUnavailable` (`HTTP 503 Service Unavailable`). | **Strict Safety** | Limits strictly enforced; incoming streams rejected until Redis is reachable. |
 | **Redis Outage on Acquire (`fail_open=True`)** | Grants an uncoordinated in-memory fallback lease using worker monotonic clock (`time.monotonic()`). | **Graceful Degradation** | Fallback acquisitions are intentionally unthrottled across and *within* worker processes during outage; fallback leases do not retroactively register upon Redis recovery. |
 | **Worker Clock Drift** | All lease evaluations and expiration purges use `redis.call('TIME')`. | **Absolute** | Worker system clock or NTP skew cannot cause premature expiration or lingering leases. |
-| **Slow Observability / Metric Hooks** | All lifecycle hooks (`on_acquired`, `on_released`, `on_lost`, `on_rejected`, `on_backend_error`) run out-of-band via background tasks and threadpool offloading (`asyncio.to_thread` for sync callables). | **Strong Guarantee** | Slow APM/Datadog/StatsD calls cannot delay stream cancellation, block acquire returns, or consume renewal retry windows. |
+| **Slow Observability / Metric Hooks** | All lifecycle hooks (`on_acquired`, `on_released`, `on_lost`, `on_rejected`, `on_backend_error`) run out-of-band via an internal bounded FIFO queue and threadpool (`asyncio.to_thread` for sync callables). | **Strong Guarantee** | Slow APM/Datadog/StatsD calls cannot delay stream cancellation, block acquire returns, or consume renewal retry windows. |
 | **Redis Sentinel Master Failover** | `READONLY` transitions during replica write are retried. Asynchronous Redis replication can lose recently acknowledged writes if a master fails before syncing; un-replicated leases are detected as lost on next renewal and cancelled cleanly. | **High Availability** | Seamlessly rides out master elections shorter than remaining `lease_seconds`. Divergent writes are terminated rather than resurrected. |
 | **Redis Cluster Multi-Key Coordination** | Keys share hash tag `{prefix}` (`{prefix}:user:...` and `{prefix}:global`), guaranteeing placement on the same hash slot for atomic Lua execution. | **Atomic Lua Execution** | Atomically validates both per-user and global capacity in a single Redis round-trip without `CROSSSLOT` errors. Coordinated keys share one cluster slot, which can become a hot slot at extreme throughput. |
 
@@ -147,7 +161,7 @@ When `fail_open=True` is enabled in `LeaseConfig`, the manager grants fallback l
   - `fail_open=False` (Default): Raises `StreamLeaseUnavailable` (HTTP 503) when Redis is unreachable. Enforces limits during transient network partitions at the cost of rejecting requests when the backend is down. (Note: asynchronous Redis replication or master failover can still lose recently acknowledged writes if a master fails before syncing to its replica).
   - `fail_open=True`: Automatically grants in-memory fallback leases when Redis encounters network or timeout errors. Keeps streaming endpoints open during outages, with the operational trade-off that limits are not coordinated across workers until Redis recovers. Authentication, authorization, and script syntax errors never fail open.
 - **Definitive Revocation vs. Network Errors:** If Redis explicitly reports that a lease is missing or expired (`renew()` returning 0) or encounters an unhandled execution error, `wrap()` and `lease()` cancel the stream immediately to prevent exceeding limits. Transient network disconnects trigger rapid retries until the monotonic lease deadline is reached.
-- **Observability and Lifecycle Hooks:**
+- **Observability and Lifecycle Hooks (Best-Effort Telemetry Contract):**
   `LeaseConfig` provides zero-dependency callback hooks (supporting both sync and async callables) to plug directly into Prometheus, Datadog, StatsD, or Sentry:
   ```python
   config = LeaseConfig(
@@ -159,23 +173,26 @@ When `fail_open=True` is enabled in `LeaseConfig`, the manager grants fallback l
       hook_queue_size=1024,
   )
   ```
-  `on_released` receives the release reason (`completed`, `cancelled`, `error`, `lost`, or `manual`), guaranteeing that active connection gauges decrement accurately across all stream terminations.
-  All lifecycle hooks are managed by an internal bounded FIFO `HookDispatcher`. On application shutdown, flush all pending telemetry events gracefully:
+  - **Best-Effort Delivery:** Lifecycle callbacks are designed strictly for out-of-band telemetry and monitoring. If callbacks execute slower than event arrival and fill `hook_queue_size`, new events are dropped with a rate-limited log warning to preserve event-loop responsiveness. **Never rely on lifecycle hooks for financial billing, credit deduction, or security-critical audits.**
+  - `on_released` receives the release reason (`completed`, `cancelled`, `error`, `lost`, or `manual`), guaranteeing that active connection gauges decrement accurately across all stream terminations.
+  - Dispatcher telemetry properties for operational monitoring: `manager.dispatcher.queued_count`, `manager.dispatcher.dropped_count`, `manager.dispatcher.error_count`, and `manager.dispatcher.queue_depth`.
+  - On application shutdown, flush all pending telemetry events gracefully:
   ```python
-  await manager.drain(timeout=5.0)
+  await manager.close(drain=True, timeout=5.0)
   ```
 - **Cluster Configuration Drift Detection:**
-  In distributed environments with multiple worker processes or Kubernetes pods, ensure all instances share identical limit configurations:
+  In distributed environments with multiple worker processes or Kubernetes pods, ensure all instances share identical limit configurations. Canonical configuration is registered atomically via `SET ... NX` (persistent key `{prefix}:config` with no TTL expiration to prevent split-brain during rolling deploys):
   ```python
-  # Logs a warning on drift or raises ConfigurationMismatchError if strict=True
+  # Logs a warning on drift or raises ConfigurationMismatchError if strict=True.
+  # When strict=True, network errors raise StreamLeaseUnavailable to fail-fast on pod startup.
   await manager.verify_cluster_config(strict=True)
   ```
 - **Redis Failover & Sentinel Support:** Automatically classifies `ReadOnlyError` (thrown when hitting a replica during master election) as a transient condition, enabling adaptive renewal retries to ride out failovers without dropping active streams.
 - **Redis Cluster:** All keys use Redis hash tags (`{prefix}:user:...` and `{prefix}:global`), guaranteeing user and global sorted sets reside on the same hash slot for multi-key atomic Lua operations. As with any multi-key Lua coordination, evaluate slot contention and failover behavior under your specific topology.
 - **Reproducible Concurrency Benchmarks:**
-  Run throughput and latency benchmarks against your local Redis instance:
+  Run throughput and latency benchmarks against your local Redis instance with pre-warmed connection pool and multi-run statistics:
   ```bash
-  docker compose run --rm backend uv run python benchmarks/bench_lease_concurrency.py --count 1000 --concurrency 50
+  docker compose run --rm backend uv run python benchmarks/bench_lease_concurrency.py --count 1000 --concurrency 50 --runs 3
   ```
 - **Docker Compose Testing Stack:** Run the test suite and Redis dependency cleanly across Linux, macOS, and Windows:
   ```bash

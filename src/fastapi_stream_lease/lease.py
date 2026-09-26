@@ -26,42 +26,6 @@ def _safe_uncancel() -> None:
             uncancel()
 
 
-_BACKGROUND_HOOK_TASKS: set[asyncio.Task[Any]] = set()
-
-
-async def _run_async_hook(coro: Any, hook: Any) -> None:
-    try:
-        await coro
-    except Exception as exc:
-        logger.warning("Error executing lease lifecycle callback %s: %s", hook, exc)
-
-
-def _trigger_hook(hook: Any, *args: Any) -> None:
-    """Safely trigger an optional sync or async lifecycle callback without raising.
-
-    Synchronous callbacks execute inline and must be non-blocking (e.g. metric updates).
-    Asynchronous callbacks are dispatched out-of-band on the running event loop as
-    background tasks, ensuring network/telemetry I/O never delays coordination.
-    """
-    if hook is None:
-        return
-    try:
-        res = hook(*args)
-        if asyncio.iscoroutine(res):
-            try:
-                loop = asyncio.get_running_loop()
-                task = loop.create_task(_run_async_hook(res, hook))
-                _BACKGROUND_HOOK_TASKS.add(task)
-                task.add_done_callback(_BACKGROUND_HOOK_TASKS.discard)
-            except RuntimeError:
-                res.close()
-    except Exception as exc:
-        logger.warning("Error executing lease lifecycle callback %s: %s", hook, exc)
-
-
-_trigger_hook_background = _trigger_hook
-
-
 @dataclass
 class StreamLease:
     """Represents an active, acquired stream lease."""

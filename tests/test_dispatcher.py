@@ -216,3 +216,72 @@ async def test_manager_lifecycle_context_and_drain(fake_redis):
         await mgr.drain(timeout=2.0)
         assert events == ["acq"]
         await lease.release()
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_metrics_properties():
+    """Verify queued_count, dropped_count, error_count, and queue_depth counters."""
+    dispatcher = HookDispatcher(max_queue_size=2, sync_inline=False)
+    block_worker = asyncio.Event()
+
+    async def blocking_hook():
+        await block_worker.wait()
+
+    def failing_hook():
+        raise RuntimeError("boom")
+
+    assert dispatcher.queued_count == 0
+    assert dispatcher.dropped_count == 0
+    assert dispatcher.error_count == 0
+    assert dispatcher.queue_depth == 0
+
+    # 1. Enqueue blocking hook (will be picked up by worker immediately)
+    assert dispatcher.dispatch(blocking_hook) is True
+    await asyncio.sleep(0.01)
+
+    # 2. Fill queue to max capacity (2 items)
+    assert dispatcher.dispatch(lambda: None) is True
+    assert dispatcher.dispatch(failing_hook) is True
+    assert dispatcher.queue_depth == 2
+
+    # 3. Exceed capacity -> should drop
+    assert dispatcher.dispatch(lambda: None) is False
+    assert dispatcher.dropped_count == 1
+
+    # Unblock worker and let items process
+    block_worker.set()
+    await dispatcher.drain(timeout=2.0)
+
+    assert dispatcher.queued_count == 3
+    assert dispatcher.dropped_count == 1
+    assert dispatcher.error_count == 1
+    assert dispatcher.queue_depth == 0
+
+    await dispatcher.close()
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_default_sync_inline_is_false():
+    """Verify that default HookDispatcher sets sync_inline=False for out-of-band execution."""
+    dispatcher = HookDispatcher()
+    assert dispatcher._sync_inline is False
+    await dispatcher.close()
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_close_worker_cancellation_timeout():
+    """Verify that close() forcibly cancels hung worker task on timeout without uncaught error."""
+    dispatcher = HookDispatcher(max_queue_size=10, sync_inline=False)
+    hung_forever = asyncio.Event()
+
+    async def hang():
+        await hung_forever.wait()
+
+    dispatcher.dispatch(hang)
+    await asyncio.sleep(0.01)
+
+    # close without drain, with tiny timeout so worker is cancelled while hanging
+    await dispatcher.close(drain=False, timeout=0.01)
+    assert dispatcher._closed is True
+    assert dispatcher._worker_task is not None
+    assert dispatcher._worker_task.done()

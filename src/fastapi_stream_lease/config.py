@@ -106,6 +106,7 @@ class LeaseConfig:
     def fingerprint_dict(self) -> dict[str, Any]:
         """Return critical cluster configuration parameters for consistency verification."""
         return {
+            "algorithm_version": 1,
             "key_prefix": self.key_prefix,
             "max_per_user": self.max_per_user,
             "max_global": self.max_global,
