@@ -1054,4 +1054,3 @@ async def test_verify_cluster_config_with_bytes_and_string_payloads(fake_redis):
     manager.redis.get = AsyncMock(return_value=json.dumps(payload))
     assert await manager.verify_cluster_config(strict=True) is True
     await manager.close()
-
