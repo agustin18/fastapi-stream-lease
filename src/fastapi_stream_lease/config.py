@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import isfinite
 
 
 @dataclass(frozen=True)
@@ -20,12 +21,24 @@ class LeaseConfig:
     """Prefix for Redis keys (e.g. stream_lease:user:{id}, stream_lease:global)."""
 
     def __post_init__(self) -> None:
-        if self.lease_seconds <= 0:
-            raise ValueError("lease_seconds must be greater than 0")
+        if not isfinite(self.lease_seconds) or self.lease_seconds <= 0:
+            raise ValueError("lease_seconds must be finite and greater than 0")
         if self.max_per_user < 0:
             raise ValueError("max_per_user cannot be negative")
         if self.max_global < 0:
             raise ValueError("max_global cannot be negative")
+        if not self.key_prefix:
+            raise ValueError("key_prefix cannot be empty")
+        if "{" in self.key_prefix or "}" in self.key_prefix:
+            left = self.key_prefix.find("{")
+            right = self.key_prefix.find("}")
+            if (
+                left < 0
+                or right <= left + 1
+                or self.key_prefix.count("{") != 1
+                or self.key_prefix.count("}") != 1
+            ):
+                raise ValueError("key_prefix must contain one nonempty Redis hash tag")
 
     @property
     def _cluster_prefix(self) -> str:

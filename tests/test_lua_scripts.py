@@ -111,6 +111,18 @@ async def test_lease_renewal(lease_manager):
 
 
 @pytest.mark.asyncio
+async def test_expired_lease_cannot_be_revived(lease_manager):
+    lease = await lease_manager.acquire("user_1")
+    await asyncio.sleep(2.1)
+    replacement = await lease_manager.acquire("user_1")
+
+    assert await lease.renew() is False
+    assert await lease_manager.get_active_count("user_1") == 1
+    assert await lease_manager.get_active_count() == 1
+    await replacement.release()
+
+
+@pytest.mark.asyncio
 async def test_acquire_unexpected_code(lease_manager):
     lease_manager.redis.eval = AsyncMock(return_value=99)
     with pytest.raises(RuntimeError, match="Unexpected stream lease acquisition return code: 99"):
@@ -151,8 +163,17 @@ async def test_unlimited_limits(fake_redis):
 def test_lease_config_validation():
     from fastapi_stream_lease import LeaseConfig
 
-    with pytest.raises(ValueError, match="lease_seconds must be greater than 0"):
+    with pytest.raises(ValueError, match="lease_seconds must be finite and greater than 0"):
         LeaseConfig(lease_seconds=0)
+
+    with pytest.raises(ValueError, match="lease_seconds"):
+        LeaseConfig(lease_seconds=float("nan"))
+
+    with pytest.raises(ValueError, match="key_prefix cannot be empty"):
+        LeaseConfig(key_prefix="")
+
+    with pytest.raises(ValueError, match="one nonempty Redis hash tag"):
+        LeaseConfig(key_prefix="{}")
 
     with pytest.raises(ValueError, match="max_per_user cannot be negative"):
         LeaseConfig(max_per_user=-1)

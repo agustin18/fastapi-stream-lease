@@ -7,6 +7,14 @@ class StreamLeaseError(Exception):
     """Base exception for all stream lease errors."""
 
 
+class StreamLeaseLost(StreamLeaseError):
+    """Raised when an active stream can no longer hold its concurrency slot."""
+
+    def __init__(self, lease_id: str) -> None:
+        self.lease_id = lease_id
+        super().__init__(f"Stream lease {lease_id} was lost")
+
+
 class StreamLeaseRejected(StreamLeaseError):
     """Raised when a stream lease request is rejected due to concurrency limits."""
 

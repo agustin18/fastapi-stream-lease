@@ -8,6 +8,8 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, TypeVar
 
+from fastapi_stream_lease.exceptions import StreamLeaseLost
+
 if TYPE_CHECKING:
     from fastapi_stream_lease.manager import StreamLeaseManager
 
@@ -47,6 +49,35 @@ class StreamLease:
         self._is_released = True
         await self.manager.release(self)
 
+    def _start_auto_renew(
+        self, interval: float | None = None
+    ) -> tuple[asyncio.Task[None], asyncio.Event]:
+        interval = self.manager.config.lease_seconds / 2 if interval is None else interval
+        if not 0 < interval < self.manager.config.lease_seconds:
+            raise ValueError("renew_interval must be positive and shorter than lease_seconds")
+
+        owner = asyncio.current_task()
+        if owner is None:
+            raise RuntimeError("Auto-renewal requires a running asyncio task")
+        lease_lost = asyncio.Event()
+
+        async def worker() -> None:
+            while not self._is_released:
+                await asyncio.sleep(interval)
+                if not await self.renew():
+                    logger.warning("Stream lease %s was lost during auto-renewal", self.lease_id)
+                    lease_lost.set()
+                    owner.cancel()
+                    return
+
+        return asyncio.create_task(worker()), lease_lost
+
+    @staticmethod
+    async def _stop_auto_renew(task: asyncio.Task[None]) -> None:
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+
     async def wrap(
         self,
         stream: AsyncIterable[T],
@@ -56,40 +87,23 @@ class StreamLease:
         """
         Wrap an async stream (e.g. SSE event generator or LLM token stream).
 
-        Guarantees that:
-        1. A background renewal worker keeps the lease alive during long pauses
-           (such as slow LLM time-to-first-token or client idle periods).
-        2. When the stream terminates, is cancelled, or the client disconnects,
-           the lease is guaranteed to be released in the `finally` block.
+        Renew during long pauses and release when the iterator closes. If renewal
+        fails, interrupt the stream with StreamLeaseLost. Consumers that stop early
+        must close the iterator (for example, with contextlib.aclosing).
         """
-        if renew_interval is not None and renew_interval >= self.manager.config.lease_seconds:
-            logger.warning(
-                "renew_interval (%.1fs) >= lease_seconds (%.1fs) on lease %s",
-                renew_interval,
-                self.manager.config.lease_seconds,
-                self.lease_id,
-            )
-
-        interval = renew_interval or (self.manager.config.lease_seconds / 2.0)
         renew_task: asyncio.Task[None] | None = None
-
-        async def _auto_renew_worker() -> None:
-            while not self._is_released:
-                await asyncio.sleep(interval)
-                success = await self.renew()
-                if not success:
-                    logger.warning("Stream lease %s was lost during auto-renewal", self.lease_id)
-                    break
-
-        if auto_renew:
-            renew_task = asyncio.create_task(_auto_renew_worker())
+        lease_lost = asyncio.Event()
 
         try:
+            if auto_renew:
+                renew_task, lease_lost = self._start_auto_renew(renew_interval)
             async for chunk in stream:
                 yield chunk
+        except asyncio.CancelledError:
+            if lease_lost.is_set():
+                raise StreamLeaseLost(self.lease_id) from None
+            raise
         finally:
             if renew_task is not None:
-                renew_task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await renew_task
+                await self._stop_auto_renew(renew_task)
             await self.release()

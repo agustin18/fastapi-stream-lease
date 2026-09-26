@@ -4,13 +4,14 @@ build-backend = "hatchling.build"
 
 [project]
 name = "fastapi-stream-lease"
-version = "0.1.0"
+version = "0.1.1"
 description = "Distributed stream and SSE concurrency lease manager for FastAPI and Starlette backed by atomic Redis Lua scripts."
 readme = "README.md"
 authors = [
     { name = "Agustin Saiz", email = "agustinsaiz02@gmail.com" }
 ]
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 keywords = [
     "fastapi",
     "starlette",
@@ -25,7 +26,6 @@ keywords = [
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
