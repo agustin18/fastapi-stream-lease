@@ -6,6 +6,16 @@ from typing import Any, Literal
 class StreamLeaseError(Exception):
     """Base exception for all stream lease errors."""
 
+    def as_response(self) -> Any:
+        """Convert into a Starlette/FastAPI JSONResponse if supported by the exception subclass."""
+        raise NotImplementedError(f"{self.__class__.__name__} does not implement as_response()")
+
+    def as_http_exception(self) -> Any:
+        """Convert into a Starlette/FastAPI HTTPException if supported by the exception subclass."""
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not implement as_http_exception()"
+        )
+
 
 class StreamLeaseLost(StreamLeaseError):
     """Raised when an active stream can no longer hold its concurrency slot."""

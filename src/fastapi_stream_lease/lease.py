@@ -8,7 +8,7 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, TypeVar
 
-from fastapi_stream_lease.exceptions import StreamLeaseLost
+from fastapi_stream_lease.exceptions import StreamLeaseLost, StreamLeaseUnavailable
 
 if TYPE_CHECKING:
     from fastapi_stream_lease.manager import StreamLeaseManager
@@ -16,6 +16,14 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
+
+
+def _safe_uncancel() -> None:
+    task = asyncio.current_task()
+    if task is not None:
+        uncancel = getattr(task, "uncancel", None)
+        if callable(uncancel):
+            uncancel()
 
 
 @dataclass
@@ -28,6 +36,7 @@ class StreamLease:
     global_key: str
     manager: StreamLeaseManager
     created_at: float = field(default_factory=time.time)
+    created_monotonic: float = field(default_factory=time.monotonic)
     expires_at: float = field(init=False)
     _is_released: bool = field(default=False, init=False)
     _is_fallback: bool = field(default=False, init=False)
@@ -37,7 +46,7 @@ class StreamLease:
     )
 
     def __post_init__(self) -> None:
-        self.expires_at = self.created_at + self.manager.config.lease_seconds
+        self.expires_at = self.created_monotonic + self.manager.config.lease_seconds
 
     async def __aenter__(self) -> StreamLease:
         if self._is_released:
@@ -50,6 +59,7 @@ class StreamLease:
     async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         try:
             if self._context_lease_lost.is_set():
+                _safe_uncancel()
                 raise StreamLeaseLost(self.lease_id) from None
         finally:
             if self._context_renew_task is not None:
@@ -58,15 +68,23 @@ class StreamLease:
             await self.release()
 
     async def renew(self) -> bool:
-        """Manually renew this lease, extending its TTL in Redis."""
+        """
+        Manually renew this lease, extending its TTL in Redis.
+
+        Returns:
+            bool: True if successfully extended, False if the lease expired or was evicted.
+        Raises:
+            StreamLeaseUnavailable: If the Redis backend is unreachable.
+        """
         if self._is_released:
             return False
         if self._is_fallback:
-            self.expires_at = time.time() + self.manager.config.lease_seconds
+            self.expires_at = time.monotonic() + self.manager.config.lease_seconds
             return True
+        start_monotonic = time.monotonic()
         success = await self.manager.renew(self)
         if success:
-            self.expires_at = time.time() + self.manager.config.lease_seconds
+            self.expires_at = start_monotonic + self.manager.config.lease_seconds
         return success
 
     async def release(self) -> None:
@@ -100,32 +118,48 @@ class StreamLease:
                 if self._is_released:
                     return
 
-                if await self.renew():
+                try:
+                    renewed = await self.renew()
+                except StreamLeaseUnavailable:
+                    # Backend outage: lease might still be active in Redis;
+                    # retry during remaining TTL
+                    now = time.monotonic()
+                    remaining = self.expires_at - now
+                    min_window = max(0.05, interval / 4)
+                    if remaining > min_window:
+                        retry_interval = max(0.05, min(remaining / 3, 2.0))
+                        logger.warning(
+                            "Stream lease %s renewal attempt failed due to backend outage; "
+                            "retrying in %.2fs (%.2fs remaining)",
+                            self.lease_id,
+                            retry_interval,
+                            remaining,
+                        )
+                        current_interval = retry_interval
+                        continue
+                    else:
+                        logger.error(
+                            "Stream lease %s expired during backend outage; cancelling stream",
+                            self.lease_id,
+                        )
+                        lease_lost.set()
+                        owner.cancel()
+                        return
+
+                if renewed:
                     current_interval = interval
                     continue
 
-                # Renewal failed: check remaining TTL grace period before cancelling
-                now = time.time()
-                remaining = self.expires_at - now
-                min_window = max(0.05, interval / 4)
-                if remaining > min_window:
-                    retry_interval = max(0.05, min(remaining / 3, 2.0))
-                    logger.warning(
-                        "Stream lease %s renewal attempt failed; "
-                        "retrying in %.2fs (%.2fs remaining)",
-                        self.lease_id,
-                        retry_interval,
-                        remaining,
-                    )
-                    current_interval = retry_interval
-                else:
-                    logger.error(
-                        "Stream lease %s expired and could not be renewed; cancelling stream",
-                        self.lease_id,
-                    )
-                    lease_lost.set()
-                    owner.cancel()
-                    return
+                # Redis confirmed lease is lost/expired (renew() returned False).
+                # Terminate immediately without retries to enforce concurrency limits.
+                logger.error(
+                    "Stream lease %s was revoked or expired in Redis; "
+                    "cancelling stream immediately",
+                    self.lease_id,
+                )
+                lease_lost.set()
+                owner.cancel()
+                return
 
         return asyncio.create_task(worker()), lease_lost
 
@@ -158,6 +192,7 @@ class StreamLease:
                 yield chunk
         except asyncio.CancelledError:
             if lease_lost.is_set():
+                _safe_uncancel()
                 raise StreamLeaseLost(self.lease_id) from None
             raise
         finally:
