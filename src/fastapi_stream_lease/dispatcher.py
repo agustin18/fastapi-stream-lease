@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import time
+from contextlib import suppress
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -16,7 +18,7 @@ class HookDispatcher:
     and enforces bounded queue backpressure to prevent unbounded task accumulation.
     """
 
-    def __init__(self, max_queue_size: int = 1024, sync_inline: bool = True) -> None:
+    def __init__(self, max_queue_size: int = 1024, sync_inline: bool = False) -> None:
         if max_queue_size <= 0:
             raise ValueError("max_queue_size must be greater than 0")
         self._max_queue_size = max_queue_size
@@ -24,6 +26,30 @@ class HookDispatcher:
         self._queue: asyncio.Queue[tuple[Any, tuple[Any, ...]] | None] | None = None
         self._worker_task: asyncio.Task[None] | None = None
         self._closed = False
+        self._queued_count = 0
+        self._dropped_count = 0
+        self._error_count = 0
+        self._last_drop_log_time = 0.0
+
+    @property
+    def queued_count(self) -> int:
+        """Total number of callback invocations successfully enqueued."""
+        return self._queued_count
+
+    @property
+    def dropped_count(self) -> int:
+        """Total number of callback invocations dropped due to queue backpressure or closure."""
+        return self._dropped_count
+
+    @property
+    def error_count(self) -> int:
+        """Total number of exceptions raised during callback execution."""
+        return self._error_count
+
+    @property
+    def queue_depth(self) -> int:
+        """Current number of pending callbacks in the queue."""
+        return self._queue.qsize() if self._queue is not None else 0
 
     def _ensure_worker(self) -> None:
         """Lazily initialize the queue and consumer worker task on the running loop."""
@@ -52,6 +78,7 @@ class HookDispatcher:
                     if inspect.isawaitable(res):
                         await res
             except Exception as exc:
+                self._error_count += 1
                 logger.warning(
                     "Error executing lifecycle callback %s: %s",
                     hook_or_coro,
@@ -65,16 +92,24 @@ class HookDispatcher:
             self._ensure_worker()
             assert self._queue is not None
             self._queue.put_nowait((hook_or_coro, args))
+            self._queued_count += 1
             return True
         except asyncio.QueueFull:
-            logger.warning(
-                "Lifecycle hook queue full (capacity=%d); dropping callback %s",
-                self._max_queue_size,
-                hook_or_coro,
-            )
+            self._dropped_count += 1
+            now = time.monotonic()
+            if now - self._last_drop_log_time >= 2.0:
+                self._last_drop_log_time = now
+                logger.warning(
+                    "Lifecycle hook queue full (capacity=%d, dropped_total=%d); "
+                    "dropping callback %s",
+                    self._max_queue_size,
+                    self._dropped_count,
+                    hook_or_coro,
+                )
             return False
         except RuntimeError as exc:
             # Event loop is closed or shutting down
+            self._dropped_count += 1
             logger.warning("Could not dispatch lifecycle hook %s: %s", hook_or_coro, exc)
             return False
 
@@ -90,6 +125,7 @@ class HookDispatcher:
         if hook is None:
             return True
         if self._closed:
+            self._dropped_count += 1
             logger.warning("Attempted to dispatch hook %s on a closed dispatcher", hook)
             return False
 
@@ -100,6 +136,7 @@ class HookDispatcher:
                     return self._enqueue(res, ())
                 return True
             except Exception as exc:
+                self._error_count += 1
                 logger.warning("Error executing lifecycle callback %s: %s", hook, exc)
                 return False
 
@@ -138,3 +175,5 @@ class HookDispatcher:
                 await asyncio.wait_for(self._worker_task, timeout=timeout)
             except (asyncio.QueueFull, TimeoutError, asyncio.TimeoutError):
                 self._worker_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await self._worker_task
