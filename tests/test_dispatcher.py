@@ -285,3 +285,67 @@ async def test_dispatcher_close_worker_cancellation_timeout():
     assert dispatcher._closed is True
     assert dispatcher._worker_task is not None
     assert dispatcher._worker_task.done()
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_sync_hook_returning_awaitable():
+    """Verify that a sync hook returning an awaitable coroutine is awaited in the consumer."""
+    dispatcher = HookDispatcher(max_queue_size=10, sync_inline=False)
+    executed = []
+
+    async def async_inner():
+        executed.append("done")
+
+    def sync_returning_coro():
+        return async_inner()
+
+    dispatcher.dispatch(sync_returning_coro)
+    await dispatcher.drain(timeout=2.0)
+    assert executed == ["done"]
+    await dispatcher.close()
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_rate_limited_drop_logging():
+    """Verify rate-limited logging branch when multiple drops occur in rapid succession."""
+    dispatcher = HookDispatcher(max_queue_size=1, sync_inline=False)
+    block_worker = asyncio.Event()
+
+    async def blocker():
+        await block_worker.wait()
+
+    dispatcher.dispatch(blocker)
+    await asyncio.sleep(0.01)
+
+    # Fill queue to capacity (1 item)
+    dispatcher.dispatch(lambda: None)
+    # First drop (triggers log)
+    assert dispatcher.dispatch(lambda: None) is False
+    # Second drop within 2s (hits rate-limit branch without re-logging)
+    assert dispatcher.dispatch(lambda: None) is False
+    assert dispatcher.dropped_count == 2
+
+    block_worker.set()
+    await dispatcher.drain(timeout=2.0)
+    await dispatcher.close()
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_enqueue_runtime_error():
+    """Verify that RuntimeError during _enqueue (e.g. shutdown) drops and returns False."""
+    from unittest.mock import patch
+
+    dispatcher = HookDispatcher(max_queue_size=10, sync_inline=False)
+    with patch.object(dispatcher, "_ensure_worker", side_effect=RuntimeError("Loop closed")):
+        assert dispatcher.dispatch(lambda: None) is False
+        assert dispatcher.dropped_count == 1
+    await dispatcher.close()
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_drain_when_queue_none():
+    """Verify drain() returns immediately when no worker/queue was instantiated."""
+    dispatcher = HookDispatcher(max_queue_size=10, sync_inline=False)
+    assert dispatcher._queue is None
+    await dispatcher.drain(timeout=1.0)
+    await dispatcher.close()
