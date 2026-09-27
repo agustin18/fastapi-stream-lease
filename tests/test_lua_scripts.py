@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import asyncio
 from unittest.mock import AsyncMock
+from uuid import uuid4
 
 import pytest
 
-from fastapi_stream_lease import StreamLeaseRejected
+from fastapi_stream_lease import LeaseConfig, StreamLeaseManager, StreamLeaseRejected
 
 
 @pytest.mark.asyncio
@@ -112,13 +113,20 @@ async def test_lease_renewal(lease_manager):
 
 @pytest.mark.asyncio
 async def test_expired_lease_cannot_be_revived(lease_manager):
-    lease = await lease_manager.acquire("user_1")
-    await asyncio.sleep(2.2)
-    replacement = await lease_manager.acquire("user_1")
+    config = LeaseConfig(
+        lease_seconds=0.5,
+        max_per_user=2,
+        max_global=4,
+        key_prefix=f"expired_{uuid4().hex[:8]}",
+    )
+    mgr = StreamLeaseManager(redis=lease_manager.redis, config=config)
+    lease = await mgr.acquire("user_1")
+    await asyncio.sleep(0.7)
+    replacement = await mgr.acquire("user_1")
 
     assert await lease.renew() is False
-    assert await lease_manager.get_active_count("user_1") == 1
-    assert await lease_manager.get_active_count() == 1
+    assert await mgr.get_active_count("user_1") == 1
+    assert await mgr.get_active_count() == 1
     await replacement.release()
 
 

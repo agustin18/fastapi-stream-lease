@@ -29,27 +29,42 @@ from fastapi_stream_lease.lua import (
 
 logger = logging.getLogger(__name__)
 
+_NON_TRANSIENT_REDIS_ERRORS: tuple[type[BaseException], ...] = tuple(
+    cls
+    for name in ("AuthenticationError", "AuthorizationError", "ClusterCrossSlotError")
+    if (cls := getattr(redis.exceptions, name, None)) is not None
+)
+
+_TRANSIENT_REDIS_ERRORS: tuple[type[BaseException], ...] = tuple(
+    cls
+    for name in (
+        "ConnectionError",
+        "TimeoutError",
+        "ReadOnlyError",
+        "ClusterDownError",
+        "MasterDownError",
+        "SlotNotCoveredError",
+        "TryAgainError",
+        "ClusterError",
+    )
+    if (cls := getattr(redis.exceptions, name, None)) is not None
+)
+
+_TRANSIENT_BUILTIN_ERRORS: tuple[type[BaseException], ...] = (
+    ConnectionError,
+    TimeoutError,
+    asyncio.TimeoutError,
+    OSError,
+)
+
 
 def is_network_error(exc: BaseException) -> bool:
-    """Return True for transient network, timeout, or failover conditions."""
-    if isinstance(
-        exc,
-        (
-            redis.exceptions.AuthenticationError,
-            getattr(redis.exceptions, "AuthorizationError", ()),
-        ),
-    ):
+    """Return True for transient network, timeout, failover, or cluster state conditions."""
+    if isinstance(exc, _NON_TRANSIENT_REDIS_ERRORS):
         return False
-    if isinstance(
-        exc,
-        (
-            redis.exceptions.ConnectionError,
-            redis.exceptions.TimeoutError,
-            getattr(redis.exceptions, "ReadOnlyError", ()),
-        ),
-    ):
+    if isinstance(exc, _TRANSIENT_REDIS_ERRORS):
         return True
-    if isinstance(exc, (ConnectionError, TimeoutError, asyncio.TimeoutError, OSError)):
+    if isinstance(exc, _TRANSIENT_BUILTIN_ERRORS):
         return True
     return False
 

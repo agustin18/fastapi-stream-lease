@@ -19,6 +19,15 @@ from fastapi_stream_lease import (
 )
 
 
+async def _safe_close(client: redis.Redis) -> None:
+    if hasattr(client, "aclose"):
+        await client.aclose()
+    elif hasattr(client, "close"):
+        res = client.close()
+        if asyncio.iscoroutine(res):
+            await res
+
+
 @pytest.fixture
 async def real_manager():
     url = os.environ.get("REDIS_URL")
@@ -34,7 +43,7 @@ async def real_manager():
         await client.ping()
         yield manager
     finally:
-        await client.aclose()
+        await _safe_close(client)
 
 
 @pytest.mark.asyncio
@@ -61,7 +70,7 @@ async def test_real_redis_atomic_limits_across_managers(real_manager):
 @pytest.mark.asyncio
 async def test_real_redis_expired_lease_stays_expired(real_manager):
     expired = await real_manager.acquire("user_1")
-    await asyncio.sleep(0.55)
+    await asyncio.sleep(0.7)
     replacement = await real_manager.acquire("user_1")
     try:
         assert await expired.renew() is False
@@ -114,7 +123,10 @@ async def main():
     except StreamLeaseRejected as exc:
         print(exc.reason)
     finally:
-        await client.aclose()
+        if hasattr(client, "aclose"):
+            await client.aclose()
+        else:
+            await client.close()
 
 asyncio.run(main())
 """
@@ -184,7 +196,7 @@ async def test_real_redis_network_failure_fail_open_and_closed():
         assert await fallback.renew() is True
         await fallback.release()
     finally:
-        await broken_client.aclose()
+        await _safe_close(broken_client)
 
 
 @pytest.mark.asyncio
@@ -214,4 +226,4 @@ async def test_real_redis_verify_cluster_config_concurrent_race():
         assert sum(1 for r in results if r is False) == 15
     finally:
         await client.delete(cfg_a.config_key)
-        await client.aclose()
+        await _safe_close(client)

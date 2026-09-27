@@ -88,18 +88,41 @@ services:
           redis-cluster-4:7003 redis-cluster-5:7004 redis-cluster-6:7005 \
           --cluster-replicas 1
         
-        for i in $$(seq 1 30); do
-          STATE=$$(redis-cli -h redis-cluster-1 -p 7000 cluster info | grep cluster_state: | tr -d '\r\n')
-          SLOTS=$$(redis-cli -h redis-cluster-1 -p 7000 cluster info | grep cluster_slots_assigned: | tr -d '\r\n')
-          NODES=$$(redis-cli -h redis-cluster-1 -p 7000 cluster info | grep cluster_known_nodes: | tr -d '\r\n')
-          if [ "$$STATE" = "cluster_state:ok" ] && [ "$$SLOTS" = "cluster_slots_assigned:16384" ] && [ "$$NODES" = "cluster_known_nodes:6" ]; then
-            echo "Redis Cluster successfully initialized with 6 nodes and healthy!"
+        NODES="redis-cluster-1:7000 redis-cluster-2:7001 redis-cluster-3:7002 redis-cluster-4:7003 redis-cluster-5:7004 redis-cluster-6:7005"
+        for i in $$(seq 1 45); do
+          ALL_OK=true
+          for node in $$NODES; do
+            HOST=$${node%:*}
+            PORT=$${node#*:}
+            STATE=$$(redis-cli -h $$HOST -p $$PORT cluster info 2>/dev/null | grep cluster_state: | tr -d '\r\n')
+            SLOTS=$$(redis-cli -h $$HOST -p $$PORT cluster info 2>/dev/null | grep cluster_slots_assigned: | tr -d '\r\n')
+            KNOWN=$$(redis-cli -h $$HOST -p $$PORT cluster info 2>/dev/null | grep cluster_known_nodes: | tr -d '\r\n')
+            if [ "$$STATE" != "cluster_state:ok" ] || [ "$$SLOTS" != "cluster_slots_assigned:16384" ] || [ "$$KNOWN" != "cluster_known_nodes:6" ]; then
+              ALL_OK=false
+              break
+            fi
+            CNODES=$$(redis-cli -h $$HOST -p $$PORT cluster nodes 2>/dev/null)
+            if echo "$$CNODES" | grep -E -q 'fail\?|fail|handshake|disconnected'; then
+              ALL_OK=false
+              break
+            fi
+            ROLE=$$(redis-cli -h $$HOST -p $$PORT info replication 2>/dev/null | grep role: | tr -d '\r\n')
+            if [ "$$ROLE" = "role:slave" ]; then
+              MLINK=$$(redis-cli -h $$HOST -p $$PORT info replication 2>/dev/null | grep master_link_status: | tr -d '\r\n')
+              if [ "$$MLINK" != "master_link_status:up" ]; then
+                ALL_OK=false
+                break
+              fi
+            fi
+          done
+          if [ "$$ALL_OK" = "true" ]; then
+            echo "All 6 Redis Cluster nodes converged, 16384 slots assigned, replicas linked up, and cluster healthy!"
             exit 0
           fi
-          echo "Waiting for cluster convergence: $$STATE $$SLOTS $$NODES..."
+          echo "Waiting for symmetric cluster convergence across all 6 nodes (attempt $$i/45)..."
           sleep 1
         done
-        echo "Cluster initialization timed out!"
+        echo "Cluster symmetric initialization timed out!"
         exit 1
     networks:
       - cluster-net
