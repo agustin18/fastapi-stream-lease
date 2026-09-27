@@ -146,6 +146,7 @@ The manager context and `async with lease` both renew while open. Handle normal 
 | **Slow Observability / Metric Hooks** | All lifecycle hooks (`on_acquired`, `on_released`, `on_lost`, `on_rejected`, `on_backend_error`) run out-of-band via an internal bounded FIFO queue and threadpool (`asyncio.to_thread` for sync callables). | **Strong Guarantee** | Slow APM/Datadog/StatsD calls cannot delay stream cancellation, block acquire returns, or consume renewal retry windows. |
 | **Redis Sentinel Master Failover** | `READONLY` transitions during replica write are retried. Asynchronous Redis replication can lose recently acknowledged writes if a master fails before syncing; un-replicated leases are detected as lost on next renewal and cancelled cleanly. In split-brain network partitions, divergent masters can temporarily allow concurrent leases across partitions until the partition heals or `min-replicas-to-write` blocks writes on the isolated master. | **High Availability** | Seamlessly rides out master elections shorter than remaining `lease_seconds` when the lease state is present on the promoted replica. Divergent writes are terminated rather than resurrected. `min-replicas-to-write` can bound or reduce the stale-master write window during network partitions, at the cost of write availability. Redis Sentinel remains eventually consistent and cannot guarantee a strict cluster-wide concurrency bound across all network partitions. |
 | **Redis Cluster Multi-Key Coordination** | Keys share hash tag `{prefix}` (`{prefix}:user:...` and `{prefix}:global`), guaranteeing placement on the same hash slot for atomic Lua execution. | **Atomic Lua Execution** | Atomically validates both per-user and global capacity in a single Redis round-trip without `CROSSSLOT` errors. Coordinated keys share one cluster slot, which can become a hot slot at extreme throughput. |
+| **Redis Cluster Slot Failover & Replication** | Replicated leases and configuration keys survive slot promotion when a replica is elected. Acknowledged writes (leases or `{prefix}:config`) that have not reached the promoted replica before master failure may be lost. Un-replicated leases are detected as lost on next renewal and cleanly cancelled. Redis Cluster uses asynchronous replication and does not guarantee strict consistency during failures/partitions; `WAIT` minimizes this window but does not provide CP guarantees. | **High Availability** | Seamlessly transitions across cluster node failover when lease state reached the promoted replica. Streams with un-replicated leases are terminated on next renewal rather than resurrected. Different concurrency domains (different `{prefix}`) distribute across cluster shards, but all keys for a single prefix reside on one hash slot. |
 
 ### Fail-Open Fallback Lease Lifecycle
 
@@ -209,15 +210,24 @@ Because `{prefix}:config` is persistent (stored with `SET ... NX` without TTL ex
      ```
    - Start the updated worker instances. The first new pod will atomically register the updated configuration fingerprint with `SET ... NX`, and subsequent pods will verify compatibility against it.
 - **Redis Failover & Sentinel Support:** Automatically classifies `ReadOnlyError` (thrown when hitting a replica during master election) and `ConnectionError` as transient conditions, enabling adaptive renewal retries to ride out failovers without dropping active streams. Note that the Sentinel configuration in `docker-compose.sentinel.yml` uses aggressive test timings (`down-after-milliseconds 1000`, `failover-timeout 5000`); production environments should use standard recommended operational timeouts (`down-after-milliseconds` 5000–30000ms, `failover-timeout` 60000–180000ms).
-- **Redis Cluster:** All keys use Redis hash tags (`{prefix}:user:...` and `{prefix}:global`), guaranteeing user and global sorted sets reside on the same hash slot for multi-key atomic Lua operations. As with any multi-key Lua coordination, evaluate slot contention and failover behavior under your specific topology.
+- **Redis Cluster Support:** All keys use Redis hash tags (`{prefix}:user:...` and `{prefix}:global`), guaranteeing user and global sorted sets reside on the same hash slot for atomic multi-key Lua operations without `CROSSSLOT` errors. Validated under real 6-node sharded topologies (`docker-compose.cluster.yml`) with automated slot failover, `MOVED` redirection recovery, and drift verification (`tests/test_cluster.py`).
 - **Reproducible Concurrency Benchmarks:**
   Run throughput and latency benchmarks against your local Redis instance with pre-warmed connection pool and multi-run statistics:
   ```bash
   docker compose run --rm backend uv run python benchmarks/bench_lease_concurrency.py --count 1000 --concurrency 50 --runs 3
   ```
-- **Docker Compose Testing Stack:** Run the test suite and Redis dependency cleanly across Linux, macOS, and Windows:
+- **Docker Compose Testing Stack:** Run the test suite and distributed coordination topologies cleanly:
   ```bash
+  # Standard unit and integration test suite:
   docker compose run --rm backend uv run pytest
+
+  # Redis Sentinel failover & chaos test suite:
+  docker compose -f docker-compose.sentinel.yml up -d --wait
+  docker compose -f docker-compose.sentinel.yml run --rm backend uv run pytest -o addopts='' tests/test_sentinel.py -vv -s
+
+  # Redis Cluster 6-node multi-shard test suite:
+  docker compose -f docker-compose.cluster.yml up -d --wait
+  docker compose -f docker-compose.cluster.yml run --rm backend uv run --all-extras pytest -o addopts='' tests/test_cluster.py -vv -s
   ```
 
 ## Examples directory

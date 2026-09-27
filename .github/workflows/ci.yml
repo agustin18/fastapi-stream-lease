@@ -147,6 +147,63 @@ jobs:
         run: |
           docker compose -f docker-compose.sentinel.yml down -v
 
+  test-redis-py-min:
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 10
+    env:
+      REDIS_URL: redis://localhost:6379/15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      - name: Set up Python 3.12
+        run: uv python install 3.12
+      - name: Install dependencies with minimum redis-py floor
+        run: |
+          uv sync --locked --extra dev --python 3.12
+          uv pip install "redis==5.0.0"
+      - name: Run test suite with redis-py 5.0.0 floor
+        run: uv run --python 3.12 pytest -o addopts=''
+
+  test-cluster:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Start Redis Cluster Topology
+        run: |
+          docker compose -f docker-compose.cluster.yml up -d --wait
+
+      - name: Dump cluster logs on failure
+        if: failure()
+        run: |
+          docker compose -f docker-compose.cluster.yml logs
+
+      - name: Run Redis Cluster Integration & Failover Tests (latest redis-py)
+        run: |
+          docker compose -f docker-compose.cluster.yml run --rm backend uv run --all-extras pytest -o addopts='' tests/test_cluster.py -vv -s
+
+      - name: Settle cluster topology before floor test
+        run: sleep 5
+
+      - name: Run Redis Cluster Integration & Failover Tests (minimum redis-py==5.0.0 floor)
+        run: |
+          docker compose -f docker-compose.cluster.yml run --rm backend uv run --with "redis==5.0.0" pytest -o addopts='' tests/test_cluster.py -vv -s
+
+      - name: Teardown Redis Cluster Topology
+        if: always()
+        run: |
+          docker compose -f docker-compose.cluster.yml down -v
+
   package:
     runs-on: ubuntu-latest
     steps:

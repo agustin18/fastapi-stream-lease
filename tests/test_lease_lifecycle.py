@@ -7,6 +7,7 @@ from contextlib import aclosing
 from unittest.mock import AsyncMock
 
 import pytest
+import redis
 
 from fastapi_stream_lease import (
     LeaseConfig,
@@ -476,23 +477,39 @@ async def test_manager_non_network_errors_in_renew_release_and_count(lease_manag
         await lease_manager.get_active_count("err_user_non_net")
 
 
-def test_is_network_error_helper():
-    import redis.exceptions
-
+@pytest.mark.parametrize(
+    ("exc_class_or_name", "expected"),
+    [
+        (redis.exceptions.ConnectionError, True),
+        (redis.exceptions.TimeoutError, True),
+        ("ReadOnlyError", True),
+        ("ClusterDownError", True),
+        ("MasterDownError", True),
+        ("SlotNotCoveredError", True),
+        ("TryAgainError", True),
+        ("ClusterError", True),
+        (ConnectionResetError, True),
+        (asyncio.TimeoutError, True),
+        (OSError, True),
+        ("ClusterCrossSlotError", False),
+        (redis.exceptions.AuthenticationError, False),
+        ("AuthorizationError", False),
+        (redis.exceptions.ResponseError, False),
+        (ValueError, False),
+    ],
+)
+def test_is_network_error_helper(exc_class_or_name, expected):
     from fastapi_stream_lease.manager import is_network_error
 
-    assert is_network_error(redis.exceptions.ConnectionError("down")) is True
-    assert is_network_error(redis.exceptions.TimeoutError("timed out")) is True
-    assert is_network_error(ConnectionResetError("reset")) is True
-    assert is_network_error(asyncio.TimeoutError()) is True
-    assert is_network_error(OSError("os err")) is True
-    assert is_network_error(redis.exceptions.ReadOnlyError("READONLY replica")) is True
+    if isinstance(exc_class_or_name, str):
+        exc_cls = getattr(redis.exceptions, exc_class_or_name, None)
+        if exc_cls is None:
+            pytest.skip(f"{exc_class_or_name} not available in this redis-py version")
+    else:
+        exc_cls = exc_class_or_name
 
-    # Excluded errors
-    assert is_network_error(redis.exceptions.AuthenticationError("bad auth")) is False
-    assert is_network_error(redis.exceptions.AuthorizationError("no perm")) is False
-    assert is_network_error(redis.exceptions.ResponseError("syntax")) is False
-    assert is_network_error(ValueError("bad value")) is False
+    exc = exc_cls() if exc_cls is asyncio.TimeoutError else exc_cls("test error")
+    assert is_network_error(exc) is expected
 
 
 def test_safe_uncancel_edge_cases(monkeypatch):

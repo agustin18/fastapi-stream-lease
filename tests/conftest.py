@@ -14,7 +14,10 @@ async def fake_redis():
         yield client
     finally:
         await client.flushall()
-        await client.aclose()
+        if hasattr(client, "aclose"):
+            await client.aclose()
+        else:
+            await client.close()
 
 
 @pytest.fixture
