@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 from contextlib import suppress
+from typing import Any
 from unittest.mock import AsyncMock
 from uuid import uuid4
 
@@ -35,6 +36,37 @@ def parse_sentinel_hosts(hosts_env: str) -> list[tuple[str, int]]:
     return sentinels
 
 
+async def safe_close_client(client: Any) -> None:
+    """Safely close client across redis-py 5.0.0 (close()) and 5.0.1+ (aclose())."""
+    if client is None:
+        return
+    if hasattr(client, "aclose"):
+        await client.aclose()
+    elif hasattr(client, "close"):
+        res = client.close()
+        if asyncio.iscoroutine(res):
+            await res
+
+
+def normalize_sentinel_dict(data: Any) -> dict[str, str]:
+    """Normalize sentinel response into a dictionary across redis-py 5.0.0 and 8.x."""
+    if isinstance(data, dict):
+        return {
+            (k.decode() if isinstance(k, bytes) else str(k)): (
+                v.decode() if isinstance(v, bytes) else str(v)
+            )
+            for k, v in data.items()
+        }
+    if isinstance(data, list):
+        d: dict[str, str] = {}
+        for i in range(0, len(data) - 1, 2):
+            k = data[i].decode("utf-8") if isinstance(data[i], bytes) else str(data[i])
+            v = data[i + 1].decode("utf-8") if isinstance(data[i + 1], bytes) else str(data[i + 1])
+            d[k] = v
+        return d
+    return {}
+
+
 async def wait_for_writable_master(
     sentinel: Sentinel, service_name: str, timeout: float = 25.0
 ) -> tuple[str, int]:
@@ -49,7 +81,7 @@ async def wait_for_writable_master(
         except Exception:
             await asyncio.sleep(0.5)
         finally:
-            await client.aclose()
+            await safe_close_client(client)
     raise TimeoutError(f"Master for '{service_name}' did not become writable within {timeout}s")
 
 
@@ -84,17 +116,12 @@ async def wait_for_sentinel_settled(
                     continue
 
                 # 2. Master status and topology discovery
-                master_info = await admin_conn.execute_command("SENTINEL", "master", service_name)
-                raw_flags = master_info.get(b"flags") or master_info.get("flags", b"")
-                if isinstance(raw_flags, bytes):
-                    raw_flags = raw_flags.decode("utf-8")
-
-                num_other_val = master_info.get(b"num-other-sentinels") or master_info.get(
-                    "num-other-sentinels", 0
+                master_info = normalize_sentinel_dict(
+                    await admin_conn.execute_command("SENTINEL", "master", service_name)
                 )
-                num_slaves_val = master_info.get(b"num-slaves") or master_info.get("num-slaves", 0)
-                num_other = int(num_other_val)
-                num_slaves = int(num_slaves_val)
+                raw_flags = master_info.get("flags", "")
+                num_other = int(master_info.get("num-other-sentinels", 0))
+                num_slaves = int(master_info.get("num-slaves", 0))
 
                 if (
                     "failover_in_progress" not in raw_flags
@@ -104,25 +131,16 @@ async def wait_for_sentinel_settled(
                     and num_slaves >= 1
                 ):
                     # 3. Healthy replica check
-                    cur_master_ip = master_info.get(b"ip") or master_info.get("ip")
-                    if isinstance(cur_master_ip, bytes):
-                        cur_master_ip = cur_master_ip.decode("utf-8")
+                    cur_master_ip = master_info.get("ip")
 
-                    replicas = await admin_conn.execute_command(
+                    replicas_raw = await admin_conn.execute_command(
                         "SENTINEL", "replicas", service_name
                     )
-                    for rep in replicas:
-                        rep_flags = rep.get(b"flags") or rep.get("flags", b"")
-                        if isinstance(rep_flags, bytes):
-                            rep_flags = rep_flags.decode("utf-8")
-                        link_status = rep.get(b"master-link-status") or rep.get(
-                            "master-link-status", b""
-                        )
-                        if isinstance(link_status, bytes):
-                            link_status = link_status.decode("utf-8")
-                        rep_ip = rep.get(b"ip") or rep.get("ip")
-                        if isinstance(rep_ip, bytes):
-                            rep_ip = rep_ip.decode("utf-8")
+                    for rep_raw in replicas_raw:
+                        rep = normalize_sentinel_dict(rep_raw)
+                        rep_flags = rep.get("flags", "")
+                        link_status = rep.get("master-link-status", "")
+                        rep_ip = rep.get("ip")
 
                         if (
                             rep_ip != cur_master_ip
@@ -136,7 +154,7 @@ async def wait_for_sentinel_settled(
                     if settled:
                         break
             finally:
-                await admin_conn.aclose()
+                await safe_close_client(admin_conn)
         except Exception:
             pass
         await asyncio.sleep(0.5)
@@ -156,24 +174,18 @@ async def get_replica_address(
     first_host, first_port = sentinel_hosts[0]
     admin_conn = aioredis.from_url(f"redis://{first_host}:{first_port}")
     try:
-        master_info = await admin_conn.execute_command("SENTINEL", "master", service_name)
-        cur_master_ip = master_info.get(b"ip") or master_info.get("ip")
-        if isinstance(cur_master_ip, bytes):
-            cur_master_ip = cur_master_ip.decode("utf-8")
+        master_info = normalize_sentinel_dict(
+            await admin_conn.execute_command("SENTINEL", "master", service_name)
+        )
+        cur_master_ip = master_info.get("ip")
 
-        replicas = await admin_conn.execute_command("SENTINEL", "replicas", service_name)
-        for rep in replicas:
-            rep_flags = rep.get(b"flags") or rep.get("flags", b"")
-            if isinstance(rep_flags, bytes):
-                rep_flags = rep_flags.decode("utf-8")
-            link_status = rep.get(b"master-link-status") or rep.get("master-link-status", b"")
-            if isinstance(link_status, bytes):
-                link_status = link_status.decode("utf-8")
-
-            ip = rep.get(b"ip") or rep.get("ip")
-            port = rep.get(b"port") or rep.get("port")
-            if isinstance(ip, bytes):
-                ip = ip.decode("utf-8")
+        replicas_raw = await admin_conn.execute_command("SENTINEL", "replicas", service_name)
+        for rep_raw in replicas_raw:
+            rep = normalize_sentinel_dict(rep_raw)
+            rep_flags = rep.get("flags", "")
+            link_status = rep.get("master-link-status", "")
+            ip = rep.get("ip")
+            port = rep.get("port")
 
             if (
                 ip != cur_master_ip
@@ -181,10 +193,11 @@ async def get_replica_address(
                 and "s_down" not in rep_flags
                 and "disconnected" not in rep_flags
                 and link_status == "ok"
+                and port is not None
             ):
                 return ip, int(port)
     finally:
-        await admin_conn.aclose()
+        await safe_close_client(admin_conn)
     raise RuntimeError(f"No healthy replica found for '{service_name}'")
 
 
@@ -211,7 +224,7 @@ async def wait_for_key_replication(
                     if expected_value is None or val == expected_value:
                         return
             finally:
-                await replica_client.aclose()
+                await safe_close_client(replica_client)
         except Exception:
             pass
         await asyncio.sleep(0.05)
@@ -238,7 +251,7 @@ async def wait_for_lease_replication(
                 if score is not None and float(score) > 0:
                     return
             finally:
-                await replica_client.aclose()
+                await safe_close_client(replica_client)
         except Exception:
             pass
         await asyncio.sleep(0.05)
@@ -299,7 +312,7 @@ async def test_sentinel_basic_lease_lifecycle(sentinel_cluster):
     await lease.release()
     assert await manager.get_active_count("user_1") == 0
     await manager.close()
-    await client.aclose()
+    await safe_close_client(client)
 
 
 @pytest.mark.asyncio
@@ -368,7 +381,7 @@ async def test_sentinel_forced_failover_client_reconnection(sentinel_cluster):
     try:
         await admin_conn.execute_command("SENTINEL", "failover", service_name)
     finally:
-        await admin_conn.aclose()
+        await safe_close_client(admin_conn)
 
     # Poll Sentinel until master address changes and is writable
     for _ in range(60):
@@ -393,7 +406,7 @@ async def test_sentinel_forced_failover_client_reconnection(sentinel_cluster):
     # Verify final state on new master
     assert await manager.get_active_count("user_failover") == 0
     await manager.close()
-    await client.aclose()
+    await safe_close_client(client)
 
 
 @pytest.mark.asyncio
@@ -472,7 +485,7 @@ async def test_sentinel_hard_master_failure_and_election_failover(sentinel_clust
         except Exception:
             pass
         finally:
-            await master_raw.aclose()
+            await safe_close_client(master_raw)
 
     asyncio.create_task(pause_master())
 
@@ -503,7 +516,7 @@ async def test_sentinel_hard_master_failure_and_election_failover(sentinel_clust
     # Verify lease was cleanly released on the new master
     assert await manager.get_active_count("user_hard_failover") == 0
     await manager.close()
-    await client.aclose()
+    await safe_close_client(client)
 
 
 @pytest.mark.asyncio
@@ -569,7 +582,7 @@ async def test_sentinel_verify_cluster_config_across_failover(sentinel_cluster):
     try:
         await admin_conn.execute_command("SENTINEL", "failover", service_name)
     finally:
-        await admin_conn.aclose()
+        await safe_close_client(admin_conn)
 
     # Poll Sentinel until master changes to B and is writable
     for _ in range(60):
@@ -608,8 +621,8 @@ async def test_sentinel_verify_cluster_config_across_failover(sentinel_cluster):
     await manager_a.close()
     await manager_b.close()
     await manager_inc.close()
-    await client_a.aclose()
-    await client_b.aclose()
+    await safe_close_client(client_a)
+    await safe_close_client(client_b)
 
 
 @pytest.mark.asyncio
@@ -652,7 +665,7 @@ async def test_sentinel_real_outage_exceeding_lease_ttl_terminates_stream(sentin
         except Exception:
             pass
         finally:
-            await conn.aclose()
+            await safe_close_client(conn)
 
     # Induce total cluster outage by pausing both nodes for 3.0s;
     # verify stream owner task is cancelled with StreamLeaseLost once lease TTL (1.2s) expires
@@ -666,7 +679,7 @@ async def test_sentinel_real_outage_exceeding_lease_ttl_terminates_stream(sentin
         # Settle topology: wait for paused nodes to wake up and rejoin
         await asyncio.sleep(3.5)
         await manager.close()
-        await client.aclose()
+        await safe_close_client(client)
 
 
 @pytest.mark.asyncio
@@ -698,4 +711,4 @@ async def test_sentinel_mock_outage_exceeding_lease_ttl_terminates_stream(sentin
             await asyncio.sleep(1.5)
 
     await manager.close()
-    await client.aclose()
+    await safe_close_client(client)
