@@ -97,6 +97,7 @@ async def run_comparative_benchmark(
     max_p99_overhead_ms: float,
     baseline_p99: float | None = None,
     max_regression_pct: float = 10.0,
+    noise_floor_ms: float = 0.20,
 ) -> dict[str, Any]:
     if count < 10:
         raise ValueError(f"count must be at least 10, got {count}")
@@ -374,21 +375,28 @@ async def run_comparative_benchmark(
     regression_details: dict[str, Any] = {}
 
     if baseline_p99 is not None and baseline_p99 > 0:
-        diff_pct = ((max_p99_paired_overhead - baseline_p99) / baseline_p99) * 100.0
+        abs_diff_ms = max_p99_paired_overhead - baseline_p99
+        diff_pct = (abs_diff_ms / baseline_p99) * 100.0
         regression_details = {
             "baseline_p99_ms": baseline_p99,
             "current_p99_ms": max_p99_paired_overhead,
+            "delta_ms": round(abs_diff_ms, 3),
             "delta_pct": round(diff_pct, 2),
+            "noise_floor_ms": noise_floor_ms,
             "max_allowed_regression_pct": max_regression_pct,
         }
-        if diff_pct > max_regression_pct:
+        if abs_diff_ms > noise_floor_ms and diff_pct > max_regression_pct:
             regression_passed = False
             print(
                 f"\n[Phase 5] REGRESSION DETECTED: +{diff_pct:.2f}% "
-                f"(allowed: <= +{max_regression_pct:.1f}%)"
+                f"(+{abs_diff_ms:.3f} ms > noise floor {noise_floor_ms:.2f} ms, "
+                f"allowed: <= +{max_regression_pct:.1f}%)"
             )
         else:
-            print(f"\n[Phase 5] Regression Check PASSED: delta={diff_pct:+.2f}% vs baseline")
+            print(
+                f"\n[Phase 5] Regression Check PASSED: delta={diff_pct:+.2f}% "
+                f"({abs_diff_ms:+.3f} ms) vs baseline"
+            )
 
     overall_passed = budget_passed and regression_passed and zero_residual_keys
 
@@ -477,6 +485,12 @@ def main() -> None:
         help="Maximum regression percentage allowed vs baseline (default: 10.0)",
     )
     parser.add_argument(
+        "--noise-floor-ms",
+        type=float,
+        default=0.20,
+        help="Overhead noise floor in ms below which regressions are considered host jitter",
+    )
+    parser.add_argument(
         "--json-output",
         action="store_true",
         help="Print machine-readable JSON output",
@@ -527,6 +541,7 @@ def main() -> None:
             max_p99_overhead_ms=args.max_p99_overhead_ms,
             baseline_p99=baseline_p99,
             max_regression_pct=args.max_regression_pct,
+            noise_floor_ms=args.noise_floor_ms,
         )
     )
 

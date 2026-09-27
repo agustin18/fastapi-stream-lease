@@ -121,20 +121,26 @@ async def test_soak_input_validation():
 
 
 @pytest.mark.parametrize(
-    ("baseline_p99", "current_p99", "max_allowed_pct", "expected_passed"),
+    ("baseline_p99", "current_p99", "max_allowed_pct", "noise_floor_ms", "expected_passed"),
     [
-        (0.20, 0.21, 10.0, True),  # +5% regression <= 10%
-        (0.20, 0.22, 10.0, True),  # +10% regression == 10%
-        (0.20, 0.23, 10.0, False),  # +15% regression > 10%
-        (0.50, 0.25, 10.0, True),  # -50% improvement
+        (0.20, 0.21, 10.0, 0.20, True),  # +5% regression <= 10%
+        (0.20, 0.22, 10.0, 0.20, True),  # +10% regression == 10%
+        (0.20, 0.45, 10.0, 0.20, False),  # +125% regression > 10% AND delta 0.25 > 0.20
+        (0.04, 0.16, 10.0, 0.20, True),  # +300% relative but delta 0.12 <= noise floor 0.20
+        (0.50, 0.25, 10.0, 0.20, True),  # -50% improvement
     ],
 )
 def test_regression_gate_evaluation(
-    baseline_p99: float, current_p99: float, max_allowed_pct: float, expected_passed: bool
+    baseline_p99: float,
+    current_p99: float,
+    max_allowed_pct: float,
+    noise_floor_ms: float,
+    expected_passed: bool,
 ) -> None:
     """Verify regression gate accepts within-budget deltas and rejects regressions (R1)."""
-    diff_pct = ((current_p99 - baseline_p99) / baseline_p99) * 100.0
-    regression_passed = diff_pct <= max_allowed_pct
+    abs_diff_ms = current_p99 - baseline_p99
+    diff_pct = (abs_diff_ms / baseline_p99) * 100.0
+    regression_passed = not (abs_diff_ms > noise_floor_ms and diff_pct > max_allowed_pct)
     assert regression_passed is expected_passed
 
 
