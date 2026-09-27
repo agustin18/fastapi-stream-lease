@@ -50,6 +50,7 @@ jobs:
       - name: Execute Wrapper Overhead & Host Latency Calibration
         env:
           REDIS_URL: redis://localhost:6379/15
+          PYTHONPATH: src
         run: |
           uv run python benchmarks/bench_wrapper_overhead.py \
             --count 1000 \
@@ -94,6 +95,7 @@ jobs:
       - name: Execute Soak Workload & Verify Memory/Task Plateau
         env:
           REDIS_URL: redis://localhost:6379/15
+          PYTHONPATH: src
         run: |
           DURATION="${{ github.event.inputs.soak_duration || '120' }}"
           CONCURRENCY="${{ github.event.inputs.target_concurrency || '300' }}"

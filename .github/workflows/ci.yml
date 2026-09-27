@@ -147,6 +147,7 @@ jobs:
           --health-retries 10
     env:
       REDIS_URL: redis://localhost:6379/15
+      PYTHONPATH: src
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install uv

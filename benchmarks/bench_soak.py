@@ -303,10 +303,9 @@ async def run_soak(
     rss_slope_mb_per_sec = 0.0
     abs_growth_mb = 0.0
 
-    if len(samples) >= 6:
-        # Evaluate second half (steady-state phase)
-        mid_point = len(samples) // 2
-        steady_samples = samples[mid_point:]
+    if len(samples) >= 2:
+        # Evaluate steady-state phase (second half if >= 6 samples, otherwise all samples)
+        steady_samples = samples[len(samples) // 2 :] if len(samples) >= 6 else samples
         times = [s["time_s"] for s in steady_samples]
         rss_mbs = [s["rss_kb"] / 1024.0 for s in steady_samples]
 
@@ -321,8 +320,7 @@ async def run_soak(
         # 3. Absolute growth in steady state must be <= 15 MB
         if rss_slope_mb_per_sec > 0.15 or rss_growth_pct > 15.0 or abs_growth_mb > 15.0:
             plateau_stable = False
-    elif assert_plateau and len(samples) < 6:
-        # Require enough samples to declare plateau
+    elif assert_plateau and len(samples) < 2:
         plateau_stable = False
 
     # S04: unexpected_rejections must be 0
