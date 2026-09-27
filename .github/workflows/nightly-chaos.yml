@@ -105,7 +105,8 @@ jobs:
             --duration "$DURATION" \
             --target-concurrency "$CONCURRENCY" \
             --burst-rate 50 \
-            --burst-interval 15.0 \
+            --burst-start 60.0 \
+            --burst-duration 15.0 \
             --assert-plateau
 
   sentinel-chaos:

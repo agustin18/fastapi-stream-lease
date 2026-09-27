@@ -441,7 +441,27 @@ async def run_comparative_benchmark(
     return result_summary
 
 
-def main() -> None:
+def parse_baseline_file(baseline_path: str | Path) -> float:
+    """Parse and validate a baseline JSON file, returning max_p99_paired_overhead_ms."""
+    path = Path(baseline_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Baseline file not found: {baseline_path}")
+    with open(path, encoding="utf-8") as f:
+        baseline_data = json.load(f)
+    if not isinstance(baseline_data, dict):
+        raise ValueError("Baseline JSON must be an object/dict")
+    if "max_p99_paired_overhead_ms" not in baseline_data:
+        raise ValueError("Missing required field 'max_p99_paired_overhead_ms' in baseline JSON")
+    val = float(baseline_data["max_p99_paired_overhead_ms"])
+    if not math.isfinite(val) or val <= 0.0:
+        raise ValueError(
+            f"'max_p99_paired_overhead_ms' must be a finite positive number, got {val}"
+        )
+    return val
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Build command line argument parser for wrapper overhead benchmark."""
     parser = argparse.ArgumentParser(description="fastapi-stream-lease wrapper overhead benchmark")
     parser.add_argument(
         "--redis-url",
@@ -495,6 +515,11 @@ def main() -> None:
         action="store_true",
         help="Print machine-readable JSON output",
     )
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
     args = parser.parse_args()
 
     # Argument validation
@@ -507,25 +532,8 @@ def main() -> None:
 
     baseline_p99: float | None = None
     if args.baseline:
-        baseline_file = Path(args.baseline)
-        if not baseline_file.exists():
-            print(f"Error: Baseline file not found: {args.baseline}", file=sys.stderr)
-            sys.exit(1)
         try:
-            with open(baseline_file, encoding="utf-8") as f:
-                baseline_data = json.load(f)
-            if not isinstance(baseline_data, dict):
-                raise ValueError("Baseline JSON must be an object/dict")
-            if "max_p99_paired_overhead_ms" not in baseline_data:
-                raise ValueError(
-                    "Missing required field 'max_p99_paired_overhead_ms' in baseline JSON"
-                )
-            val = float(baseline_data["max_p99_paired_overhead_ms"])
-            if not math.isfinite(val) or val <= 0.0:
-                raise ValueError(
-                    f"'max_p99_paired_overhead_ms' must be a finite positive number, got {val}"
-                )
-            baseline_p99 = val
+            baseline_p99 = parse_baseline_file(args.baseline)
         except Exception as err:
             print(
                 f"Error: Failed to parse baseline JSON from {args.baseline}: {err}",

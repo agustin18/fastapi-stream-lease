@@ -393,7 +393,8 @@ async def run_soak(
     }
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
+    """Build command line argument parser for soak workload benchmark."""
     parser = argparse.ArgumentParser(description="fastapi-stream-lease soak workload benchmark")
     parser.add_argument(
         "--redis-url",
@@ -459,6 +460,11 @@ def main() -> None:
         action="store_true",
         help="Output full metrics report in JSON format",
     )
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
     args = parser.parse_args()
 
     # V01: Argument validation

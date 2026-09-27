@@ -4,8 +4,16 @@ from __future__ import annotations
 
 import pytest
 
+from benchmarks.bench_soak import build_parser as build_soak_parser
 from benchmarks.bench_soak import compute_linear_slope
-from benchmarks.bench_wrapper_overhead import compute_distribution, percentile
+from benchmarks.bench_wrapper_overhead import (
+    build_parser as build_overhead_parser,
+)
+from benchmarks.bench_wrapper_overhead import (
+    compute_distribution,
+    parse_baseline_file,
+    percentile,
+)
 
 
 def test_percentile_calculation():
@@ -203,41 +211,93 @@ def test_soak_overall_passed_invariants(
 
 
 def test_baseline_json_parsing_robustness(tmp_path) -> None:
-    """Verify baseline parser rejects missing fields, non-dicts, or invalid values (R3)."""
-    import json
-    import math
-
-    def parse_baseline(file_path):
-        with open(file_path, encoding="utf-8") as f:
-            data = json.load(f)
-        if not isinstance(data, dict):
-            raise ValueError("Baseline JSON must be an object/dict")
-        if "max_p99_paired_overhead_ms" not in data:
-            raise ValueError("Missing required field 'max_p99_paired_overhead_ms'")
-        val = float(data["max_p99_paired_overhead_ms"])
-        if not math.isfinite(val) or val <= 0.0:
-            raise ValueError("Must be finite positive number")
-        return val
+    """Verify parse_baseline_file rejects missing fields, non-dicts, or invalid values (R3)."""
+    # Non-existent file
+    with pytest.raises(FileNotFoundError, match="Baseline file not found"):
+        parse_baseline_file(tmp_path / "non_existent.json")
 
     # Non-dict
     f1 = tmp_path / "f1.json"
     f1.write_text("[1, 2, 3]")
     with pytest.raises(ValueError, match="must be an object/dict"):
-        parse_baseline(f1)
+        parse_baseline_file(f1)
 
     # Missing field
     f2 = tmp_path / "f2.json"
     f2.write_text('{"other": 1.0}')
     with pytest.raises(ValueError, match="Missing required field"):
-        parse_baseline(f2)
+        parse_baseline_file(f2)
 
     # Non-positive
     f3 = tmp_path / "f3.json"
     f3.write_text('{"max_p99_paired_overhead_ms": 0.0}')
-    with pytest.raises(ValueError, match="Must be finite positive"):
-        parse_baseline(f3)
+    with pytest.raises(ValueError, match="must be a finite positive number"):
+        parse_baseline_file(f3)
 
     # Valid
     f4 = tmp_path / "f4.json"
     f4.write_text('{"max_p99_paired_overhead_ms": 0.35}')
-    assert parse_baseline(f4) == 0.35
+    assert parse_baseline_file(f4) == 0.35
+
+
+def test_nightly_and_ci_cli_arguments_are_valid() -> None:
+    """Verify that exact CLI flags used in nightly-chaos.yml and ci.yml parse cleanly."""
+    overhead_parser = build_overhead_parser()
+    soak_parser = build_soak_parser()
+
+    # Nightly overhead invocation
+    nightly_overhead_args = [
+        "--count",
+        "1000",
+        "--concurrency",
+        "1",
+        "--max-p99-overhead-ms",
+        "1.0",
+        "--baseline",
+        "benchmarks/baseline-overhead.json",
+        "--max-regression-pct",
+        "20.0",
+        "--save-baseline",
+        "/tmp/overhead-baseline.json",
+    ]
+    parsed_no = overhead_parser.parse_args(nightly_overhead_args)
+    assert parsed_no.count == 1000
+    assert parsed_no.concurrency == 1
+    assert parsed_no.max_regression_pct == 20.0
+
+    # Nightly soak invocation (asserting --burst-start and --burst-duration)
+    nightly_soak_args = [
+        "--duration",
+        "300",
+        "--target-concurrency",
+        "500",
+        "--burst-rate",
+        "50",
+        "--burst-start",
+        "60.0",
+        "--burst-duration",
+        "15.0",
+        "--assert-plateau",
+    ]
+    parsed_ns = soak_parser.parse_args(nightly_soak_args)
+    assert parsed_ns.duration == 300.0
+    assert parsed_ns.target_concurrency == 500
+    assert parsed_ns.burst_rate == 50
+    assert parsed_ns.burst_start == 60.0
+    assert parsed_ns.burst_duration == 15.0
+    assert parsed_ns.assert_plateau is True
+
+    # Smoke soak invocation
+    smoke_soak_args = [
+        "--duration",
+        "5",
+        "--target-concurrency",
+        "10",
+        "--lease-seconds",
+        "4.0",
+        "--renew-interval",
+        "1.0",
+    ]
+    parsed_ss = soak_parser.parse_args(smoke_soak_args)
+    assert parsed_ss.duration == 5.0
+    assert parsed_ss.target_concurrency == 10

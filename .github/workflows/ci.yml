@@ -160,18 +160,19 @@ jobs:
         run: uv sync --locked --extra dev
       - name: Smoke test wrapper overhead benchmark with regression gate
         run: |
-          BASELINE_ARG="--baseline benchmarks/baseline-overhead.json"
           if [ "${{ github.event_name }}" = "pull_request" ] && [ -n "${{ github.base_ref }}" ]; then
-            echo "Attempting to calibrate baseline against base branch: ${{ github.base_ref }}"
-            if git fetch origin "${{ github.base_ref }}":base_ref --depth=1 --force && git worktree add /tmp/base-repo base_ref; then
-              PYTHONPATH=/tmp/base-repo/src uv run python benchmarks/bench_wrapper_overhead.py \
-                --count 100 \
-                --concurrency 1 \
-                --max-p99-overhead-ms 5.0 \
-                --save-baseline /tmp/base-overhead-baseline.json
-              git worktree remove /tmp/base-repo --force
-              BASELINE_ARG="--baseline /tmp/base-overhead-baseline.json"
-            fi
+            echo "Calibrating baseline against base branch: ${{ github.base_ref }}"
+            git fetch origin "${{ github.base_ref }}":base_ref --depth=1 --force
+            git worktree add /tmp/base-repo base_ref
+            PYTHONPATH=/tmp/base-repo/src uv run python benchmarks/bench_wrapper_overhead.py \
+              --count 100 \
+              --concurrency 1 \
+              --max-p99-overhead-ms 5.0 \
+              --save-baseline /tmp/base-overhead-baseline.json
+            git worktree remove /tmp/base-repo --force
+            BASELINE_ARG="--baseline /tmp/base-overhead-baseline.json"
+          else
+            BASELINE_ARG="--baseline benchmarks/baseline-overhead.json"
           fi
           echo "Running benchmark with $BASELINE_ARG..."
           uv run python benchmarks/bench_wrapper_overhead.py \
