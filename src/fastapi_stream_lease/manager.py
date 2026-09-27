@@ -65,16 +65,16 @@ _TRANSIENT_BUILTIN_ERRORS: tuple[type[BaseException], ...] = (
     OSError,
 )
 
+_ALL_TRANSIENT_ERRORS: tuple[type[BaseException], ...] = (
+    _TRANSIENT_REDIS_ERRORS + _TRANSIENT_BUILTIN_ERRORS
+)
+
 
 def is_network_error(exc: BaseException) -> bool:
     """Return True for transient network, timeout, failover, or cluster state conditions."""
     if isinstance(exc, _NON_TRANSIENT_REDIS_ERRORS):
         return False
-    if isinstance(exc, _TRANSIENT_REDIS_ERRORS):
-        return True
-    if isinstance(exc, _TRANSIENT_BUILTIN_ERRORS):
-        return True
-    return False
+    return isinstance(exc, _ALL_TRANSIENT_ERRORS)
 
 
 class StreamLeaseManager:
