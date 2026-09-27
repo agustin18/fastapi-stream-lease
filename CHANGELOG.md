@@ -1,7 +1,9 @@
 # Changelog
 
-## 0.2.0b1 — 2026-09-26
+## 0.2.0b1 — 2026-09-27
 
+- **Real Redis Sentinel Failover & Chaos Test Suite**: Added comprehensive multi-node Redis Sentinel automated testing (1 Master, 1 Replica, 3 Sentinels with Quorum 2) covering quorum health checks (`SENTINEL ckquorum`), lease and configuration replication before failovers, unresponsive master crashes (`DEBUG SLEEP`), and total cluster outage cancellation boundaries.
+- **Failover-Safe Startup Cluster Verification**: Hardened `verify_cluster_config` with bounded retry loops (strictly validating `retry_attempts >= 1` and `retry_delay >= 0`) to seamlessly survive transient failovers and master promotions during pod startup.
 - **Asynchronous Bounded Hook Dispatcher (`HookDispatcher`)**: Decoupled all lifecycle telemetry hooks (`on_acquired`, `on_released`, `on_lost`, `on_rejected`, `on_backend_error`) into an isolated, bounded, out-of-band FIFO worker. Sync callbacks execute in threadpools via `asyncio.to_thread` without blocking the asyncio event loop or delaying stream cancellations. Telemetry queue overflow drops excess events gracefully with rate-limited logging.
 - **Immediate Task Cancellation on Lease Revocation**: Requesting immediate owner-task cancellation as soon as lease loss or disconnect is detected, before telemetry callbacks are enqueued.
 - **Atomic Cluster Configuration Consistency (`verify_cluster_config`)**: Added startup fingerprint verification using persistent atomic Redis `SET NX` (`{prefix}:config`), detecting limit drift across pods (including `max_global`, `max_per_user`, `lease_seconds`, and `fail_open`) without TTL expiration races. A 3-attempt retry loop safely verifies canonical state even under concurrent node initialization.

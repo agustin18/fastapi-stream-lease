@@ -144,7 +144,7 @@ The manager context and `async with lease` both renew while open. Handle normal 
 | **Redis Outage on Acquire (`fail_open=True`)** | Grants an uncoordinated in-memory fallback lease using worker monotonic clock (`time.monotonic()`). | **Graceful Degradation** | Fallback acquisitions are intentionally unthrottled across and *within* worker processes during outage; fallback leases do not retroactively register upon Redis recovery. |
 | **Worker Clock Drift** | All lease evaluations and expiration purges use `redis.call('TIME')`. | **Absolute** | Worker system clock or NTP skew cannot cause premature expiration or lingering leases. |
 | **Slow Observability / Metric Hooks** | All lifecycle hooks (`on_acquired`, `on_released`, `on_lost`, `on_rejected`, `on_backend_error`) run out-of-band via an internal bounded FIFO queue and threadpool (`asyncio.to_thread` for sync callables). | **Strong Guarantee** | Slow APM/Datadog/StatsD calls cannot delay stream cancellation, block acquire returns, or consume renewal retry windows. |
-| **Redis Sentinel Master Failover** | `READONLY` transitions during replica write are retried. Asynchronous Redis replication can lose recently acknowledged writes if a master fails before syncing; un-replicated leases are detected as lost on next renewal and cancelled cleanly. | **High Availability** | Seamlessly rides out master elections shorter than remaining `lease_seconds`. Divergent writes are terminated rather than resurrected. |
+| **Redis Sentinel Master Failover** | `READONLY` transitions during replica write are retried. Asynchronous Redis replication can lose recently acknowledged writes if a master fails before syncing; un-replicated leases are detected as lost on next renewal and cancelled cleanly. In split-brain network partitions, divergent masters can temporarily allow concurrent leases across partitions until the partition heals or `min-replicas-to-write` blocks writes on the isolated master. | **High Availability** | Seamlessly rides out master elections shorter than remaining `lease_seconds` when the lease state is present on the promoted replica. Divergent writes are terminated rather than resurrected. `min-replicas-to-write` can bound or reduce the stale-master write window during network partitions, at the cost of write availability. Redis Sentinel remains eventually consistent and cannot guarantee a strict cluster-wide concurrency bound across all network partitions. |
 | **Redis Cluster Multi-Key Coordination** | Keys share hash tag `{prefix}` (`{prefix}:user:...` and `{prefix}:global`), guaranteeing placement on the same hash slot for atomic Lua execution. | **Atomic Lua Execution** | Atomically validates both per-user and global capacity in a single Redis round-trip without `CROSSSLOT` errors. Coordinated keys share one cluster slot, which can become a hot slot at extreme throughput. |
 
 ### Fail-Open Fallback Lease Lifecycle
@@ -185,9 +185,11 @@ When `fail_open=True` is enabled in `LeaseConfig`, the manager grants fallback l
   In distributed environments with multiple worker processes or Kubernetes pods, ensure all instances share identical limit configurations. Canonical configuration is registered atomically via `SET ... NX` (persistent key `{prefix}:config` with no TTL expiration to prevent split-brain during rolling deploys):
   ```python
   # Logs a warning on drift or raises ConfigurationMismatchError if strict=True.
-  # When strict=True, network errors raise StreamLeaseUnavailable to fail-fast on pod startup.
+  # Retries transient errors during Sentinel failovers; raises StreamLeaseUnavailable
+  # on prolonged outages to trigger fail-fast Kubernetes CrashLoopBackOff.
   await manager.verify_cluster_config(strict=True)
   ```
+  During transient Redis reconnects or Sentinel master elections (which typically resolve in 1–3 seconds), `verify_cluster_config()` retries across a short bounded window (`retry_attempts=3`, `retry_delay=0.1s` by default). If the coordination backend remains unavailable past all retries, `strict=True` raises `StreamLeaseUnavailable` to trigger fail-fast container exit so Kubernetes restarts the container or does not route traffic to unverified pods.
 
 ### Changing Cluster Configuration Safely
 
@@ -206,7 +208,7 @@ Because `{prefix}:config` is persistent (stored with `SET ... NX` without TTL ex
      redis-cli DEL "{my_prefix}:config"
      ```
    - Start the updated worker instances. The first new pod will atomically register the updated configuration fingerprint with `SET ... NX`, and subsequent pods will verify compatibility against it.
-- **Redis Failover & Sentinel Support:** Automatically classifies `ReadOnlyError` (thrown when hitting a replica during master election) as a transient condition, enabling adaptive renewal retries to ride out failovers without dropping active streams.
+- **Redis Failover & Sentinel Support:** Automatically classifies `ReadOnlyError` (thrown when hitting a replica during master election) and `ConnectionError` as transient conditions, enabling adaptive renewal retries to ride out failovers without dropping active streams. Note that the Sentinel configuration in `docker-compose.sentinel.yml` uses aggressive test timings (`down-after-milliseconds 1000`, `failover-timeout 5000`); production environments should use standard recommended operational timeouts (`down-after-milliseconds` 5000–30000ms, `failover-timeout` 60000–180000ms).
 - **Redis Cluster:** All keys use Redis hash tags (`{prefix}:user:...` and `{prefix}:global`), guaranteeing user and global sorted sets reside on the same hash slot for multi-key atomic Lua operations. As with any multi-key Lua coordination, evaluate slot contention and failover behavior under your specific topology.
 - **Reproducible Concurrency Benchmarks:**
   Run throughput and latency benchmarks against your local Redis instance with pre-warmed connection pool and multi-run statistics:

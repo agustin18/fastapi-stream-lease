@@ -129,6 +129,24 @@ jobs:
       - name: Check Redis 8 compatibility
         run: uv run pytest -o addopts='' tests/test_real_redis.py -q
 
+  test-sentinel:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Start Redis Sentinel Topology
+        run: |
+          docker compose -f docker-compose.sentinel.yml up -d --wait sentinel-1 sentinel-2 sentinel-3
+
+      - name: Run Redis Sentinel Integration & Failover Tests
+        run: |
+          docker compose -f docker-compose.sentinel.yml run --rm backend uv run pytest -o addopts='' tests/test_sentinel.py -vv -s
+
+      - name: Teardown Sentinel Topology
+        if: always()
+        run: |
+          docker compose -f docker-compose.sentinel.yml down -v
+
   package:
     runs-on: ubuntu-latest
     steps:

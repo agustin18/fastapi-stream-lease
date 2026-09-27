@@ -966,6 +966,10 @@ async def test_verify_cluster_config_registration_and_mismatch(fake_redis):
     with pytest.raises(StreamLeaseUnavailable):
         await mgr_err.verify_cluster_config(strict=True)
 
+    fake_redis.set = AsyncMock(side_effect=RuntimeError("Unexpected error"))
+    with pytest.raises(RuntimeError, match="Unexpected error"):
+        await mgr_err.verify_cluster_config(strict=False)
+
     fake_redis.set = orig_set
 
     # 6. Config mismatch on fail_open
@@ -989,6 +993,12 @@ async def test_verify_cluster_config_registration_and_mismatch(fake_redis):
     assert await mgr_unresolvable.verify_cluster_config(strict=False) is False
     with pytest.raises(StreamLeaseUnavailable):
         await mgr_unresolvable.verify_cluster_config(strict=True)
+
+    # 8. Invalid retry_attempts or retry_delay parameter validation
+    with pytest.raises(ValueError, match="retry_attempts must be at least 1"):
+        await mgr1.verify_cluster_config(retry_attempts=0)
+    with pytest.raises(ValueError, match="retry_delay must be non-negative"):
+        await mgr1.verify_cluster_config(retry_delay=-0.5)
 
 
 @pytest.mark.asyncio
