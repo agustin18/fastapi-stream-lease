@@ -5,16 +5,19 @@ OpenTelemetry metrics and selective tracing adapter for fastapi-stream-lease.
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterator
-from contextlib import contextmanager
-from typing import Any
+from contextlib import AbstractContextManager, nullcontext
+from typing import Any, cast
 
 from fastapi_stream_lease.observability.contract import (
+    DEFAULT_DURATION_BUCKETS,
     BackendErrorKind,
     LostReason,
     Operation,
     Outcome,
-    validate_cardinality_safe,
+    coerce_backend_error_kind,
+    coerce_lost_reason,
+    coerce_operation,
+    coerce_outcome,
 )
 
 logger = logging.getLogger(__name__)
@@ -29,8 +32,8 @@ def require_opentelemetry() -> Any:
         return opentelemetry, metrics, trace
     except ImportError as exc:
         raise ImportError(
-            "The 'opentelemetry-api' and 'opentelemetry-sdk' packages are required. "
-            "Install them via: pip install 'fastapi-stream-lease[otel]'"
+            "The 'opentelemetry-api' package is required to use OpenTelemetryMetrics. "
+            "Install it via: pip install 'fastapi-stream-lease[otel]'"
         ) from exc
 
 
@@ -70,6 +73,7 @@ class OpenTelemetryMetrics:
             "fastapi_stream_lease.operation_duration",
             description="Latency distribution of stream lease operations in seconds.",
             unit="s",
+            explicit_bucket_boundaries_advisory=DEFAULT_DURATION_BUCKETS,
         )
 
         self.lost_counter = self.meter.create_counter(
@@ -90,49 +94,82 @@ class OpenTelemetryMetrics:
             unit="1",
         )
 
+        self.hook_dropped_counter = self.meter.create_counter(
+            "fastapi_stream_lease.hook_dropped",
+            description="Total lifecycle telemetry hooks dropped due to queue backpressure.",
+            unit="1",
+        )
+
+        self.hook_errors_counter = self.meter.create_counter(
+            "fastapi_stream_lease.hook_errors",
+            description="Total number of lifecycle telemetry hooks that raised exceptions.",
+            unit="1",
+        )
+
+        # Store current depth for callback observation
+        self._current_queue_depth: int = 0
+        self.meter.create_observable_gauge(
+            "fastapi_stream_lease.hook_queue_depth",
+            callbacks=[self._observe_queue_depth],
+            description="Current number of queued lifecycle hooks in the background dispatcher.",
+            unit="1",
+        )
+
+    def _observe_queue_depth(self, options: Any = None) -> list[Any]:
+        from opentelemetry.metrics import Observation
+
+        return [Observation(self._current_queue_depth)]
+
     def record_operation(
         self,
         operation: Operation | str,
         outcome: Outcome | str,
         duration: float,
     ) -> None:
-        """Record an operation count and duration in OpenTelemetry."""
-        op_val = operation.value if isinstance(operation, Operation) else str(operation)
-        out_val = outcome.value if isinstance(outcome, Outcome) else str(outcome)
-        attrs = {"operation": op_val, "outcome": out_val}
-        validate_cardinality_safe(attrs)
+        """Record an operation count and duration in OpenTelemetry with strict enum validation."""
+        op_enum = coerce_operation(operation)
+        out_enum = coerce_outcome(outcome)
+        attrs = {"operation": op_enum.value, "outcome": out_enum.value}
 
         self.operations_counter.add(1, attrs)
         if duration >= 0:
-            self.duration_histogram.record(duration, {"operation": op_val})
+            self.duration_histogram.record(duration, {"operation": op_enum.value})
 
     def record_lost(self, reason: LostReason | str) -> None:
-        """Record an unexpected lease loss event."""
-        r_val = reason.value if isinstance(reason, LostReason) else str(reason)
-        attrs = {"reason": r_val}
-        validate_cardinality_safe(attrs)
-        self.lost_counter.add(1, attrs)
+        """Record an unexpected lease loss event with strict enum validation."""
+        r_enum = coerce_lost_reason(reason)
+        self.lost_counter.add(1, {"reason": r_enum.value})
 
     def record_backend_error(self, kind: BackendErrorKind | str) -> None:
-        """Record a classified backend Redis error."""
-        k_val = kind.value if isinstance(kind, BackendErrorKind) else str(kind)
-        attrs = {"kind": k_val}
-        validate_cardinality_safe(attrs)
-        self.backend_errors_counter.add(1, attrs)
+        """Record a classified backend Redis error with strict enum validation."""
+        k_enum = coerce_backend_error_kind(kind)
+        self.backend_errors_counter.add(1, {"kind": k_enum.value})
 
     def record_fallback(self) -> None:
         """Record a fallback lease activation."""
         self.fallback_counter.add(1)
 
-    @contextmanager
-    def trace_operation(self, operation: Operation | str) -> Iterator[Any]:
+    def record_hook_drop(self) -> None:
+        """Record a dropped lifecycle hook due to dispatcher queue saturation."""
+        self.hook_dropped_counter.add(1)
+
+    def record_hook_error(self) -> None:
+        """Record a lifecycle hook callback exception."""
+        self.hook_errors_counter.add(1)
+
+    def set_hook_queue_depth(self, depth: int) -> None:
+        """Update current hook dispatcher queue depth observed by gauge."""
+        self._current_queue_depth = depth
+
+    def trace_operation(self, operation: Operation | str) -> AbstractContextManager[Any]:
         """
         Selectively emit an OpenTelemetry span for acquire and verify_config.
         Omit spans for high-frequency renewals to avoid trace flooding in LLM streaming.
         """
-        op_val = operation.value if isinstance(operation, Operation) else str(operation)
-        if op_val in (Operation.ACQUIRE.value, Operation.VERIFY_CONFIG.value):
-            with self.tracer.start_as_current_span(f"fastapi_stream_lease.{op_val}") as span:
-                yield span
-        else:
-            yield None
+        op_enum = coerce_operation(operation)
+        if op_enum in (Operation.ACQUIRE, Operation.VERIFY_CONFIG):
+            return cast(
+                AbstractContextManager[Any],
+                self.tracer.start_as_current_span(f"fastapi_stream_lease.{op_enum.value}"),
+            )
+        return nullcontext()

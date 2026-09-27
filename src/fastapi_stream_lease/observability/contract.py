@@ -1,12 +1,13 @@
 """
-Telemetry contract definitions and cardinality safety constraints for stream lease metrics.
+Telemetry contract definitions, strict cardinality coercion, and TelemetryAdapter protocol.
 """
 
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping
+from contextlib import AbstractContextManager
 from enum import Enum
+from typing import Any, Protocol, runtime_checkable
 
 DEFAULT_DURATION_BUCKETS: tuple[float, ...] = (
     0.001,
@@ -20,10 +21,6 @@ DEFAULT_DURATION_BUCKETS: tuple[float, ...] = (
     0.5,
     1.0,
     2.5,
-)
-
-FORBIDDEN_METRIC_LABELS: frozenset[str] = frozenset(
-    {"user_id", "lease_id", "user_key", "principal", "client_id"}
 )
 
 
@@ -64,6 +61,56 @@ class BackendErrorKind(str, Enum):
     UNKNOWN = "unknown"
 
 
+def coerce_operation(operation: Operation | str) -> Operation:
+    """Coerce input to Operation enum, raising ValueError on unknown values."""
+    if isinstance(operation, Operation):
+        return operation
+    try:
+        return Operation(str(operation))
+    except ValueError as exc:
+        allowed = [e.value for e in Operation]
+        raise ValueError(
+            f"Invalid operation '{operation}'. Must be strictly one of {allowed}"
+        ) from exc
+
+
+def coerce_outcome(outcome: Outcome | str) -> Outcome:
+    """Coerce input to Outcome enum, raising ValueError on unknown values."""
+    if isinstance(outcome, Outcome):
+        return outcome
+    try:
+        return Outcome(str(outcome))
+    except ValueError as exc:
+        allowed = [e.value for e in Outcome]
+        raise ValueError(f"Invalid outcome '{outcome}'. Must be strictly one of {allowed}") from exc
+
+
+def coerce_lost_reason(reason: LostReason | str) -> LostReason:
+    """Coerce input to LostReason enum, raising ValueError on unknown values."""
+    if isinstance(reason, LostReason):
+        return reason
+    try:
+        return LostReason(str(reason))
+    except ValueError as exc:
+        allowed = [e.value for e in LostReason]
+        raise ValueError(
+            f"Invalid lost reason '{reason}'. Must be strictly one of {allowed}"
+        ) from exc
+
+
+def coerce_backend_error_kind(kind: BackendErrorKind | str) -> BackendErrorKind:
+    """Coerce input to BackendErrorKind enum, raising ValueError on unknown values."""
+    if isinstance(kind, BackendErrorKind):
+        return kind
+    try:
+        return BackendErrorKind(str(kind))
+    except ValueError as exc:
+        allowed = [e.value for e in BackendErrorKind]
+        raise ValueError(
+            f"Invalid backend error kind '{kind}'. Must be strictly one of {allowed}"
+        ) from exc
+
+
 def classify_backend_error(exc: BaseException) -> BackendErrorKind:
     """Classify an exception into a cardinality-safe BackendErrorKind."""
     name = type(exc).__name__
@@ -78,14 +125,46 @@ def classify_backend_error(exc: BaseException) -> BackendErrorKind:
     return BackendErrorKind.UNKNOWN
 
 
-def validate_cardinality_safe(labels: Mapping[str, str]) -> None:
+@runtime_checkable
+class TelemetryAdapter(Protocol):
     """
-    Ensure that high-cardinality attributes (such as user_id or lease_id)
-    are never included as metric labels.
+    Formal protocol defining the contract for stream lease telemetry and metrics adapters.
+    All implementations MUST guarantee non-blocking, best-effort execution.
     """
-    for forbidden in FORBIDDEN_METRIC_LABELS:
-        if forbidden in labels:
-            raise ValueError(
-                f"Forbidden metric label '{forbidden}' detected. "
-                "High-cardinality identifiers must never be recorded as metric labels."
-            )
+
+    def record_operation(
+        self,
+        operation: Operation | str,
+        outcome: Outcome | str,
+        duration: float,
+    ) -> None:
+        """Record an operation execution count and its latency in seconds."""
+        ...
+
+    def record_lost(self, reason: LostReason | str) -> None:
+        """Record an unexpected lease loss event with classified cause."""
+        ...
+
+    def record_backend_error(self, kind: BackendErrorKind | str) -> None:
+        """Record a transient backend Redis network or cluster error."""
+        ...
+
+    def record_fallback(self) -> None:
+        """Record an emergency fallback lease granted when fail_open=True."""
+        ...
+
+    def record_hook_drop(self) -> None:
+        """Record a dropped lifecycle hook due to dispatcher queue saturation."""
+        ...
+
+    def record_hook_error(self) -> None:
+        """Record an exception raised within a lifecycle hook callback."""
+        ...
+
+    def set_hook_queue_depth(self, depth: int) -> None:
+        """Set the current pending queue depth of the background hook dispatcher."""
+        ...
+
+    def trace_operation(self, operation: Operation | str) -> AbstractContextManager[Any]:
+        """Optionally emit an open distributed tracing span for an operation."""
+        ...

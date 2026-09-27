@@ -10,6 +10,7 @@ from fastapi_stream_lease.observability.contract import (
     LostReason,
     Operation,
     Outcome,
+    TelemetryAdapter,
 )
 from fastapi_stream_lease.observability.otel import OpenTelemetryMetrics
 from fastapi_stream_lease.observability.prometheus import PrometheusMetrics
@@ -22,4 +23,5 @@ __all__ = [
     "Operation",
     "Outcome",
     "PrometheusMetrics",
+    "TelemetryAdapter",
 ]

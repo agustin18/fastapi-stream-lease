@@ -349,3 +349,59 @@ async def test_dispatcher_drain_when_queue_none():
     assert dispatcher._queue is None
     await dispatcher.drain(timeout=1.0)
     await dispatcher.close()
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_callbacks_and_resilience():
+    """Verify on_drop/on_error callbacks are triggered and exceptions are safely suppressed."""
+    drop_called = []
+    error_called = []
+
+    def on_drop():
+        drop_called.append(True)
+        raise RuntimeError("failing drop callback")
+
+    def on_error():
+        error_called.append(True)
+        raise RuntimeError("failing error callback")
+
+    dispatcher = HookDispatcher(
+        max_queue_size=1,
+        sync_inline=True,
+        on_drop=on_drop,
+        on_error=on_error,
+    )
+
+    # 1. Sync inline error triggers on_error
+    def bad_sync():
+        raise ValueError("sync err")
+
+    dispatcher.dispatch(bad_sync)
+    assert len(error_called) == 1
+
+    # 2. Async error in queue triggers on_error
+    async def bad_async():
+        raise ValueError("async err")
+
+    dispatcher.dispatch(bad_async)
+    await dispatcher.drain(timeout=1.0)
+    assert len(error_called) == 2
+
+    # 3. Queue full triggers on_drop
+    blocker = asyncio.Event()
+
+    async def blocking():
+        await blocker.wait()
+
+    async def dummy():
+        pass
+
+    dispatcher.dispatch(blocking)
+    assert dispatcher.dispatch(dummy) is False  # dropped!
+    assert len(drop_called) == 1
+
+    # 4. Dispatch after close triggers on_drop
+    blocker.set()
+    await dispatcher.close()
+    assert dispatcher.dispatch(dummy) is False
+    assert len(drop_called) == 2

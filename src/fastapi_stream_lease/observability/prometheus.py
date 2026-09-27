@@ -1,10 +1,11 @@
 """
-Prometheus metrics adapter for fastapi-stream-lease with cardinality-safe labels.
+Prometheus metrics adapter for fastapi-stream-lease with strictly bounded cardinality.
 """
 
 from __future__ import annotations
 
 import logging
+from contextlib import AbstractContextManager, nullcontext
 from typing import Any
 
 from fastapi_stream_lease.observability.contract import (
@@ -13,7 +14,10 @@ from fastapi_stream_lease.observability.contract import (
     LostReason,
     Operation,
     Outcome,
-    validate_cardinality_safe,
+    coerce_backend_error_kind,
+    coerce_lost_reason,
+    coerce_operation,
+    coerce_outcome,
 )
 
 logger = logging.getLogger(__name__)
@@ -34,8 +38,11 @@ def require_prometheus_client() -> Any:
 
 class PrometheusMetrics:
     """
-    Adapter that registers and collects cardinality-safe Prometheus metrics
+    Adapter that registers and collects strictly bounded Prometheus metrics
     for stream lease operations, latencies, and failures.
+
+    Note: PrometheusMetrics is application-scoped. Create a single instance per CollectorRegistry
+    and share it across all StreamLeaseManager instances.
     """
 
     def __init__(self, registry: Any = None) -> None:
@@ -101,34 +108,40 @@ class PrometheusMetrics:
         outcome: Outcome | str,
         duration: float,
     ) -> None:
-        """Record an operation count and duration histogram sample."""
-        op_val = operation.value if isinstance(operation, Operation) else str(operation)
-        out_val = outcome.value if isinstance(outcome, Outcome) else str(outcome)
-        validate_cardinality_safe({"operation": op_val, "outcome": out_val})
+        """Record an operation count and duration histogram sample with strict enum validation."""
+        op_enum = coerce_operation(operation)
+        out_enum = coerce_outcome(outcome)
 
-        self.operations_total.labels(operation=op_val, outcome=out_val).inc()
+        self.operations_total.labels(operation=op_enum.value, outcome=out_enum.value).inc()
         if duration >= 0:
-            self.operation_duration_seconds.labels(operation=op_val).observe(duration)
+            self.operation_duration_seconds.labels(operation=op_enum.value).observe(duration)
 
     def record_lost(self, reason: LostReason | str) -> None:
-        """Record an unexpected lease loss event."""
-        r_val = reason.value if isinstance(reason, LostReason) else str(reason)
-        validate_cardinality_safe({"reason": r_val})
-        self.lost_total.labels(reason=r_val).inc()
+        """Record an unexpected lease loss event with strict enum validation."""
+        r_enum = coerce_lost_reason(reason)
+        self.lost_total.labels(reason=r_enum.value).inc()
 
     def record_backend_error(self, kind: BackendErrorKind | str) -> None:
-        """Record a classified backend Redis error."""
-        k_val = kind.value if isinstance(kind, BackendErrorKind) else str(kind)
-        validate_cardinality_safe({"kind": k_val})
-        self.backend_errors_total.labels(kind=k_val).inc()
+        """Record a classified backend Redis error with strict enum validation."""
+        k_enum = coerce_backend_error_kind(kind)
+        self.backend_errors_total.labels(kind=k_enum.value).inc()
 
     def record_fallback(self) -> None:
         """Record a fallback lease activation."""
         self.fallback_total.inc()
 
-    def record_hook_metrics(self, dropped_count: int, error_count: int, queue_depth: int) -> None:
-        """Record telemetry dispatcher queue depth, dropped hooks, and errors."""
-        # Update counters and gauge
-        self.hook_dropped_total._value.set(float(dropped_count))
-        self.hook_errors_total._value.set(float(error_count))
-        self.hook_queue_depth.set(float(queue_depth))
+    def record_hook_drop(self) -> None:
+        """Increment count of dropped telemetry hooks monotonically."""
+        self.hook_dropped_total.inc()
+
+    def record_hook_error(self) -> None:
+        """Increment count of hook exceptions monotonically."""
+        self.hook_errors_total.inc()
+
+    def set_hook_queue_depth(self, depth: int) -> None:
+        """Set current pending queue depth of the dispatcher."""
+        self.hook_queue_depth.set(float(depth))
+
+    def trace_operation(self, operation: Operation | str) -> AbstractContextManager[Any]:
+        """No-op context manager for metrics-only Prometheus adapter."""
+        return nullcontext()

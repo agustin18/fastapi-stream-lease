@@ -5,6 +5,8 @@ Tests for cardinality-safe observability adapters (Prometheus & OpenTelemetry).
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterator
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -17,31 +19,49 @@ from prometheus_client import CollectorRegistry
 
 from fastapi_stream_lease.config import LeaseConfig
 from fastapi_stream_lease.exceptions import (
+    StreamLeaseLost,
     StreamLeaseRejected,
     StreamLeaseUnavailable,
 )
 from fastapi_stream_lease.manager import StreamLeaseManager
 from fastapi_stream_lease.observability.contract import (
+    DEFAULT_DURATION_BUCKETS,
     BackendErrorKind,
     LostReason,
     Operation,
     Outcome,
-    validate_cardinality_safe,
+    TelemetryAdapter,
+    classify_backend_error,
+    coerce_backend_error_kind,
+    coerce_lost_reason,
+    coerce_operation,
+    coerce_outcome,
 )
 from fastapi_stream_lease.observability.otel import OpenTelemetryMetrics
 from fastapi_stream_lease.observability.prometheus import PrometheusMetrics
 
 
-def test_cardinality_safe_validation() -> None:
-    """Verifies that user_id, lease_id, or dynamic keys are rejected as metric labels."""
-    safe_labels = {"operation": "acquire", "outcome": "success"}
-    validate_cardinality_safe(safe_labels)
+def test_strict_cardinality_coercion() -> None:
+    """Verifies that unknown or dynamic strings are rejected by enum coercion helpers."""
+    assert coerce_operation("acquire") == Operation.ACQUIRE
+    assert coerce_operation(Operation.RENEW) == Operation.RENEW
+    with pytest.raises(ValueError, match="Invalid operation 'invalid_op'"):
+        coerce_operation("invalid_op")
 
-    with pytest.raises(ValueError, match="Forbidden metric label 'user_id'"):
-        validate_cardinality_safe({"user_id": "123", "operation": "acquire"})
+    assert coerce_outcome("success") == Outcome.SUCCESS
+    assert coerce_outcome(Outcome.REJECTED) == Outcome.REJECTED
+    with pytest.raises(ValueError, match="Invalid outcome 'invalid_out'"):
+        coerce_outcome("invalid_out")
 
-    with pytest.raises(ValueError, match="Forbidden metric label 'lease_id'"):
-        validate_cardinality_safe({"lease_id": "abc-456", "outcome": "success"})
+    assert coerce_lost_reason("backend_timeout") == LostReason.BACKEND_TIMEOUT
+    assert coerce_lost_reason(LostReason.REDIS_REVOKED) == LostReason.REDIS_REVOKED
+    with pytest.raises(ValueError, match="Invalid lost reason 'user_cancelled'"):
+        coerce_lost_reason("user_cancelled")
+
+    assert coerce_backend_error_kind("connection") == BackendErrorKind.CONNECTION
+    assert coerce_backend_error_kind(BackendErrorKind.TIMEOUT) == BackendErrorKind.TIMEOUT
+    with pytest.raises(ValueError, match="Invalid backend error kind 'bad_kind'"):
+        coerce_backend_error_kind("bad_kind")
 
 
 @pytest.mark.parametrize(
@@ -125,17 +145,31 @@ def test_prometheus_backend_errors_metrics(kind: BackendErrorKind) -> None:
 
 
 def test_prometheus_fallback_and_dispatcher_gauges() -> None:
-    """Verifies fallback counter and dispatcher hook queue depth and drops."""
+    """Verifies fallback counter and dispatcher hook queue depth, drops, and errors."""
     registry = CollectorRegistry()
     metrics = PrometheusMetrics(registry=registry)
 
     metrics.record_fallback()
     assert registry.get_sample_value("fastapi_stream_lease_fallback_total") == 1.0
 
-    metrics.record_hook_metrics(dropped_count=3, error_count=1, queue_depth=42)
+    metrics.record_hook_drop()
+    metrics.record_hook_drop()
+    metrics.record_hook_drop()
     assert registry.get_sample_value("fastapi_stream_lease_hook_dropped_total") == 3.0
+
+    metrics.record_hook_error()
     assert registry.get_sample_value("fastapi_stream_lease_hook_errors_total") == 1.0
+
+    metrics.set_hook_queue_depth(42)
     assert registry.get_sample_value("fastapi_stream_lease_hook_queue_depth") == 42.0
+
+
+def test_prometheus_duplicate_registration_raises() -> None:
+    """Verifies that creating two PrometheusMetrics on the same registry raises ValueError."""
+    registry = CollectorRegistry()
+    PrometheusMetrics(registry=registry)
+    with pytest.raises(ValueError, match="Duplicated timeseries"):
+        PrometheusMetrics(registry=registry)
 
 
 def test_otel_metrics_and_selective_tracing() -> None:
@@ -296,7 +330,6 @@ def test_missing_optional_dependency_raises_clear_importerror() -> None:
 )
 def test_classify_backend_error_mapping(exc: BaseException, expected: BackendErrorKind) -> None:
     """Verify exception mapping to cardinality-safe BackendErrorKind categories."""
-    from fastapi_stream_lease.observability.contract import classify_backend_error
 
     assert classify_backend_error(exc) == expected
 
@@ -428,3 +461,272 @@ async def test_manager_metrics_on_failures_and_fallback(fake_redis) -> None:
 
     await manager.close()
     await manager_strict.close()
+
+
+def test_telemetry_adapter_protocol_conformance() -> None:
+    """Verifies Prometheus and OTel adapters fulfill TelemetryAdapter protocol."""
+    registry = CollectorRegistry()
+    prom = PrometheusMetrics(registry=registry)
+    assert isinstance(prom, TelemetryAdapter)
+
+    metric_reader = InMemoryMetricReader()
+    meter_provider = MeterProvider(metric_readers=[metric_reader])
+    otel = OpenTelemetryMetrics(meter_provider=meter_provider)
+    assert isinstance(otel, TelemetryAdapter)
+
+
+def test_otel_duration_buckets_and_hook_metrics() -> None:
+    """Verifies OTel histogram explicit bucket boundaries advisory and hook metrics."""
+    metric_reader = InMemoryMetricReader()
+    meter_provider = MeterProvider(metric_readers=[metric_reader])
+    otel = OpenTelemetryMetrics(meter_provider=meter_provider)
+
+    assert otel.duration_histogram._advisory.explicit_bucket_boundaries == DEFAULT_DURATION_BUCKETS
+
+    otel.record_hook_drop()
+    otel.record_hook_error()
+    otel.set_hook_queue_depth(13)
+
+    observations = otel._observe_queue_depth()
+    assert len(observations) == 1
+    assert observations[0].value == 13
+
+
+@pytest.mark.asyncio
+async def test_broken_telemetry_failure_isolation(fake_redis) -> None:
+    """
+    CRITICAL P1 AUDIT TEST:
+    Verifies that a completely broken TelemetryAdapter raising exceptions on every call
+    NEVER causes ghost leases, dropped streams, or breaks Redis coordination semantics.
+    """
+
+    class BrokenTelemetryAdapter:
+        def record_operation(self, operation: Any, outcome: Any, duration: float) -> None:
+            raise RuntimeError("record_operation simulated failure")
+
+        def record_lost(self, reason: Any) -> None:
+            raise RuntimeError("record_lost simulated failure")
+
+        def record_backend_error(self, kind: Any) -> None:
+            raise RuntimeError("record_backend_error simulated failure")
+
+        def record_fallback(self) -> None:
+            raise RuntimeError("record_fallback simulated failure")
+
+        def record_hook_drop(self) -> None:
+            raise RuntimeError("record_hook_drop simulated failure")
+
+        def record_hook_error(self) -> None:
+            raise RuntimeError("record_hook_error simulated failure")
+
+        def set_hook_queue_depth(self, depth: int) -> None:
+            raise RuntimeError("set_hook_queue_depth simulated failure")
+
+        def trace_operation(self, operation: Any) -> Any:
+            raise RuntimeError("trace_operation simulated failure")
+
+    broken = BrokenTelemetryAdapter()
+    config = LeaseConfig(lease_seconds=5.0, fail_open=True)
+    manager = StreamLeaseManager(fake_redis, config=config, telemetry=broken)
+
+    # 1. Acquire with broken telemetry must succeed and return a valid lease
+    lease = await manager.acquire(user_id="user_broken_telemetry")
+    assert lease is not None
+    assert lease.lease_id is not None
+
+    # 2. Renew with broken telemetry must succeed
+    renewed = await lease.renew()
+    assert renewed is True
+
+    # 3. Release with broken telemetry must succeed
+    await lease.release()
+    assert lease._is_released is True
+
+    # 4. Verify config with broken telemetry must succeed
+    verified = await manager.verify_cluster_config()
+    assert verified is True
+
+    # 5. Acquire with network error and fail_open=True must still return fallback lease
+    with patch.object(fake_redis, "eval", side_effect=ConnectionError("redis down")):
+        fallback_lease = await manager.acquire(user_id="user_broken_fallback")
+        assert fallback_lease._is_fallback is True
+        await fallback_lease.release()
+
+    # 6. Verify broken hook callbacks, depth, lost, and backend error calls
+    manager._on_hook_drop()
+    manager._on_hook_error()
+    manager._update_hook_queue_depth()
+    manager._safe_record_lost("redis_revoked")
+    manager._safe_record_backend_error(ConnectionError("fail"))
+    manager._safe_record_fallback()
+
+    # 7. Verify property alias works
+    assert manager.metrics is broken
+    manager.metrics = None
+    assert manager.telemetry is None
+
+    await manager.close()
+
+    # 8. Verify broken span __enter__ failure isolation
+    class BrokenEnterSpan:
+        def __enter__(self) -> Any:
+            raise RuntimeError("enter boom")
+
+        def __exit__(self, *args: Any) -> Any:
+            return False
+
+    class BrokenEnterAdapter:
+        def trace_operation(self, op: Any) -> Any:
+            return BrokenEnterSpan()
+
+    manager_enter_broken = StreamLeaseManager(fake_redis, telemetry=BrokenEnterAdapter())
+    l_enter = await manager_enter_broken.acquire(user_id="u_enter_broken")
+    assert l_enter is not None
+    await l_enter.release()
+    await manager_enter_broken.close()
+
+    # 9. Verify broken span __exit__ failure isolation (normal completion and rejection throw)
+    class BrokenExitSpan:
+        def __enter__(self) -> Any:
+            return self
+
+        def __exit__(self, *args: Any) -> Any:
+            raise RuntimeError("exit boom")
+
+    class BrokenExitAdapter:
+        def trace_operation(self, op: Any) -> Any:
+            return BrokenExitSpan()
+
+    manager_exit_broken = StreamLeaseManager(
+        fake_redis, LeaseConfig(max_per_user=1), telemetry=BrokenExitAdapter()
+    )
+    l_exit1 = await manager_exit_broken.acquire(user_id="u_exit_broken")
+    assert l_exit1 is not None
+    with pytest.raises(StreamLeaseRejected):
+        await manager_exit_broken.acquire(user_id="u_exit_broken")
+    await l_exit1.release()
+    await manager_exit_broken.close()
+
+    # 10. Verify callbacks when telemetry is None
+    manager_none = StreamLeaseManager(fake_redis, telemetry=None)
+    manager_none._on_hook_drop()
+    manager_none._on_hook_error()
+    await manager_none.close()
+
+    # 11. Verify span context manager exception suppression branch
+    class SuppressSpan:
+        def __enter__(self) -> Any:
+            return self
+
+        def __exit__(self, *args: Any) -> bool:
+            return True
+
+    class SuppressAdapter:
+        def trace_operation(self, op: Any) -> Any:
+            return SuppressSpan()
+
+    manager_suppress = StreamLeaseManager(fake_redis, telemetry=SuppressAdapter())
+    with manager_suppress._safe_trace_operation(Operation.ACQUIRE):
+        raise ValueError("suppressed by span")
+    await manager_suppress.close()
+
+
+@pytest.mark.asyncio
+async def test_manager_records_lost_on_redis_revocation(fake_redis) -> None:
+    """Verifies that lost_total is automatically emitted when lease is revoked/evicted in Redis."""
+    registry = CollectorRegistry()
+    metrics = PrometheusMetrics(registry=registry)
+    config = LeaseConfig(lease_seconds=0.2)
+    manager = StreamLeaseManager(fake_redis, config, telemetry=metrics)
+
+    with pytest.raises(StreamLeaseLost):
+        async with manager.lease(user_id="usr_lost_revocation", renew_interval=0.03) as lease:
+            await fake_redis.delete(lease.user_key)
+            await asyncio.sleep(0.1)
+
+    val = registry.get_sample_value(
+        "fastapi_stream_lease_lost_total",
+        {"reason": "redis_revoked"},
+    )
+    assert val == 1.0
+
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_manager_records_lost_on_backend_timeout(fake_redis) -> None:
+    """Verifies that lost_total is emitted when renewal expires during backend outage."""
+    registry = CollectorRegistry()
+    metrics = PrometheusMetrics(registry=registry)
+    config = LeaseConfig(lease_seconds=0.1)
+    manager = StreamLeaseManager(fake_redis, config, telemetry=metrics)
+
+    lease = await manager.acquire(user_id="usr_lost_timeout")
+
+    async def slow_stream() -> AsyncIterator[str]:
+        yield "chunk1"
+        await asyncio.sleep(0.2)
+        yield "chunk2"
+
+    with patch.object(fake_redis, "eval", side_effect=ConnectionError("outage")):
+        with pytest.raises(StreamLeaseLost):
+            async for _ in lease.wrap(slow_stream(), auto_renew=True, renew_interval=0.02):
+                pass
+
+    val = registry.get_sample_value(
+        "fastapi_stream_lease_lost_total",
+        {"reason": "backend_timeout"},
+    )
+    assert val == 1.0
+
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_manager_records_lost_on_unexpected_error(fake_redis) -> None:
+    """Verifies that lost_total is automatically emitted when renewal fails unexpectedly."""
+    registry = CollectorRegistry()
+    metrics = PrometheusMetrics(registry=registry)
+    config = LeaseConfig(lease_seconds=0.1)
+    manager = StreamLeaseManager(fake_redis, config, telemetry=metrics)
+
+    lease = await manager.acquire(user_id="usr_lost_unexpected")
+
+    async def slow_stream() -> AsyncIterator[str]:
+        yield "chunk1"
+        await asyncio.sleep(0.2)
+        yield "chunk2"
+
+    with patch.object(fake_redis, "eval", side_effect=TypeError("script bug")):
+        with pytest.raises(StreamLeaseLost):
+            async for _ in lease.wrap(slow_stream(), auto_renew=True, renew_interval=0.02):
+                pass
+
+    val = registry.get_sample_value(
+        "fastapi_stream_lease_lost_total",
+        {"reason": "unexpected_error"},
+    )
+    assert val == 1.0
+
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_manager_dispatcher_hook_error_telemetry(fake_redis) -> None:
+    """Verifies that hook_errors_total is incremented when a lifecycle callback raises."""
+    registry = CollectorRegistry()
+    metrics = PrometheusMetrics(registry=registry)
+
+    def failing_hook(*args: Any) -> None:
+        raise ValueError("failing hook")
+
+    config = LeaseConfig(on_acquired=failing_hook)
+    manager = StreamLeaseManager(fake_redis, config, telemetry=metrics)
+
+    lease = await manager.acquire(user_id="usr_hook_err")
+    await manager.drain()
+    await lease.release()
+    await manager.close()
+
+    val = registry.get_sample_value("fastapi_stream_lease_hook_errors_total")
+    assert val == 1.0

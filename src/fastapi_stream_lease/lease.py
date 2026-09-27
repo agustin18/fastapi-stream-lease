@@ -101,6 +101,7 @@ class StreamLease:
         if not self._is_fallback:
             await self.manager.release(self)
         self.manager.dispatcher.dispatch(self.manager.config.on_released, self, reason)
+        self.manager._update_hook_queue_depth()
 
     def _start_auto_renew(
         self, interval: float | None = None
@@ -151,9 +152,11 @@ class StreamLease:
                         )
                         lease_lost.set()
                         owner.cancel()
+                        self.manager._safe_record_lost("backend_timeout")
                         self.manager.dispatcher.dispatch(
                             self.manager.config.on_lost, self, "backend_timeout"
                         )
+                        self.manager._update_hook_queue_depth()
                         return
                 except Exception as exc:
                     logger.error(
@@ -165,9 +168,11 @@ class StreamLease:
                     )
                     lease_lost.set()
                     owner.cancel()
+                    self.manager._safe_record_lost("unexpected_error")
                     self.manager.dispatcher.dispatch(
                         self.manager.config.on_lost, self, "unexpected_error"
                     )
+                    self.manager._update_hook_queue_depth()
                     return
 
                 if renewed:
@@ -183,7 +188,9 @@ class StreamLease:
                 )
                 lease_lost.set()
                 owner.cancel()
+                self.manager._safe_record_lost("redis_revoked")
                 self.manager.dispatcher.dispatch(self.manager.config.on_lost, self, "redis_revoked")
+                self.manager._update_hook_queue_depth()
                 return
 
         return asyncio.create_task(worker()), lease_lost

@@ -18,11 +18,19 @@ class HookDispatcher:
     and enforces bounded queue backpressure to prevent unbounded task accumulation.
     """
 
-    def __init__(self, max_queue_size: int = 1024, sync_inline: bool = False) -> None:
+    def __init__(
+        self,
+        max_queue_size: int = 1024,
+        sync_inline: bool = False,
+        on_drop: Any | None = None,
+        on_error: Any | None = None,
+    ) -> None:
         if max_queue_size <= 0:
             raise ValueError("max_queue_size must be greater than 0")
         self._max_queue_size = max_queue_size
         self._sync_inline = sync_inline
+        self._on_drop = on_drop
+        self._on_error = on_error
         self._queue: asyncio.Queue[tuple[Any, tuple[Any, ...]] | None] | None = None
         self._worker_task: asyncio.Task[None] | None = None
         self._closed = False
@@ -59,6 +67,20 @@ class HookDispatcher:
             loop = asyncio.get_running_loop()
             self._worker_task = loop.create_task(self._worker())
 
+    def _notify_drop(self) -> None:
+        if self._on_drop is not None:
+            try:
+                self._on_drop()
+            except Exception:
+                pass
+
+    def _notify_error(self) -> None:
+        if self._on_error is not None:
+            try:
+                self._on_error()
+            except Exception:
+                pass
+
     async def _worker(self) -> None:
         """Background consumer executing queued callbacks in strict FIFO order."""
         assert self._queue is not None
@@ -79,6 +101,7 @@ class HookDispatcher:
                         await res
             except Exception as exc:
                 self._error_count += 1
+                self._notify_error()
                 logger.warning(
                     "Error executing lifecycle callback %s: %s",
                     hook_or_coro,
@@ -96,6 +119,7 @@ class HookDispatcher:
             return True
         except asyncio.QueueFull:
             self._dropped_count += 1
+            self._notify_drop()
             now = time.monotonic()
             if now - self._last_drop_log_time >= 2.0:
                 self._last_drop_log_time = now
@@ -110,6 +134,7 @@ class HookDispatcher:
         except RuntimeError as exc:
             # Event loop is closed or shutting down
             self._dropped_count += 1
+            self._notify_drop()
             logger.warning("Could not dispatch lifecycle hook %s: %s", hook_or_coro, exc)
             return False
 
@@ -126,6 +151,7 @@ class HookDispatcher:
             return True
         if self._closed:
             self._dropped_count += 1
+            self._notify_drop()
             logger.warning("Attempted to dispatch hook %s on a closed dispatcher", hook)
             return False
 
@@ -137,6 +163,7 @@ class HookDispatcher:
                 return True
             except Exception as exc:
                 self._error_count += 1
+                self._notify_error()
                 logger.warning("Error executing lifecycle callback %s: %s", hook, exc)
                 return False
 
