@@ -487,6 +487,9 @@ async def test_cluster_hard_master_failure_and_election_failover(cluster_client)
     assert len(test_failed) == 0, (
         f"Streaming task failed during automatic cluster failover: {test_failed}"
     )
+    # Wait for former primary to wake up from DEBUG SLEEP and re-converge
+    await asyncio.sleep(3.0)
+    await wait_for_cluster_ready(cluster_client)
     await manager.close()
 
 
@@ -529,7 +532,7 @@ async def test_cluster_outage_exceeding_lease_ttl_terminates_stream():
 
         async def pause_node(conn: aioredis.Redis):
             try:
-                await conn.execute_command("DEBUG", "SLEEP", 6.0)
+                await conn.execute_command("DEBUG", "SLEEP", 3.5)
             except Exception:
                 pass
             finally:
@@ -539,9 +542,11 @@ async def test_cluster_outage_exceeding_lease_ttl_terminates_stream():
             async with lease:
                 asyncio.create_task(pause_node(conn_master))
                 asyncio.create_task(pause_node(conn_replica))
-                await asyncio.sleep(5.0)
+                await asyncio.sleep(4.0)
     finally:
-        await asyncio.sleep(5.0)
+        # Wait for paused nodes to wake up and cluster to fully recover
+        await asyncio.sleep(4.0)
+        await wait_for_cluster_ready(client)
         await manager.close()
         await safe_close_client(client)
 
@@ -562,6 +567,7 @@ async def test_cluster_verify_cluster_config_across_failover(cluster_client):
     6. Run verify_cluster_config on promoted primary: succeeds with same config,
        and rejects conflicting configuration with ConfigurationMismatchError.
     """
+    await wait_for_cluster_ready(cluster_client)
     prefix = f"cluster_cfg_failover_{uuid4().hex[:8]}"
     config_a = LeaseConfig(
         key_prefix=prefix,
