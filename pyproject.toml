@@ -63,6 +63,7 @@ dev = [
     "prometheus-client>=0.20.0",
     "opentelemetry-api>=1.30.0",
     "opentelemetry-sdk>=1.30.0",
+    "codespell>=2.2.0",
 ]
 
 [project.urls]
@@ -83,8 +84,30 @@ line-length = 100
 target-version = "py310"
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "W", "UP", "B"]
+select = [
+    "E",     # pycodestyle errors
+    "W",     # pycodestyle warnings
+    "F",     # pyflakes
+    "I",     # isort
+    "UP",    # pyupgrade
+    "B",     # flake8-bugbear
+    "SIM",   # flake8-simplify
+    "C4",    # flake8-comprehensions
+    "ASYNC", # flake8-async
+    "PERF",  # perflint (performance anti-patterns)
+    "RUF",   # ruff-specific rules
+    "T20",   # flake8-print (disallow print in src/)
+]
 ignore = []
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["T20", "SIM", "ASYNC", "PERF", "RUF006"]
+"benchmarks/*" = ["T20"]
+"examples/*" = ["T20"]
+
+[tool.codespell]
+skip = "*.lock,*.xml,.git,.venv,.mypy_cache,.pytest_cache,dist"
+ignore-words-list = "crate"
 
 [tool.mypy]
 python_version = "3.10"

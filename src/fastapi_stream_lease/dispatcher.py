@@ -71,24 +71,18 @@ class HookDispatcher:
 
     def _notify_drop(self) -> None:
         if self._on_drop is not None:
-            try:
+            with suppress(Exception):
                 self._on_drop()
-            except Exception:
-                pass
 
     def _notify_error(self) -> None:
         if self._on_error is not None:
-            try:
+            with suppress(Exception):
                 self._on_error()
-            except Exception:
-                pass
 
     def _notify_queue_change(self, delta: int) -> None:
         if self._on_queue_change is not None and delta != 0:
-            try:
+            with suppress(Exception):
                 self._on_queue_change(delta)
-            except Exception:
-                pass
 
     async def _worker(self) -> None:
         """Background consumer executing queued callbacks in strict FIFO order."""

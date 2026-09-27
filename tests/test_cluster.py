@@ -473,7 +473,7 @@ async def test_cluster_hard_master_failure_and_election_failover(cluster_client)
         finally:
             await safe_close_client(conn_freeze)
 
-    asyncio.create_task(sleep_master())
+    _sleep_task = asyncio.create_task(sleep_master())
 
     # Wait for automatic election and promotion
     new_primary = await wait_for_slot_primary(cluster_client, slot, replica_host, timeout=30.0)
@@ -540,8 +540,8 @@ async def test_cluster_outage_exceeding_lease_ttl_terminates_stream():
 
         with pytest.raises(StreamLeaseLost):
             async with lease:
-                asyncio.create_task(pause_node(conn_master))
-                asyncio.create_task(pause_node(conn_replica))
+                _task_m = asyncio.create_task(pause_node(conn_master))
+                _task_r = asyncio.create_task(pause_node(conn_replica))
                 await asyncio.sleep(4.0)
     finally:
         # Wait for paused nodes to wake up and cluster to fully recover

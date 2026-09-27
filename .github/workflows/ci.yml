@@ -36,6 +36,9 @@ jobs:
       - name: Run Mypy Type Checking
         run: uv run mypy src
 
+      - name: Check Spelling (codespell)
+        run: uv run codespell
+
   test:
     runs-on: ubuntu-latest
     services:

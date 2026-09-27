@@ -487,7 +487,7 @@ async def test_sentinel_hard_master_failure_and_election_failover(sentinel_clust
         finally:
             await safe_close_client(master_raw)
 
-    asyncio.create_task(pause_master())
+    _pause_task = asyncio.create_task(pause_master())
 
     # Wait for Sentinel to detect failure, elect leader, and promote replica
     for _ in range(60):
@@ -672,8 +672,8 @@ async def test_sentinel_real_outage_exceeding_lease_ttl_terminates_stream(sentin
     try:
         with pytest.raises(StreamLeaseLost):
             async with lease:
-                asyncio.create_task(pause_node(conn_master))
-                asyncio.create_task(pause_node(conn_replica))
+                _task_m = asyncio.create_task(pause_node(conn_master))
+                _task_r = asyncio.create_task(pause_node(conn_replica))
                 await asyncio.sleep(3.5)
     finally:
         # Settle topology: wait for paused nodes to wake up and rejoin
