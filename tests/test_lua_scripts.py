@@ -84,8 +84,8 @@ async def test_lease_expiration_and_self_cleanup(lease_manager):
     _ = await lease_manager.acquire("user_1")
     assert await lease_manager.get_active_count("user_1") == 2
 
-    # Wait for lease to expire (2.1s)
-    await asyncio.sleep(2.1)
+    # Wait for lease to expire (2.2s > 2.0s lease_seconds)
+    await asyncio.sleep(2.2)
 
     # Next acquire should auto-purge expired leases and succeed
     lease3 = await lease_manager.acquire("user_1")
@@ -113,7 +113,7 @@ async def test_lease_renewal(lease_manager):
 @pytest.mark.asyncio
 async def test_expired_lease_cannot_be_revived(lease_manager):
     lease = await lease_manager.acquire("user_1")
-    await asyncio.sleep(2.1)
+    await asyncio.sleep(2.2)
     replacement = await lease_manager.acquire("user_1")
 
     assert await lease.renew() is False

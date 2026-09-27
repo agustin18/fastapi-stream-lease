@@ -40,15 +40,16 @@ async def wait_for_writable_master(
 ) -> tuple[str, int]:
     """Poll until Sentinel reports a master that successfully executes write commands."""
     for _ in range(int(timeout / 0.5)):
+        client = sentinel.master_for(service_name, socket_timeout=1.0)
         try:
-            client = sentinel.master_for(service_name, socket_timeout=1.0)
             test_key = f"sentinel_writable_{uuid4().hex[:8]}"
             await client.set(test_key, "1", ex=5)
             await client.delete(test_key)
-            await client.aclose()
             return await sentinel.discover_master(service_name)
         except Exception:
             await asyncio.sleep(0.5)
+        finally:
+            await client.aclose()
     raise TimeoutError(f"Master for '{service_name}' did not become writable within {timeout}s")
 
 
