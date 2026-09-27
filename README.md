@@ -209,15 +209,24 @@ Because `{prefix}:config` is persistent (stored with `SET ... NX` without TTL ex
      ```
    - Start the updated worker instances. The first new pod will atomically register the updated configuration fingerprint with `SET ... NX`, and subsequent pods will verify compatibility against it.
 - **Redis Failover & Sentinel Support:** Automatically classifies `ReadOnlyError` (thrown when hitting a replica during master election) and `ConnectionError` as transient conditions, enabling adaptive renewal retries to ride out failovers without dropping active streams. Note that the Sentinel configuration in `docker-compose.sentinel.yml` uses aggressive test timings (`down-after-milliseconds 1000`, `failover-timeout 5000`); production environments should use standard recommended operational timeouts (`down-after-milliseconds` 5000–30000ms, `failover-timeout` 60000–180000ms).
-- **Redis Cluster:** All keys use Redis hash tags (`{prefix}:user:...` and `{prefix}:global`), guaranteeing user and global sorted sets reside on the same hash slot for multi-key atomic Lua operations. As with any multi-key Lua coordination, evaluate slot contention and failover behavior under your specific topology.
+- **Redis Cluster Support:** All keys use Redis hash tags (`{prefix}:user:...` and `{prefix}:global`), guaranteeing user and global sorted sets reside on the same hash slot for atomic multi-key Lua operations without `CROSSSLOT` errors. Validated under real 6-node sharded topologies (`docker-compose.cluster.yml`) with automated slot failover, `MOVED` redirection recovery, and drift verification (`tests/test_cluster.py`).
 - **Reproducible Concurrency Benchmarks:**
   Run throughput and latency benchmarks against your local Redis instance with pre-warmed connection pool and multi-run statistics:
   ```bash
   docker compose run --rm backend uv run python benchmarks/bench_lease_concurrency.py --count 1000 --concurrency 50 --runs 3
   ```
-- **Docker Compose Testing Stack:** Run the test suite and Redis dependency cleanly across Linux, macOS, and Windows:
+- **Docker Compose Testing Stack:** Run the test suite and distributed coordination topologies cleanly:
   ```bash
+  # Standard unit and integration test suite:
   docker compose run --rm backend uv run pytest
+
+  # Redis Sentinel failover & chaos test suite:
+  docker compose -f docker-compose.sentinel.yml up -d --wait
+  docker compose -f docker-compose.sentinel.yml run --rm backend uv run pytest -o addopts='' tests/test_sentinel.py -vv -s
+
+  # Redis Cluster 6-node multi-shard test suite:
+  docker compose -f docker-compose.cluster.yml up -d --wait
+  docker compose -f docker-compose.cluster.yml run --rm backend uv run --all-extras pytest -o addopts='' tests/test_cluster.py -vv -s
   ```
 
 ## Examples directory

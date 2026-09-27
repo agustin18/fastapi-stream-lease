@@ -147,6 +147,24 @@ jobs:
         run: |
           docker compose -f docker-compose.sentinel.yml down -v
 
+  test-cluster:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Start Redis Cluster Topology
+        run: |
+          docker compose -f docker-compose.cluster.yml up -d --wait
+
+      - name: Run Redis Cluster Integration & Failover Tests
+        run: |
+          docker compose -f docker-compose.cluster.yml run --rm backend uv run --all-extras pytest -o addopts='' tests/test_cluster.py -vv -s
+
+      - name: Teardown Redis Cluster Topology
+        if: always()
+        run: |
+          docker compose -f docker-compose.cluster.yml down -v
+
   package:
     runs-on: ubuntu-latest
     steps:
