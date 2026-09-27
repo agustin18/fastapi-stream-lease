@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import math
 import os
 import sys
 import time
@@ -448,8 +449,8 @@ def main() -> None:
     parser.add_argument(
         "--concurrency",
         type=int,
-        default=25,
-        help="Concurrent coroutines (default: 25)",
+        default=1,
+        help="Concurrent coroutines (default: 1)",
     )
     parser.add_argument(
         "--max-p99-overhead-ms",
@@ -499,7 +500,18 @@ def main() -> None:
         try:
             with open(baseline_file, encoding="utf-8") as f:
                 baseline_data = json.load(f)
-            baseline_p99 = float(baseline_data.get("max_p99_paired_overhead_ms", 1.0))
+            if not isinstance(baseline_data, dict):
+                raise ValueError("Baseline JSON must be an object/dict")
+            if "max_p99_paired_overhead_ms" not in baseline_data:
+                raise ValueError(
+                    "Missing required field 'max_p99_paired_overhead_ms' in baseline JSON"
+                )
+            val = float(baseline_data["max_p99_paired_overhead_ms"])
+            if not math.isfinite(val) or val <= 0.0:
+                raise ValueError(
+                    f"'max_p99_paired_overhead_ms' must be a finite positive number, got {val}"
+                )
+            baseline_p99 = val
         except Exception as err:
             print(
                 f"Error: Failed to parse baseline JSON from {args.baseline}: {err}",

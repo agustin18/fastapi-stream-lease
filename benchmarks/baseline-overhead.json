@@ -1,0 +1,8 @@
+{
+  "benchmark": "fastapi-stream-lease-wrapper-overhead",
+  "version": "1.0",
+  "concurrency": 1,
+  "count": 1000,
+  "budget_threshold_ms": 1.0,
+  "max_p99_paired_overhead_ms": 0.50
+}

@@ -47,7 +47,7 @@ jobs:
       - name: Install dependencies
         run: uv sync --locked --extra dev
 
-      - name: Execute Wrapper Overhead & Host Latency Calibration
+      - name: Execute Wrapper Overhead & Enforce Regression Budget against Blessed Baseline
         env:
           REDIS_URL: redis://localhost:6379/15
           PYTHONPATH: src
@@ -56,6 +56,8 @@ jobs:
             --count 1000 \
             --concurrency 1 \
             --max-p99-overhead-ms 1.0 \
+            --baseline benchmarks/baseline-overhead.json \
+            --max-regression-pct 20.0 \
             --save-baseline /tmp/overhead-baseline.json
 
       - name: Upload overhead benchmark artifact
@@ -97,11 +99,13 @@ jobs:
           REDIS_URL: redis://localhost:6379/15
           PYTHONPATH: src
         run: |
-          DURATION="${{ github.event.inputs.soak_duration || '120' }}"
-          CONCURRENCY="${{ github.event.inputs.target_concurrency || '300' }}"
+          DURATION="${{ github.event.inputs.soak_duration || '300' }}"
+          CONCURRENCY="${{ github.event.inputs.target_concurrency || '500' }}"
           uv run python benchmarks/bench_soak.py \
             --duration "$DURATION" \
             --target-concurrency "$CONCURRENCY" \
+            --burst-rate 50 \
+            --burst-interval 15.0 \
             --assert-plateau
 
   sentinel-chaos:

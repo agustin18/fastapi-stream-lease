@@ -274,7 +274,13 @@ async def run_soak(
     if not zero_task_leak:
         print(f"WARNING: Lingering asyncio tasks detected ({len(extra_tasks)}):", file=sys.stderr)
         for t in extra_tasks:
-            print(f"  - Task name={t.get_name()}, coro={t.get_coro()}", file=sys.stderr)
+            stack_frames = [
+                f"{f.f_code.co_filename}:{f.f_lineno} in {f.f_code.co_name}" for f in t.get_stack()
+            ]
+            print(
+                f"  - Task name={t.get_name()}, coro={t.get_coro()}, stack={stack_frames}",
+                file=sys.stderr,
+            )
 
     final_rss_kb = get_current_rss_kb()
 
@@ -296,6 +302,7 @@ async def run_soak(
     await client.aclose()
 
     zero_ghost_leases = total_ghost_leases == 0
+    zero_residual_keys = len(remaining_keys) == 0
 
     # M02: Robust linear regression slope & plateau calculation
     plateau_stable = True
@@ -323,9 +330,10 @@ async def run_soak(
     elif assert_plateau and len(samples) < 2:
         plateau_stable = False
 
-    # S04: unexpected_rejections must be 0
+    # S04 & S07: unexpected_rejections must be 0, zero ghost leases AND zero residual keys
     passed = (
         zero_ghost_leases
+        and zero_residual_keys
         and zero_task_leak
         and len(unexpected_errors) == 0
         and unexpected_rejections == 0
@@ -348,6 +356,10 @@ async def run_soak(
         f"  Ghost Leases in Redis:   {total_ghost_leases} "
         f"{'[OK]' if zero_ghost_leases else '[FAIL]'}"
     )
+    print(
+        f"  Residual Redis Keys:     {len(remaining_keys)} "
+        f"{'[OK]' if zero_residual_keys else '[FAIL]'}"
+    )
     print(f"  Lingering Asyncio Tasks: {len(extra_tasks)} {'[OK]' if zero_task_leak else '[FAIL]'}")
     print(
         f"  Steady-State RSS Slope:  {rss_slope_mb_per_sec:+.4f} MB/s "
@@ -367,6 +379,8 @@ async def run_soak(
         "unexpected_errors": unexpected_errors,
         "total_ghost_leases": total_ghost_leases,
         "zero_ghost_leases": zero_ghost_leases,
+        "remaining_keys": remaining_keys,
+        "zero_residual_keys": zero_residual_keys,
         "lingering_tasks_count": len(extra_tasks),
         "zero_task_leak": zero_task_leak,
         "initial_rss_kb": initial_rss_kb,

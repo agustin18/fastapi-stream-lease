@@ -263,19 +263,22 @@ async def test_real_redis_resource_plateau_under_stream_churn(real_manager):
 
 @pytest.mark.asyncio
 async def test_real_redis_wrapper_overhead_budget(real_manager):
-    """Verify that StreamLeaseManager Python wrapper overhead is strictly within 1ms budget."""
+    """Sanity check: verify StreamLeaseManager Python wrapper overhead is within 1ms budget."""
     import statistics
     import time
 
     from fastapi_stream_lease.lua import ACQUIRE_SCRIPT, RELEASE_SCRIPT
 
     client = real_manager.redis
-    prefix = f"overhead_test_{uuid4().hex[:8]}"
-    config = LeaseConfig(lease_seconds=60.0, max_per_user=100, max_global=1000, key_prefix=prefix)
-    bench_manager = StreamLeaseManager(client, config)
-
-    user_key = config.user_key("bench_user")
-    global_key = config.global_key
+    raw_prefix = f"bench_raw_{uuid4().hex[:8]}"
+    wrap_prefix = f"bench_wrap_{uuid4().hex[:8]}"
+    raw_config = LeaseConfig(
+        lease_seconds=60.0, max_per_user=100, max_global=1000, key_prefix=raw_prefix
+    )
+    wrap_config = LeaseConfig(
+        lease_seconds=60.0, max_per_user=100, max_global=1000, key_prefix=wrap_prefix
+    )
+    bench_manager = StreamLeaseManager(client, wrap_config)
 
     # Warm up connection
     await client.ping()
@@ -284,37 +287,59 @@ async def test_real_redis_wrapper_overhead_budget(real_manager):
     wrapped_latencies: list[float] = []
 
     iterations = 25
+    created_raw_keys: set[str] = set()
     try:
         for i in range(iterations):
+            user_id = f"user_{i}"
             lease_id = f"raw_lease_{i}"
+            raw_user_key = raw_config.user_key(user_id)
+            raw_global_key = raw_config.global_key
+            created_raw_keys.add(raw_user_key)
+            created_raw_keys.add(raw_global_key)
+
             if i % 2 == 0:
                 t0 = time.perf_counter()
                 await client.eval(
-                    ACQUIRE_SCRIPT, 2, user_key, global_key, 60.0, lease_id, 1000, 1000, 120.0
+                    ACQUIRE_SCRIPT,
+                    2,
+                    raw_user_key,
+                    raw_global_key,
+                    60.0,
+                    lease_id,
+                    100,
+                    1000,
+                    120.0,
                 )
+                await client.eval(RELEASE_SCRIPT, 2, raw_user_key, raw_global_key, lease_id)
                 raw_latencies.append(time.perf_counter() - t0)
 
                 t0 = time.perf_counter()
-                lease = await bench_manager.acquire(f"wrap_user_{i}")
-                wrapped_latencies.append(time.perf_counter() - t0)
+                lease = await bench_manager.acquire(user_id)
                 await lease.release()
+                wrapped_latencies.append(time.perf_counter() - t0)
             else:
                 t0 = time.perf_counter()
-                lease = await bench_manager.acquire(f"wrap_user_{i}")
-                wrapped_latencies.append(time.perf_counter() - t0)
+                lease = await bench_manager.acquire(user_id)
                 await lease.release()
+                wrapped_latencies.append(time.perf_counter() - t0)
 
                 t0 = time.perf_counter()
                 await client.eval(
-                    ACQUIRE_SCRIPT, 2, user_key, global_key, 60.0, lease_id, 1000, 1000, 120.0
+                    ACQUIRE_SCRIPT,
+                    2,
+                    raw_user_key,
+                    raw_global_key,
+                    60.0,
+                    lease_id,
+                    100,
+                    1000,
+                    120.0,
                 )
+                await client.eval(RELEASE_SCRIPT, 2, raw_user_key, raw_global_key, lease_id)
                 raw_latencies.append(time.perf_counter() - t0)
     finally:
-        # T01: Release all raw leases and wipe test keys
-        for i in range(iterations):
-            lease_id = f"raw_lease_{i}"
-            await client.eval(RELEASE_SCRIPT, 2, user_key, global_key, lease_id)
-        await client.delete(user_key, global_key)
+        if created_raw_keys:
+            await client.delete(*created_raw_keys)
         await bench_manager.close(drain=True)
 
     # Paired delta calculation (eliminates external variance)

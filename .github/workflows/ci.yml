@@ -158,9 +158,28 @@ jobs:
         run: uv python install 3.12
       - name: Install dependencies
         run: uv sync --locked --extra dev
-      - name: Smoke test wrapper overhead benchmark
+      - name: Smoke test wrapper overhead benchmark with regression gate
         run: |
-          uv run python benchmarks/bench_wrapper_overhead.py --count 50 --concurrency 1 --max-p99-overhead-ms 5.0
+          BASELINE_ARG="--baseline benchmarks/baseline-overhead.json"
+          if [ "${{ github.event_name }}" = "pull_request" ] && [ -n "${{ github.base_ref }}" ]; then
+            echo "Attempting to calibrate baseline against base branch: ${{ github.base_ref }}"
+            if git fetch origin "${{ github.base_ref }}":base_ref --depth=1 --force && git worktree add /tmp/base-repo base_ref; then
+              PYTHONPATH=/tmp/base-repo/src uv run python benchmarks/bench_wrapper_overhead.py \
+                --count 50 \
+                --concurrency 1 \
+                --max-p99-overhead-ms 5.0 \
+                --save-baseline /tmp/base-overhead-baseline.json
+              git worktree remove /tmp/base-repo --force
+              BASELINE_ARG="--baseline /tmp/base-overhead-baseline.json"
+            fi
+          fi
+          echo "Running benchmark with $BASELINE_ARG..."
+          uv run python benchmarks/bench_wrapper_overhead.py \
+            --count 50 \
+            --concurrency 1 \
+            --max-p99-overhead-ms 5.0 \
+            $BASELINE_ARG \
+            --max-regression-pct 50.0
       - name: Smoke test soak workload
         run: |
           uv run python benchmarks/bench_soak.py --duration 5 --target-concurrency 10 --lease-seconds 4.0 --renew-interval 1.0

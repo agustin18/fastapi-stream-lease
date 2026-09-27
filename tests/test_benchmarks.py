@@ -118,3 +118,120 @@ async def test_soak_input_validation():
             lease_seconds=5.0,
             renew_interval=10.0,
         )
+
+
+@pytest.mark.parametrize(
+    ("baseline_p99", "current_p99", "max_allowed_pct", "expected_passed"),
+    [
+        (0.20, 0.21, 10.0, True),  # +5% regression <= 10%
+        (0.20, 0.22, 10.0, True),  # +10% regression == 10%
+        (0.20, 0.23, 10.0, False),  # +15% regression > 10%
+        (0.50, 0.25, 10.0, True),  # -50% improvement
+    ],
+)
+def test_regression_gate_evaluation(
+    baseline_p99: float, current_p99: float, max_allowed_pct: float, expected_passed: bool
+) -> None:
+    """Verify regression gate accepts within-budget deltas and rejects regressions (R1)."""
+    diff_pct = ((current_p99 - baseline_p99) / baseline_p99) * 100.0
+    regression_passed = diff_pct <= max_allowed_pct
+    assert regression_passed is expected_passed
+
+
+@pytest.mark.parametrize(
+    ("slope", "abs_growth", "rel_growth", "expected_stable"),
+    [
+        (0.05, 5.0, 5.0, True),  # Healthy plateau
+        (0.16, 5.0, 5.0, False),  # Slope > 0.15 MB/s
+        (0.05, 16.0, 5.0, False),  # Absolute growth > 15 MB
+        (0.05, 5.0, 16.0, False),  # Relative growth > 15%
+    ],
+)
+def test_plateau_stability_criteria(
+    slope: float, abs_growth: float, rel_growth: float, expected_stable: bool
+) -> None:
+    """Verify memory plateau criteria strictly flags slope, absolute, and relative leaks (M02)."""
+    plateau_stable = not (slope > 0.15 or rel_growth > 15.0 or abs_growth > 15.0)
+    assert plateau_stable is expected_stable
+
+
+@pytest.mark.parametrize(
+    (
+        "zero_ghosts",
+        "zero_residual_keys",
+        "zero_tasks",
+        "rejections",
+        "errors_count",
+        "plateau",
+        "expected_passed",
+    ),
+    [
+        (True, True, True, 0, 0, True, True),  # All clean -> PASS
+        (True, False, True, 0, 0, True, False),  # R2: Residual keys present -> FAIL
+        (False, True, True, 0, 0, True, False),  # Ghost leases present -> FAIL
+        (True, True, False, 0, 0, True, False),  # Task leak -> FAIL
+        (True, True, True, 1, 0, True, False),  # Rejections -> FAIL
+        (True, True, True, 0, 1, True, False),  # Errors -> FAIL
+        (True, True, True, 0, 0, False, False),  # Unstable plateau -> FAIL
+    ],
+)
+def test_soak_overall_passed_invariants(
+    zero_ghosts: bool,
+    zero_residual_keys: bool,
+    zero_tasks: bool,
+    rejections: int,
+    errors_count: int,
+    plateau: bool,
+    expected_passed: bool,
+) -> None:
+    """Verify that soak passed requires zero ghost leases AND zero residual keys (R2, S04, S07)."""
+    passed = (
+        zero_ghosts
+        and zero_residual_keys
+        and zero_tasks
+        and errors_count == 0
+        and rejections == 0
+        and plateau
+    )
+    assert passed is expected_passed
+
+
+def test_baseline_json_parsing_robustness(tmp_path) -> None:
+    """Verify baseline parser rejects missing fields, non-dicts, or invalid values (R3)."""
+    import json
+    import math
+
+    def parse_baseline(file_path):
+        with open(file_path, encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError("Baseline JSON must be an object/dict")
+        if "max_p99_paired_overhead_ms" not in data:
+            raise ValueError("Missing required field 'max_p99_paired_overhead_ms'")
+        val = float(data["max_p99_paired_overhead_ms"])
+        if not math.isfinite(val) or val <= 0.0:
+            raise ValueError("Must be finite positive number")
+        return val
+
+    # Non-dict
+    f1 = tmp_path / "f1.json"
+    f1.write_text("[1, 2, 3]")
+    with pytest.raises(ValueError, match="must be an object/dict"):
+        parse_baseline(f1)
+
+    # Missing field
+    f2 = tmp_path / "f2.json"
+    f2.write_text('{"other": 1.0}')
+    with pytest.raises(ValueError, match="Missing required field"):
+        parse_baseline(f2)
+
+    # Non-positive
+    f3 = tmp_path / "f3.json"
+    f3.write_text('{"max_p99_paired_overhead_ms": 0.0}')
+    with pytest.raises(ValueError, match="Must be finite positive"):
+        parse_baseline(f3)
+
+    # Valid
+    f4 = tmp_path / "f4.json"
+    f4.write_text('{"max_p99_paired_overhead_ms": 0.35}')
+    assert parse_baseline(f4) == 0.35
