@@ -210,7 +210,8 @@ def find_slot_nodes(
                 master = info["primary"]
                 replicas = info.get("replicas", [])
                 if not replicas:
-                    raise ValueError(f"Slot {target_slot} has no replicas assigned yet: {slots_data}")
+                    msg = f"Slot {target_slot} has no replicas assigned yet: {slots_data}"
+                    raise ValueError(msg)
                 return master, replicas[0]
     elif isinstance(slots_data, list):
         for entry in slots_data:
@@ -218,7 +219,8 @@ def find_slot_nodes(
             if start_slot <= target_slot <= end_slot:
                 m_info = entry[2]
                 if len(entry) < 4 or not entry[3]:
-                    raise ValueError(f"Slot {target_slot} has no replicas assigned yet: {slots_data}")
+                    msg = f"Slot {target_slot} has no replicas assigned yet: {slots_data}"
+                    raise ValueError(msg)
                 r_info = entry[3]
                 m_host = m_info[0].decode() if isinstance(m_info[0], bytes) else m_info[0]
                 r_host = r_info[0].decode() if isinstance(r_info[0], bytes) else r_info[0]
