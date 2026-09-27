@@ -242,4 +242,4 @@ Because `{prefix}:config` is persistent (stored with `SET ... NX` without TTL ex
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the local workflow and [SECURITY.md](SECURITY.md) for private vulnerability reports. Changes are proposed through pull requests and merged by the maintainer after CI passes. The package is licensed under [MIT](LICENSE).
 
-CI checks formatting, lint, types, Redis 5, 7, and 8 behavior, package build, and a minimum of 95% combined line and branch coverage. This is a small beta project; reports from real deployments are especially helpful for documenting operational limits.
+CI checks formatting, lint, strict static typing, Redis 5, 7, and 8 behavior, Redis Sentinel and 6-node Redis Cluster failover chaos validation, package build, and 100% combined statement and branch coverage. Reports and feedback from production deployments are welcome for continuously documenting operational limits.

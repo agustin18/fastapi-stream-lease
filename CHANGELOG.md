@@ -7,8 +7,8 @@
 - **Uncoordinated Hard Master Failure & Replica Election**: Validated automatic replica election and uninterrupted lease renewals under uncoordinated primary hard crashes (`DEBUG SLEEP`) without manual failover commands.
 - **Transient Redis Cluster Exception Classification**: Expanded `is_network_error()` with precomputed exception lookup sets (`ReadOnlyError`, `ClusterDownError`, `MasterDownError`, `SlotNotCoveredError`, `TryAgainError`, `ClusterError`) while strictly classifying `ClusterCrossSlotError` as non-transient.
 - **Dual-Node Outage Stream Cancellation**: Verified fail-closed lease termination and `StreamLeaseLost` cancellation with `lost_reasons == ["backend_timeout"]` when all nodes serving a slot become unreachable.
-- **Minimum Dependency Floor & Multi-Version CI Automation**: Added automated CI testing for minimum floor `redis==5.0.0` on Python 3.12 alongside latest `redis-py` across Python 3.10 through 3.14.
-- **Safe Client Lifecycle Teardown**: Implemented `safe_close_client` helper ensuring clean connection closure across both `redis-py` 5.0.0 (`close()`) and 5.0.1+ (`aclose()`).
+- **Minimum Dependency Floor (`redis>=5.0.0`) Across All Topologies**: Verified full compatibility with minimum floor `redis==5.0.0` across the entire unit suite, Redis Sentinel chaos tests, and 6-node Redis Cluster failover tests. Added response normalization for legacy Redis protocol array returns and safe teardown bridging `close()` and `aclose()`.
+- **Production/Stable GA Status**: Promoted package classifier to `Development Status :: 5 - Production/Stable`, graduating from beta after extensive failover and chaos verification across standalone, Sentinel, and Cluster topologies.
 - **Distributed Guarantees & Replication Failure Model Documentation**: Documented Redis Cluster asynchronous replication limits, un-replicated write loss windows during failover, and `WAIT` safety boundaries in the official distributed guarantees documentation.
 
 ## 0.2.0b1 — 2026-09-27
