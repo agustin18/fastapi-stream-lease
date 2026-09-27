@@ -33,7 +33,7 @@ def parse_cluster_nodes(nodes_env: str) -> list[tuple[str, int]]:
 
 
 async def wait_for_cluster_ready(cluster: RedisCluster, timeout: float = 30.0) -> None:
-    """Poll until Redis Cluster reports state:ok and all 16384 slots assigned."""
+    """Poll until Redis Cluster reports state:ok, all 16384 slots assigned, and replicas healthy."""
     deadline = asyncio.get_running_loop().time() + timeout
     while asyncio.get_running_loop().time() < deadline:
         try:
@@ -44,12 +44,29 @@ async def wait_for_cluster_ready(cluster: RedisCluster, timeout: float = 30.0) -
             slots = info.get("cluster_slots_assigned") or info.get(b"cluster_slots_assigned")
             if isinstance(slots, bytes):
                 slots = slots.decode("utf-8")
-            if state == "ok" and int(slots) == 16384:
-                return
+            known_nodes = info.get("cluster_known_nodes") or info.get(b"cluster_known_nodes")
+            if isinstance(known_nodes, bytes):
+                known_nodes = known_nodes.decode("utf-8")
+
+            if state == "ok" and int(slots) == 16384 and int(known_nodes) >= 6:
+                slots_data = await cluster.cluster_slots()
+                has_replicas = True
+                if isinstance(slots_data, dict):
+                    for info_slot in slots_data.values():
+                        if not info_slot.get("replicas"):
+                            has_replicas = False
+                            break
+                elif isinstance(slots_data, list):
+                    for entry in slots_data:
+                        if len(entry) < 4 or not entry[3]:
+                            has_replicas = False
+                            break
+                if has_replicas:
+                    return
         except Exception:
             pass
         await asyncio.sleep(0.5)
-    raise TimeoutError(f"Redis Cluster did not become ready within {timeout}s")
+    raise TimeoutError(f"Redis Cluster did not become fully ready with replicas within {timeout}s")
 
 
 @pytest.fixture
@@ -191,18 +208,36 @@ def find_slot_nodes(
         for (start_slot, end_slot), info in slots_data.items():
             if start_slot <= target_slot <= end_slot:
                 master = info["primary"]
-                replica = info["replicas"][0]
-                return master, replica
+                replicas = info.get("replicas", [])
+                if not replicas:
+                    raise ValueError(f"Slot {target_slot} has no replicas assigned yet: {slots_data}")
+                return master, replicas[0]
     elif isinstance(slots_data, list):
         for entry in slots_data:
             start_slot, end_slot = entry[0], entry[1]
             if start_slot <= target_slot <= end_slot:
                 m_info = entry[2]
+                if len(entry) < 4 or not entry[3]:
+                    raise ValueError(f"Slot {target_slot} has no replicas assigned yet: {slots_data}")
                 r_info = entry[3]
                 m_host = m_info[0].decode() if isinstance(m_info[0], bytes) else m_info[0]
                 r_host = r_info[0].decode() if isinstance(r_info[0], bytes) else r_info[0]
                 return (m_host, m_info[1]), (r_host, r_info[1])
     raise ValueError(f"Slot {target_slot} not found in cluster slots data")
+
+
+async def discover_slot_nodes(
+    cluster: RedisCluster, slot: int, timeout: float = 15.0
+) -> tuple[tuple[str, int], tuple[str, int]]:
+    """Poll cluster_slots until slot has settled primary and replica nodes."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
+        try:
+            slots_map = await cluster.cluster_slots()
+            return find_slot_nodes(slots_map, slot)
+        except ValueError:
+            await asyncio.sleep(0.5)
+    raise TimeoutError(f"Slot {slot} nodes (primary + replica) did not settle within {timeout}s")
 
 
 @pytest.mark.asyncio
@@ -225,8 +260,9 @@ async def test_cluster_failover_during_active_stream_renewal(cluster_client):
 
     # Find the slot for prefix and discover master & replica nodes
     slot = await cluster_client.cluster_keyslot(config.global_key)
-    slots_map = await cluster_client.cluster_slots()
-    (master_host, master_port), (replica_host, replica_port) = find_slot_nodes(slots_map, slot)
+    (master_host, master_port), (replica_host, replica_port) = await discover_slot_nodes(
+        cluster_client, slot
+    )
 
     lease_started = asyncio.Event()
     failover_done = asyncio.Event()
@@ -302,8 +338,7 @@ async def test_cluster_outage_exceeding_lease_ttl_terminates_stream(cluster_clie
     lease = await manager.acquire("user_outage")
 
     slot = await cluster_client.cluster_keyslot(config.global_key)
-    slots_map = await cluster_client.cluster_slots()
-    (m_host, m_port), (r_host, r_port) = find_slot_nodes(slots_map, slot)
+    (m_host, m_port), (r_host, r_port) = await discover_slot_nodes(cluster_client, slot)
 
     conn_master = aioredis.from_url(f"redis://{m_host}:{m_port}", socket_timeout=0.5)
     conn_replica = aioredis.from_url(f"redis://{r_host}:{r_port}", socket_timeout=0.5)

@@ -89,13 +89,14 @@ services:
           --cluster-replicas 1
         
         for i in $$(seq 1 30); do
-          STATE=$$(redis-cli -h redis-cluster-1 -p 7000 cluster info | grep cluster_state | tr -d '\r\n')
-          SLOTS=$$(redis-cli -h redis-cluster-1 -p 7000 cluster info | grep cluster_slots_assigned | tr -d '\r\n')
-          if [ "$$STATE" = "cluster_state:ok" ] && [ "$$SLOTS" = "cluster_slots_assigned:16384" ]; then
-            echo "Redis Cluster successfully initialized and healthy!"
+          STATE=$$(redis-cli -h redis-cluster-1 -p 7000 cluster info | grep cluster_state: | tr -d '\r\n')
+          SLOTS=$$(redis-cli -h redis-cluster-1 -p 7000 cluster info | grep cluster_slots_assigned: | tr -d '\r\n')
+          NODES=$$(redis-cli -h redis-cluster-1 -p 7000 cluster info | grep cluster_known_nodes: | tr -d '\r\n')
+          if [ "$$STATE" = "cluster_state:ok" ] && [ "$$SLOTS" = "cluster_slots_assigned:16384" ] && [ "$$NODES" = "cluster_known_nodes:6" ]; then
+            echo "Redis Cluster successfully initialized with 6 nodes and healthy!"
             exit 0
           fi
-          echo "Waiting for cluster convergence: $$STATE $$SLOTS..."
+          echo "Waiting for cluster convergence: $$STATE $$SLOTS $$NODES..."
           sleep 1
         done
         echo "Cluster initialization timed out!"
