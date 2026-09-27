@@ -994,6 +994,12 @@ async def test_verify_cluster_config_registration_and_mismatch(fake_redis):
     with pytest.raises(StreamLeaseUnavailable):
         await mgr_unresolvable.verify_cluster_config(strict=True)
 
+    # 8. Invalid retry_attempts or retry_delay parameter validation
+    with pytest.raises(ValueError, match="retry_attempts must be at least 1"):
+        await mgr1.verify_cluster_config(retry_attempts=0)
+    with pytest.raises(ValueError, match="retry_delay must be non-negative"):
+        await mgr1.verify_cluster_config(retry_delay=-0.5)
+
 
 @pytest.mark.asyncio
 async def test_verify_cluster_config_concurrent_race_condition(fake_redis):

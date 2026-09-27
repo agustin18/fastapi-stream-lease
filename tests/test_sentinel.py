@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
+from contextlib import suppress
 from unittest.mock import AsyncMock
 from uuid import uuid4
 
@@ -13,6 +15,7 @@ from redis.exceptions import ConnectionError
 from fastapi_stream_lease import (
     ConfigurationMismatchError,
     LeaseConfig,
+    StreamLease,
     StreamLeaseLost,
     StreamLeaseManager,
 )
@@ -57,18 +60,29 @@ async def wait_for_sentinel_settled(
 ) -> tuple[str, int]:
     """
     Poll Sentinel cluster until:
-    1. Master has flags 'master' (not failover_in_progress, not s_down, not o_down).
-    2. Sentinels agree on quorum (num-other-sentinels >= 2, num-slaves >= 1).
-    3. At least one replica is in healthy 'slave' state ready for failover promotion.
-    4. Master executes write commands successfully.
+    1. Sentinel confirms quorum and majority via `SENTINEL ckquorum`.
+    2. Master has flags 'master' (not failover_in_progress, not s_down, not o_down).
+    3. Sentinels agree on topology (num-other-sentinels >= 2, num-slaves >= 1).
+    4. At least one replica is in healthy 'slave' state ready for failover promotion.
+    5. Master executes write commands successfully.
     """
     first_host, first_port = sentinel_hosts[0]
     deadline = asyncio.get_running_loop().time() + timeout
+    settled = False
 
     while asyncio.get_running_loop().time() < deadline:
         try:
             admin_conn = aioredis.from_url(f"redis://{first_host}:{first_port}")
             try:
+                # 1. Quorum and majority reachable check
+                ck = await admin_conn.execute_command("SENTINEL", "ckquorum", service_name)
+                if isinstance(ck, bytes):
+                    ck = ck.decode("utf-8")
+                if not ck.startswith("OK"):
+                    await asyncio.sleep(0.5)
+                    continue
+
+                # 2. Master status and topology discovery
                 master_info = await admin_conn.execute_command("SENTINEL", "master", service_name)
                 raw_flags = master_info.get(b"flags") or master_info.get("flags", b"")
                 if isinstance(raw_flags, bytes):
@@ -88,22 +102,37 @@ async def wait_for_sentinel_settled(
                     and num_other >= 2
                     and num_slaves >= 1
                 ):
+                    # 3. Healthy replica check
+                    cur_master_ip = master_info.get(b"ip") or master_info.get("ip")
+                    if isinstance(cur_master_ip, bytes):
+                        cur_master_ip = cur_master_ip.decode("utf-8")
+
                     replicas = await admin_conn.execute_command(
                         "SENTINEL", "replicas", service_name
                     )
-                    has_healthy_replica = False
                     for rep in replicas:
                         rep_flags = rep.get(b"flags") or rep.get("flags", b"")
                         if isinstance(rep_flags, bytes):
                             rep_flags = rep_flags.decode("utf-8")
+                        link_status = rep.get(b"master-link-status") or rep.get(
+                            "master-link-status", b""
+                        )
+                        if isinstance(link_status, bytes):
+                            link_status = link_status.decode("utf-8")
+                        rep_ip = rep.get(b"ip") or rep.get("ip")
+                        if isinstance(rep_ip, bytes):
+                            rep_ip = rep_ip.decode("utf-8")
+
                         if (
-                            "slave" in rep_flags
+                            rep_ip != cur_master_ip
+                            and "slave" in rep_flags
                             and "s_down" not in rep_flags
                             and "disconnected" not in rep_flags
+                            and link_status == "ok"
                         ):
-                            has_healthy_replica = True
+                            settled = True
                             break
-                    if has_healthy_replica:
+                    if settled:
                         break
             finally:
                 await admin_conn.aclose()
@@ -111,7 +140,108 @@ async def wait_for_sentinel_settled(
             pass
         await asyncio.sleep(0.5)
 
+    if not settled:
+        raise TimeoutError(
+            f"Sentinel cluster for '{service_name}' failed to settle within {timeout}s"
+        )
+
     return await wait_for_writable_master(sentinel, service_name, timeout=timeout)
+
+
+async def get_replica_address(
+    sentinel_hosts: list[tuple[str, int]], service_name: str
+) -> tuple[str, int]:
+    """Find the host and port of an active, healthy replica from Sentinel."""
+    first_host, first_port = sentinel_hosts[0]
+    admin_conn = aioredis.from_url(f"redis://{first_host}:{first_port}")
+    try:
+        master_info = await admin_conn.execute_command("SENTINEL", "master", service_name)
+        cur_master_ip = master_info.get(b"ip") or master_info.get("ip")
+        if isinstance(cur_master_ip, bytes):
+            cur_master_ip = cur_master_ip.decode("utf-8")
+
+        replicas = await admin_conn.execute_command("SENTINEL", "replicas", service_name)
+        for rep in replicas:
+            rep_flags = rep.get(b"flags") or rep.get("flags", b"")
+            if isinstance(rep_flags, bytes):
+                rep_flags = rep_flags.decode("utf-8")
+            link_status = rep.get(b"master-link-status") or rep.get("master-link-status", b"")
+            if isinstance(link_status, bytes):
+                link_status = link_status.decode("utf-8")
+
+            ip = rep.get(b"ip") or rep.get("ip")
+            port = rep.get(b"port") or rep.get("port")
+            if isinstance(ip, bytes):
+                ip = ip.decode("utf-8")
+
+            if (
+                ip != cur_master_ip
+                and "slave" in rep_flags
+                and "s_down" not in rep_flags
+                and "disconnected" not in rep_flags
+                and link_status == "ok"
+            ):
+                return ip, int(port)
+    finally:
+        await admin_conn.aclose()
+    raise RuntimeError(f"No healthy replica found for '{service_name}'")
+
+
+async def wait_for_key_replication(
+    sentinel_hosts: list[tuple[str, int]],
+    service_name: str,
+    key: str,
+    expected_value: str | None = None,
+    timeout: float = 5.0,
+) -> None:
+    """Poll replica node directly until key matches expected_value."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
+        try:
+            replica_host, replica_port = await get_replica_address(sentinel_hosts, service_name)
+            replica_client = aioredis.from_url(
+                f"redis://{replica_host}:{replica_port}", socket_timeout=1.0
+            )
+            try:
+                val = await replica_client.get(key)
+                if val is not None:
+                    if isinstance(val, bytes):
+                        val = val.decode("utf-8")
+                    if expected_value is None or val == expected_value:
+                        return
+            finally:
+                await replica_client.aclose()
+        except Exception:
+            pass
+        await asyncio.sleep(0.05)
+    raise TimeoutError(f"Key '{key}' was not replicated to replica within {timeout}s")
+
+
+async def wait_for_lease_replication(
+    sentinel_hosts: list[tuple[str, int]],
+    service_name: str,
+    user_key: str,
+    lease_id: str,
+    timeout: float = 5.0,
+) -> None:
+    """Poll replica node directly until lease_id is confirmed in the replica's user sorted set."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
+        try:
+            replica_host, replica_port = await get_replica_address(sentinel_hosts, service_name)
+            replica_client = aioredis.from_url(
+                f"redis://{replica_host}:{replica_port}", socket_timeout=1.0
+            )
+            try:
+                score = await replica_client.zscore(user_key, lease_id)
+                if score is not None and float(score) > 0:
+                    return
+            finally:
+                await replica_client.aclose()
+        except Exception:
+            pass
+        await asyncio.sleep(0.05)
+    raise TimeoutError(f"Lease '{lease_id}' was not replicated to replica within {timeout}s")
 
 
 @pytest.fixture
@@ -203,10 +333,12 @@ async def test_sentinel_forced_failover_client_reconnection(sentinel_cluster):
     lease_started = asyncio.Event()
     failover_done = asyncio.Event()
     test_failed: list[Exception] = []
+    active_leases: list[StreamLease] = []
 
     async def streaming_task():
         try:
             async with manager.lease("user_failover", renew_interval=1.0) as lease:
+                active_leases.append(lease)
                 lease_started.set()
                 await failover_done.wait()
                 assert lease._is_released is False
@@ -216,6 +348,19 @@ async def test_sentinel_forced_failover_client_reconnection(sentinel_cluster):
 
     task = asyncio.create_task(streaming_task())
     await lease_started.wait()
+
+    # Flush replication to replica so lease is present before failover
+    with suppress(Exception):
+        await client.execute_command("WAIT", 1, 1000)
+
+    # Confirm lease was replicated to replica before triggering failover
+    held_lease = active_leases[0]
+    await wait_for_lease_replication(
+        sentinel_cluster["sentinel_hosts"],
+        service_name,
+        held_lease.user_key,
+        held_lease.lease_id,
+    )
 
     # Trigger forced failover via Sentinel administration connection
     admin_conn = aioredis.from_url(f"redis://{first_sentinel_host}:{first_sentinel_port}")
@@ -283,10 +428,12 @@ async def test_sentinel_hard_master_failure_and_election_failover(sentinel_clust
     lease_started = asyncio.Event()
     failover_done = asyncio.Event()
     test_failed: list[Exception] = []
+    active_leases_hard: list[StreamLease] = []
 
     async def streaming_task():
         try:
             async with manager.lease("user_hard_failover", renew_interval=1.0) as lease:
+                active_leases_hard.append(lease)
                 lease_started.set()
                 await failover_done.wait()
                 assert lease._is_released is False
@@ -296,6 +443,19 @@ async def test_sentinel_hard_master_failure_and_election_failover(sentinel_clust
 
     task = asyncio.create_task(streaming_task())
     await lease_started.wait()
+
+    # Flush replication to replica so lease is present before inducing crash
+    with suppress(Exception):
+        await client.execute_command("WAIT", 1, 1000)
+
+    # Confirm lease was replicated to replica before inducing master crash
+    held_lease_hard = active_leases_hard[0]
+    await wait_for_lease_replication(
+        sentinel_cluster["sentinel_hosts"],
+        service_name,
+        held_lease_hard.user_key,
+        held_lease_hard.lease_id,
+    )
 
     # Induce hard unresponsiveness on current master via DEBUG SLEEP (2.5s)
     # Master event loop stops responding; Sentinels observe down-after-milliseconds (1000ms),
@@ -353,10 +513,11 @@ async def test_sentinel_verify_cluster_config_across_failover(sentinel_cluster):
     Self-contained test:
     1. Identify initial master A.
     2. Register canonical configuration fingerprint on master A.
-    3. Allow asynchronous replication to sync the config key to replica B.
+    3. Verify and wait for canonical config key to be replicated to replica B.
     4. Trigger failover A -> B and verify Sentinel promotes B to master.
-    5. On promoted master B: verify compatible worker config validates as True.
-    6. On promoted master B: verify drifted config is rejected with ConfigurationMismatchError.
+    5. Perform raw GET on promoted master B to prove key survived failover.
+    6. On promoted master B: verify compatible worker config validates as True.
+    7. On promoted master B: verify drifted config is rejected with ConfigurationMismatchError.
     """
     sentinel = sentinel_cluster["sentinel"]
     service_name = sentinel_cluster["service_name"]
@@ -385,12 +546,22 @@ async def test_sentinel_verify_cluster_config_across_failover(sentinel_cluster):
     )
 
     manager_a = StreamLeaseManager(redis=client_a, config=config_a)
+    fingerprint_json = json.dumps(config_a.fingerprint_dict(), sort_keys=True)
 
     # 1. Register canonical config on current master A
     assert await manager_a.verify_cluster_config(strict=True) is True
 
-    # 2. Wait for asynchronous replication to sync canonical config key to replica
-    await asyncio.sleep(1.0)
+    # Flush replication to replica so config key is present before failover
+    with suppress(Exception):
+        await client_a.execute_command("WAIT", 1, 1000)
+
+    # 2. Wait explicitly until canonical config key is confirmed on replica B
+    await wait_for_key_replication(
+        sentinel_cluster["sentinel_hosts"],
+        service_name,
+        manager_a.config.config_key,
+        expected_value=fingerprint_json,
+    )
 
     # 3. Trigger failover from master A to replica B
     admin_conn = aioredis.from_url(f"redis://{first_sentinel_host}:{first_sentinel_port}")
@@ -416,13 +587,19 @@ async def test_sentinel_verify_cluster_config_across_failover(sentinel_cluster):
     client_b = sentinel.master_for(service_name, socket_timeout=2.0)
     await client_b.ping()
 
+    # 5. Raw GET on promoted master B proves key actually survived replication + failover
+    raw_config = await client_b.get(manager_a.config.config_key)
+    if isinstance(raw_config, bytes):
+        raw_config = raw_config.decode("utf-8")
+    assert raw_config == fingerprint_json, "Canonical config was lost during failover"
+
     manager_b = StreamLeaseManager(redis=client_b, config=config_a)
     manager_inc = StreamLeaseManager(redis=client_b, config=config_incompatible)
 
-    # 5. Compatible worker on new master B validates successfully
+    # 6. Compatible worker on new master B validates successfully
     assert await manager_b.verify_cluster_config(strict=True) is True
 
-    # 6. Incompatible worker on new master B is rejected
+    # 7. Incompatible worker on new master B is rejected
     with pytest.raises(ConfigurationMismatchError) as exc_info:
         await manager_inc.verify_cluster_config(strict=True)
     assert "max_global" in str(exc_info.value)
@@ -461,9 +638,14 @@ async def test_sentinel_real_outage_exceeding_lease_ttl_terminates_stream(sentin
     lease = await manager.acquire("user_outage")
 
     cur_master = await sentinel.discover_master(service_name)
-    conn = aioredis.from_url(f"redis://{cur_master[0]}:{cur_master[1]}", socket_timeout=0.5)
+    replica_addr = await get_replica_address(sentinel_cluster["sentinel_hosts"], service_name)
 
-    async def pause_node():
+    conn_master = aioredis.from_url(f"redis://{cur_master[0]}:{cur_master[1]}", socket_timeout=0.5)
+    conn_replica = aioredis.from_url(
+        f"redis://{replica_addr[0]}:{replica_addr[1]}", socket_timeout=0.5
+    )
+
+    async def pause_node(conn: aioredis.Redis):
         try:
             await conn.execute_command("DEBUG", "SLEEP", 3.0)
         except Exception:
@@ -471,15 +653,16 @@ async def test_sentinel_real_outage_exceeding_lease_ttl_terminates_stream(sentin
         finally:
             await conn.aclose()
 
-    # Induce outage on master; verify that stream owner task is cancelled with StreamLeaseLost
-    # once lease TTL (1.2s) is exhausted without successful renewal
+    # Induce total cluster outage by pausing both nodes for 3.0s;
+    # verify stream owner task is cancelled with StreamLeaseLost once lease TTL (1.2s) expires
     try:
         with pytest.raises(StreamLeaseLost):
             async with lease:
-                asyncio.create_task(pause_node())
+                asyncio.create_task(pause_node(conn_master))
+                asyncio.create_task(pause_node(conn_replica))
                 await asyncio.sleep(3.5)
     finally:
-        # Settle topology: wait for paused node to wake up and rejoin
+        # Settle topology: wait for paused nodes to wake up and rejoin
         await asyncio.sleep(3.5)
         await manager.close()
         await client.aclose()

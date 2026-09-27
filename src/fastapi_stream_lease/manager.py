@@ -362,6 +362,11 @@ class StreamLeaseManager:
         Returns:
             bool: True if configuration matches or was registered; False otherwise.
         """
+        if retry_attempts < 1:
+            raise ValueError("retry_attempts must be at least 1")
+        if retry_delay < 0:
+            raise ValueError("retry_delay must be non-negative")
+
         fingerprint = self.config.fingerprint_dict()
         fingerprint_json = json.dumps(fingerprint, sort_keys=True)
         config_key = self.config.config_key
