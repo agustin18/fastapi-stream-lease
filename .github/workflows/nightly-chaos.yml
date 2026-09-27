@@ -1,0 +1,138 @@
+name: Nightly Soak & Chaos Envelope
+
+on:
+  schedule:
+    # Run every night at 02:00 UTC
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+    inputs:
+      soak_duration:
+        description: "Duration of reference soak test in seconds"
+        required: false
+        default: "300"
+      target_concurrency:
+        description: "Target concurrent streams"
+        required: false
+        default: "500"
+
+permissions:
+  contents: read
+
+jobs:
+  wrapper-overhead-budget:
+    name: Wrapper Overhead Budget (p99 <= 1.0ms)
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync --locked --extra dev
+
+      - name: Execute Wrapper Overhead & Host Latency Calibration
+        env:
+          REDIS_URL: redis://localhost:6379/15
+        run: |
+          uv run python benchmarks/bench_wrapper_overhead.py \
+            --count 1000 \
+            --concurrency 25 \
+            --max-p99-overhead-ms 1.0 \
+            --save-baseline /tmp/overhead-baseline.json
+
+  soak-resource-plateau:
+    name: Reference Soak & Resource Plateau
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync --locked --extra dev
+
+      - name: Execute Soak Workload & Verify Memory/Task Plateau
+        env:
+          REDIS_URL: redis://localhost:6379/15
+        run: |
+          DURATION="${{ github.event.inputs.soak_duration || '120' }}"
+          CONCURRENCY="${{ github.event.inputs.target_concurrency || '300' }}"
+          uv run python benchmarks/bench_soak.py \
+            --duration "$DURATION" \
+            --target-concurrency "$CONCURRENCY" \
+            --assert-plateau
+
+  sentinel-chaos:
+    name: Sentinel Chaos & Automatic Failovers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Start Redis Sentinel Topology
+        run: |
+          docker compose -f docker-compose.sentinel.yml up -d --wait sentinel-1 sentinel-2 sentinel-3
+
+      - name: Run Sentinel Chaos Failover Tests
+        run: |
+          docker compose -f docker-compose.sentinel.yml run --rm backend uv run pytest -o addopts='' tests/test_sentinel.py -vv -s
+
+      - name: Teardown Sentinel Topology
+        if: always()
+        run: |
+          docker compose -f docker-compose.sentinel.yml down -v
+
+  cluster-chaos:
+    name: Cluster Chaos & Node Failovers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Start Redis Cluster Topology
+        run: |
+          docker compose -f docker-compose.cluster.yml up -d --wait
+
+      - name: Dump cluster logs on failure
+        if: failure()
+        run: |
+          docker compose -f docker-compose.cluster.yml logs
+
+      - name: Run Cluster Chaos Failover Tests
+        run: |
+          docker compose -f docker-compose.cluster.yml run --rm backend uv run --all-extras pytest -o addopts='' tests/test_cluster.py -vv -s
+
+      - name: Teardown Redis Cluster Topology
+        if: always()
+        run: |
+          docker compose -f docker-compose.cluster.yml down -v
