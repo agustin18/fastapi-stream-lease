@@ -1,21 +1,7 @@
 services:
   redis-cluster-1:
     image: redis:7-alpine
-    entrypoint: ["sh", "-c"]
-    command:
-      - |
-        cat << 'EOF' > /tmp/redis.conf
-        port 7000
-        cluster-enabled yes
-        cluster-config-file nodes.conf
-        cluster-node-timeout 2000
-        cluster-announce-ip redis-cluster-1
-        cluster-announce-port 7000
-        cluster-announce-bus-port 17000
-        save ""
-        enable-debug-command yes
-        EOF
-        exec redis-server /tmp/redis.conf
+    command: redis-server --port 7000 --cluster-enabled yes --cluster-config-file nodes.conf --cluster-node-timeout 2000 --save "" --appendonly no --enable-debug-command yes
     healthcheck:
       test: ["CMD", "redis-cli", "-p", "7000", "ping"]
       interval: 1s
@@ -26,21 +12,7 @@ services:
 
   redis-cluster-2:
     image: redis:7-alpine
-    entrypoint: ["sh", "-c"]
-    command:
-      - |
-        cat << 'EOF' > /tmp/redis.conf
-        port 7001
-        cluster-enabled yes
-        cluster-config-file nodes.conf
-        cluster-node-timeout 2000
-        cluster-announce-ip redis-cluster-2
-        cluster-announce-port 7001
-        cluster-announce-bus-port 17001
-        save ""
-        enable-debug-command yes
-        EOF
-        exec redis-server /tmp/redis.conf
+    command: redis-server --port 7001 --cluster-enabled yes --cluster-config-file nodes.conf --cluster-node-timeout 2000 --save "" --appendonly no --enable-debug-command yes
     healthcheck:
       test: ["CMD", "redis-cli", "-p", "7001", "ping"]
       interval: 1s
@@ -51,21 +23,7 @@ services:
 
   redis-cluster-3:
     image: redis:7-alpine
-    entrypoint: ["sh", "-c"]
-    command:
-      - |
-        cat << 'EOF' > /tmp/redis.conf
-        port 7002
-        cluster-enabled yes
-        cluster-config-file nodes.conf
-        cluster-node-timeout 2000
-        cluster-announce-ip redis-cluster-3
-        cluster-announce-port 7002
-        cluster-announce-bus-port 17002
-        save ""
-        enable-debug-command yes
-        EOF
-        exec redis-server /tmp/redis.conf
+    command: redis-server --port 7002 --cluster-enabled yes --cluster-config-file nodes.conf --cluster-node-timeout 2000 --save "" --appendonly no --enable-debug-command yes
     healthcheck:
       test: ["CMD", "redis-cli", "-p", "7002", "ping"]
       interval: 1s
@@ -76,21 +34,7 @@ services:
 
   redis-cluster-4:
     image: redis:7-alpine
-    entrypoint: ["sh", "-c"]
-    command:
-      - |
-        cat << 'EOF' > /tmp/redis.conf
-        port 7003
-        cluster-enabled yes
-        cluster-config-file nodes.conf
-        cluster-node-timeout 2000
-        cluster-announce-ip redis-cluster-4
-        cluster-announce-port 7003
-        cluster-announce-bus-port 17003
-        save ""
-        enable-debug-command yes
-        EOF
-        exec redis-server /tmp/redis.conf
+    command: redis-server --port 7003 --cluster-enabled yes --cluster-config-file nodes.conf --cluster-node-timeout 2000 --save "" --appendonly no --enable-debug-command yes
     healthcheck:
       test: ["CMD", "redis-cli", "-p", "7003", "ping"]
       interval: 1s
@@ -101,21 +45,7 @@ services:
 
   redis-cluster-5:
     image: redis:7-alpine
-    entrypoint: ["sh", "-c"]
-    command:
-      - |
-        cat << 'EOF' > /tmp/redis.conf
-        port 7004
-        cluster-enabled yes
-        cluster-config-file nodes.conf
-        cluster-node-timeout 2000
-        cluster-announce-ip redis-cluster-5
-        cluster-announce-port 7004
-        cluster-announce-bus-port 17004
-        save ""
-        enable-debug-command yes
-        EOF
-        exec redis-server /tmp/redis.conf
+    command: redis-server --port 7004 --cluster-enabled yes --cluster-config-file nodes.conf --cluster-node-timeout 2000 --save "" --appendonly no --enable-debug-command yes
     healthcheck:
       test: ["CMD", "redis-cli", "-p", "7004", "ping"]
       interval: 1s
@@ -126,21 +56,7 @@ services:
 
   redis-cluster-6:
     image: redis:7-alpine
-    entrypoint: ["sh", "-c"]
-    command:
-      - |
-        cat << 'EOF' > /tmp/redis.conf
-        port 7005
-        cluster-enabled yes
-        cluster-config-file nodes.conf
-        cluster-node-timeout 2000
-        cluster-announce-ip redis-cluster-6
-        cluster-announce-port 7005
-        cluster-announce-bus-port 17005
-        save ""
-        enable-debug-command yes
-        EOF
-        exec redis-server /tmp/redis.conf
+    command: redis-server --port 7005 --cluster-enabled yes --cluster-config-file nodes.conf --cluster-node-timeout 2000 --save "" --appendonly no --enable-debug-command yes
     healthcheck:
       test: ["CMD", "redis-cli", "-p", "7005", "ping"]
       interval: 1s

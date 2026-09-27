@@ -156,6 +156,11 @@ jobs:
         run: |
           docker compose -f docker-compose.cluster.yml up -d --wait
 
+      - name: Dump cluster logs on failure
+        if: failure()
+        run: |
+          docker compose -f docker-compose.cluster.yml logs
+
       - name: Run Redis Cluster Integration & Failover Tests
         run: |
           docker compose -f docker-compose.cluster.yml run --rm backend uv run --all-extras pytest -o addopts='' tests/test_cluster.py -vv -s
