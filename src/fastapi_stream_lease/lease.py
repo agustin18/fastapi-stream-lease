@@ -151,6 +151,7 @@ class StreamLease:
                         )
                         lease_lost.set()
                         owner.cancel()
+                        self.manager._safe_record_lost("backend_timeout")
                         self.manager.dispatcher.dispatch(
                             self.manager.config.on_lost, self, "backend_timeout"
                         )
@@ -165,6 +166,7 @@ class StreamLease:
                     )
                     lease_lost.set()
                     owner.cancel()
+                    self.manager._safe_record_lost("unexpected_error")
                     self.manager.dispatcher.dispatch(
                         self.manager.config.on_lost, self, "unexpected_error"
                     )
@@ -183,6 +185,7 @@ class StreamLease:
                 )
                 lease_lost.set()
                 owner.cancel()
+                self.manager._safe_record_lost("redis_revoked")
                 self.manager.dispatcher.dispatch(self.manager.config.on_lost, self, "redis_revoked")
                 return
 

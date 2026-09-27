@@ -349,3 +349,142 @@ async def test_dispatcher_drain_when_queue_none():
     assert dispatcher._queue is None
     await dispatcher.drain(timeout=1.0)
     await dispatcher.close()
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_callbacks_and_resilience():
+    """Verify on_drop/on_error callbacks are triggered and exceptions are safely suppressed."""
+    drop_called = []
+    error_called = []
+
+    def on_drop():
+        drop_called.append(True)
+        raise RuntimeError("failing drop callback")
+
+    def on_error():
+        error_called.append(True)
+        raise RuntimeError("failing error callback")
+
+    dispatcher = HookDispatcher(
+        max_queue_size=1,
+        sync_inline=True,
+        on_drop=on_drop,
+        on_error=on_error,
+    )
+
+    # 1. Sync inline error triggers on_error
+    def bad_sync():
+        raise ValueError("sync err")
+
+    dispatcher.dispatch(bad_sync)
+    assert len(error_called) == 1
+
+    # 2. Async error in queue triggers on_error
+    async def bad_async():
+        raise ValueError("async err")
+
+    dispatcher.dispatch(bad_async)
+    await dispatcher.drain(timeout=1.0)
+    assert len(error_called) == 2
+
+    # 3. Queue full triggers on_drop
+    blocker = asyncio.Event()
+
+    async def blocking():
+        await blocker.wait()
+
+    async def dummy():
+        pass
+
+    dispatcher.dispatch(blocking)
+    assert dispatcher.dispatch(dummy) is False  # dropped!
+    assert len(drop_called) == 1
+
+    # 4. Dispatch after close triggers on_drop
+    blocker.set()
+    await dispatcher.close()
+    assert dispatcher.dispatch(dummy) is False
+    assert len(drop_called) == 2
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_on_queue_change_lifecycle():
+    """Verify on_queue_change receives +1 on enqueue and -1 on dequeue."""
+    changes = []
+
+    def on_change(delta: int) -> None:
+        changes.append(delta)
+
+    dispatcher = HookDispatcher(max_queue_size=10, sync_inline=False, on_queue_change=on_change)
+
+    executed = asyncio.Event()
+
+    async def sample_hook():
+        executed.set()
+
+    dispatcher.dispatch(sample_hook)
+    assert 1 in changes
+
+    await executed.wait()
+    await dispatcher.drain(timeout=1.0)
+    await dispatcher.close()
+
+    assert sum(changes) == 0
+    assert changes.count(1) == 1
+    assert changes.count(-1) == 1
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_on_queue_change_close_without_drain():
+    """Verify on_queue_change purges remaining queue items with negative delta
+    on un-drained close."""
+    changes = []
+    blocker = asyncio.Event()
+
+    def on_change(delta: int) -> None:
+        changes.append(delta)
+
+    dispatcher = HookDispatcher(max_queue_size=10, sync_inline=False, on_queue_change=on_change)
+
+    async def blocking_hook():
+        await blocker.wait()
+
+    async def pending_hook_1():
+        pass
+
+    async def pending_hook_2():
+        pass
+
+    dispatcher.dispatch(blocking_hook)
+    dispatcher.dispatch(pending_hook_1)
+    dispatcher.dispatch(pending_hook_2)
+
+    # Let the worker pick up blocking_hook
+    await asyncio.sleep(0.02)
+
+    # Close with drain=False while items are still in queue
+    await dispatcher.close(drain=False)
+    blocker.set()
+
+    # The sum of all changes must balance out to 0 (no leaked gauge)
+    assert sum(changes) == 0
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_on_queue_change_exception_resilience():
+    """Verify that exceptions in on_queue_change do not disrupt dispatcher operation."""
+
+    def broken_change(delta: int) -> None:
+        raise RuntimeError("queue change notification failure")
+
+    dispatcher = HookDispatcher(max_queue_size=10, sync_inline=False, on_queue_change=broken_change)
+
+    executed = asyncio.Event()
+
+    async def hook():
+        executed.set()
+
+    assert dispatcher.dispatch(hook) is True
+    await executed.wait()
+    await dispatcher.drain(timeout=1.0)
+    await dispatcher.close()

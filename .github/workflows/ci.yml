@@ -241,8 +241,8 @@ jobs:
 
       - name: Clean environment wheel smoke test (core and fastapi extra)
         run: |
-          mkdir -p /tmp/smoke-test
-          cd /tmp/smoke-test
+          mkdir -p /tmp/smoke-test-fastapi
+          cd /tmp/smoke-test-fastapi
           uv venv
           WHEEL_PATH=$(ls $GITHUB_WORKSPACE/dist/*.whl)
           uv pip install "$WHEEL_PATH[fastapi]"
@@ -266,6 +266,44 @@ jobs:
           resp = err.as_response()
           assert resp.status_code == 429
           print(f"Smoke test passed on fastapi-stream-lease {fastapi_stream_lease.__version__} with [fastapi] extra")
+          PY
+
+      - name: Clean environment wheel smoke test (prometheus extra)
+        run: |
+          mkdir -p /tmp/smoke-test-prometheus
+          cd /tmp/smoke-test-prometheus
+          uv venv
+          WHEEL_PATH=$(ls $GITHUB_WORKSPACE/dist/*.whl)
+          uv pip install "$WHEEL_PATH[prometheus]"
+          uv run python - <<'PY'
+          from prometheus_client import CollectorRegistry
+          from fastapi_stream_lease.observability.prometheus import PrometheusMetrics
+
+          registry = CollectorRegistry()
+          metrics = PrometheusMetrics(registry=registry)
+          metrics.record_operation("acquire", "success", 0.012)
+          metrics.record_hook_queue_change(1)
+          assert registry.get_sample_value("fastapi_stream_lease_hook_queue_depth") == 1.0
+          print("Smoke test passed for [prometheus] extra")
+          PY
+
+      - name: Clean environment wheel smoke test (otel extra with 1.30 floor)
+        run: |
+          mkdir -p /tmp/smoke-test-otel
+          cd /tmp/smoke-test-otel
+          uv venv
+          WHEEL_PATH=$(ls $GITHUB_WORKSPACE/dist/*.whl)
+          uv pip install "$WHEEL_PATH[otel]" "opentelemetry-api==1.30.0"
+          uv run python - <<'PY'
+          import importlib.metadata
+          otel_version = importlib.metadata.version("opentelemetry-api")
+          assert otel_version == "1.30.0", f"Expected 1.30.0, got {otel_version}"
+          from fastapi_stream_lease.observability.otel import OpenTelemetryMetrics
+
+          otel = OpenTelemetryMetrics()
+          otel.record_operation("acquire", "success", 0.012)
+          otel.record_hook_queue_change(1)
+          print(f"Smoke test passed for [otel] extra with opentelemetry-api=={otel_version}")
           PY
 
       - name: Upload dist artifacts
