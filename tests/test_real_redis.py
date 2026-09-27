@@ -267,7 +267,7 @@ async def test_real_redis_wrapper_overhead_budget(real_manager):
     import statistics
     import time
 
-    from fastapi_stream_lease.lua import ACQUIRE_SCRIPT
+    from fastapi_stream_lease.lua import ACQUIRE_SCRIPT, RELEASE_SCRIPT
 
     client = real_manager.redis
     prefix = f"overhead_test_{uuid4().hex[:8]}"
@@ -284,24 +284,44 @@ async def test_real_redis_wrapper_overhead_budget(real_manager):
     wrapped_latencies: list[float] = []
 
     iterations = 25
-    for i in range(iterations):
-        lease_id = f"raw_lease_{i}"
-        t0 = time.perf_counter()
-        await client.eval(
-            ACQUIRE_SCRIPT, 2, user_key, global_key, 60.0, lease_id, 1000, 1000, 120.0
-        )
-        raw_latencies.append(time.perf_counter() - t0)
+    try:
+        for i in range(iterations):
+            lease_id = f"raw_lease_{i}"
+            if i % 2 == 0:
+                t0 = time.perf_counter()
+                await client.eval(
+                    ACQUIRE_SCRIPT, 2, user_key, global_key, 60.0, lease_id, 1000, 1000, 120.0
+                )
+                raw_latencies.append(time.perf_counter() - t0)
 
-    for i in range(iterations):
-        t0 = time.perf_counter()
-        lease = await bench_manager.acquire(f"wrap_user_{i}")
-        wrapped_latencies.append(time.perf_counter() - t0)
-        await lease.release()
+                t0 = time.perf_counter()
+                lease = await bench_manager.acquire(f"wrap_user_{i}")
+                wrapped_latencies.append(time.perf_counter() - t0)
+                await lease.release()
+            else:
+                t0 = time.perf_counter()
+                lease = await bench_manager.acquire(f"wrap_user_{i}")
+                wrapped_latencies.append(time.perf_counter() - t0)
+                await lease.release()
 
-    # Median overhead calculation
-    median_raw_ms = statistics.median(raw_latencies) * 1000.0
-    median_wrapped_ms = statistics.median(wrapped_latencies) * 1000.0
-    overhead_ms = median_wrapped_ms - median_raw_ms
+                t0 = time.perf_counter()
+                await client.eval(
+                    ACQUIRE_SCRIPT, 2, user_key, global_key, 60.0, lease_id, 1000, 1000, 120.0
+                )
+                raw_latencies.append(time.perf_counter() - t0)
+    finally:
+        # T01: Release all raw leases and wipe test keys
+        for i in range(iterations):
+            lease_id = f"raw_lease_{i}"
+            await client.eval(RELEASE_SCRIPT, 2, user_key, global_key, lease_id)
+        await client.delete(user_key, global_key)
+        await bench_manager.close(drain=True)
+
+    # Paired delta calculation (eliminates external variance)
+    deltas = [(w - r) * 1000.0 for w, r in zip(wrapped_latencies, raw_latencies, strict=True)]
+    median_overhead_ms = statistics.median(deltas)
 
     # Overhead budget threshold: <= 1.0 ms
-    assert overhead_ms <= 1.0, f"Wrapper overhead exceeded budget: {overhead_ms:.3f}ms"
+    assert median_overhead_ms <= 1.0, (
+        f"Wrapper overhead exceeded budget: {median_overhead_ms:.3f}ms"
+    )

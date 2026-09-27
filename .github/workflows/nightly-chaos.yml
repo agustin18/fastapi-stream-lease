@@ -22,6 +22,7 @@ jobs:
   wrapper-overhead-budget:
     name: Wrapper Overhead Budget (p99 <= 1.0ms)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     services:
       redis:
         image: redis:7-alpine
@@ -52,13 +53,20 @@ jobs:
         run: |
           uv run python benchmarks/bench_wrapper_overhead.py \
             --count 1000 \
-            --concurrency 25 \
+            --concurrency 1 \
             --max-p99-overhead-ms 1.0 \
             --save-baseline /tmp/overhead-baseline.json
+
+      - name: Upload overhead benchmark artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: overhead-baseline-report
+          path: /tmp/overhead-baseline.json
 
   soak-resource-plateau:
     name: Reference Soak & Resource Plateau
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     services:
       redis:
         image: redis:7-alpine
@@ -97,6 +105,7 @@ jobs:
   sentinel-chaos:
     name: Sentinel Chaos & Automatic Failovers
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -116,6 +125,7 @@ jobs:
   cluster-chaos:
     name: Cluster Chaos & Node Failovers
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 

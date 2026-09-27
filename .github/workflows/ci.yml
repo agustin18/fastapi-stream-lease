@@ -132,6 +132,38 @@ jobs:
       - name: Check Redis 8 compatibility
         run: uv run pytest -o addopts='' tests/test_real_redis.py -q
 
+  benchmark-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 10
+    env:
+      REDIS_URL: redis://localhost:6379/15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          enable-cache: true
+      - name: Set up Python
+        run: uv python install 3.12
+      - name: Install dependencies
+        run: uv sync --locked --extra dev
+      - name: Smoke test wrapper overhead benchmark
+        run: |
+          uv run python benchmarks/bench_wrapper_overhead.py --count 50 --concurrency 1 --max-p99-overhead-ms 5.0
+      - name: Smoke test soak workload
+        run: |
+          uv run python benchmarks/bench_soak.py --duration 5 --target-concurrency 10 --lease-seconds 4.0 --renew-interval 1.0
+
   test-sentinel:
     runs-on: ubuntu-latest
     steps:
