@@ -97,6 +97,7 @@ class StreamLeaseManager:
             sync_inline=False,
             on_drop=self._on_hook_drop,
             on_error=self._on_hook_error,
+            on_queue_change=self._on_hook_queue_change,
         )
 
     def _on_hook_drop(self) -> None:
@@ -113,12 +114,12 @@ class StreamLeaseManager:
             except Exception:
                 logger.exception("Telemetry record_hook_error failed")
 
-    def _update_hook_queue_depth(self) -> None:
+    def _on_hook_queue_change(self, delta: int) -> None:
         if self.telemetry is not None:
             try:
-                self.telemetry.set_hook_queue_depth(self.dispatcher.queue_depth)
+                self.telemetry.record_hook_queue_change(delta)
             except Exception:
-                logger.exception("Telemetry set_hook_queue_depth failed")
+                logger.exception("Telemetry record_hook_queue_change failed")
 
     def _safe_record_operation(
         self,
@@ -189,13 +190,11 @@ class StreamLeaseManager:
         try:
             yield span
         except BaseException as exc:
-            suppress = False
             try:
-                suppress = bool(span_cm.__exit__(type(exc), exc, exc.__traceback__))
+                span_cm.__exit__(type(exc), exc, exc.__traceback__)
             except Exception:
                 logger.exception("Telemetry span exit failed")
-            if not suppress:
-                raise
+            raise
         else:
             try:
                 span_cm.__exit__(None, None, None)
@@ -255,7 +254,6 @@ class StreamLeaseManager:
                 if is_network_error(exc):
                     self._safe_record_backend_error(exc)
                     self.dispatcher.dispatch(self.config.on_backend_error, exc)
-                    self._update_hook_queue_depth()
                     if self.config.fail_open:
                         self._safe_record_fallback()
                         self._safe_record_operation(Operation.ACQUIRE, Outcome.FALLBACK, duration)
@@ -276,7 +274,6 @@ class StreamLeaseManager:
                         )
                         lease._is_fallback = True
                         self.dispatcher.dispatch(self.config.on_acquired, lease)
-                        self._update_hook_queue_depth()
                         return lease
                     self._safe_record_operation(Operation.ACQUIRE, Outcome.BACKEND_ERROR, duration)
                     logger.warning(
@@ -301,12 +298,10 @@ class StreamLeaseManager:
             if code == 2:
                 self._safe_record_operation(Operation.ACQUIRE, Outcome.REJECTED, duration)
                 self.dispatcher.dispatch(self.config.on_rejected, user_id, "user_limit")
-                self._update_hook_queue_depth()
                 raise StreamLeaseRejected(reason="user_limit")
             if code == 3:
                 self._safe_record_operation(Operation.ACQUIRE, Outcome.REJECTED, duration)
                 self.dispatcher.dispatch(self.config.on_rejected, user_id, "global_limit")
-                self._update_hook_queue_depth()
                 raise StreamLeaseRejected(reason="global_limit")
             if code != 1:
                 raise RuntimeError(f"Unexpected stream lease acquisition return code: {code}")
@@ -323,7 +318,6 @@ class StreamLeaseManager:
                 created_monotonic=start_monotonic,
             )
             self.dispatcher.dispatch(self.config.on_acquired, lease)
-            self._update_hook_queue_depth()
             return lease
 
     async def renew(self, lease: StreamLease) -> bool:
@@ -359,7 +353,6 @@ class StreamLeaseManager:
                 self._safe_record_backend_error(exc)
                 self._safe_record_operation(Operation.RENEW, Outcome.BACKEND_ERROR, duration)
                 self.dispatcher.dispatch(self.config.on_backend_error, exc)
-                self._update_hook_queue_depth()
                 logger.warning(
                     "Network error renewing stream lease %s: %s",
                     lease.lease_id,
@@ -398,7 +391,6 @@ class StreamLeaseManager:
                 self._safe_record_backend_error(exc)
                 self._safe_record_operation(Operation.RELEASE, Outcome.BACKEND_ERROR, duration)
                 self.dispatcher.dispatch(self.config.on_backend_error, exc)
-                self._update_hook_queue_depth()
                 logger.warning("Network error releasing stream lease %s: %s", lease.lease_id, exc)
             else:
                 logger.error(
@@ -422,7 +414,6 @@ class StreamLeaseManager:
             if is_network_error(exc):
                 self._safe_record_backend_error(exc)
                 self.dispatcher.dispatch(self.config.on_backend_error, exc)
-                self._update_hook_queue_depth()
                 logger.warning(
                     "Network error querying active stream count for %s: %s",
                     target_key,
@@ -580,7 +571,6 @@ class StreamLeaseManager:
                             Operation.VERIFY_CONFIG, Outcome.BACKEND_ERROR, duration
                         )
                         self.dispatcher.dispatch(self.config.on_backend_error, exc)
-                        self._update_hook_queue_depth()
                         if strict:
                             raise StreamLeaseUnavailable(
                                 detail=(

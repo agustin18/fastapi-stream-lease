@@ -138,9 +138,12 @@ class PrometheusMetrics:
         """Increment count of hook exceptions monotonically."""
         self.hook_errors_total.inc()
 
-    def set_hook_queue_depth(self, depth: int) -> None:
-        """Set current pending queue depth of the dispatcher."""
-        self.hook_queue_depth.set(float(depth))
+    def record_hook_queue_change(self, delta: int) -> None:
+        """Adjust current pending queue depth of the dispatcher by delta."""
+        if delta > 0:
+            self.hook_queue_depth.inc(float(delta))
+        elif delta < 0:
+            self.hook_queue_depth.dec(float(-delta))
 
     def trace_operation(self, operation: Operation | str) -> AbstractContextManager[Any]:
         """No-op context manager for metrics-only Prometheus adapter."""

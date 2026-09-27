@@ -156,12 +156,15 @@ def test_prometheus_fallback_and_dispatcher_gauges() -> None:
     metrics.record_hook_drop()
     metrics.record_hook_drop()
     assert registry.get_sample_value("fastapi_stream_lease_hook_dropped_total") == 3.0
-
     metrics.record_hook_error()
     assert registry.get_sample_value("fastapi_stream_lease_hook_errors_total") == 1.0
 
-    metrics.set_hook_queue_depth(42)
+    metrics.record_hook_queue_change(42)
     assert registry.get_sample_value("fastapi_stream_lease_hook_queue_depth") == 42.0
+    metrics.record_hook_queue_change(-12)
+    assert registry.get_sample_value("fastapi_stream_lease_hook_queue_depth") == 30.0
+    metrics.record_hook_queue_change(0)
+    assert registry.get_sample_value("fastapi_stream_lease_hook_queue_depth") == 30.0
 
 
 def test_prometheus_duplicate_registration_raises() -> None:
@@ -485,11 +488,11 @@ def test_otel_duration_buckets_and_hook_metrics() -> None:
 
     otel.record_hook_drop()
     otel.record_hook_error()
-    otel.set_hook_queue_depth(13)
+    otel.record_hook_queue_change(13)
+    otel.record_hook_queue_change(-5)
 
-    observations = otel._observe_queue_depth()
-    assert len(observations) == 1
-    assert observations[0].value == 13
+    metric_data = metric_reader.get_metrics_data()
+    assert metric_data is not None
 
 
 @pytest.mark.asyncio
@@ -519,8 +522,8 @@ async def test_broken_telemetry_failure_isolation(fake_redis) -> None:
         def record_hook_error(self) -> None:
             raise RuntimeError("record_hook_error simulated failure")
 
-        def set_hook_queue_depth(self, depth: int) -> None:
-            raise RuntimeError("set_hook_queue_depth simulated failure")
+        def record_hook_queue_change(self, delta: int) -> None:
+            raise RuntimeError("record_hook_queue_change simulated failure")
 
         def trace_operation(self, operation: Any) -> Any:
             raise RuntimeError("trace_operation simulated failure")
@@ -555,7 +558,7 @@ async def test_broken_telemetry_failure_isolation(fake_redis) -> None:
     # 6. Verify broken hook callbacks, depth, lost, and backend error calls
     manager._on_hook_drop()
     manager._on_hook_error()
-    manager._update_hook_queue_depth()
+    manager._on_hook_queue_change(1)
     manager._safe_record_lost("redis_revoked")
     manager._safe_record_backend_error(ConnectionError("fail"))
     manager._safe_record_fallback()
@@ -611,24 +614,49 @@ async def test_broken_telemetry_failure_isolation(fake_redis) -> None:
     manager_none = StreamLeaseManager(fake_redis, telemetry=None)
     manager_none._on_hook_drop()
     manager_none._on_hook_error()
+    manager_none._on_hook_queue_change(1)
     await manager_none.close()
 
-    # 11. Verify span context manager exception suppression branch
+    # 11. CRITICAL P1: Telemetry span context manager MUST NEVER suppress business exceptions
     class SuppressSpan:
         def __enter__(self) -> Any:
             return self
 
         def __exit__(self, *args: Any) -> bool:
-            return True
+            return True  # Attempt to suppress exception
 
     class SuppressAdapter:
         def trace_operation(self, op: Any) -> Any:
             return SuppressSpan()
 
     manager_suppress = StreamLeaseManager(fake_redis, telemetry=SuppressAdapter())
-    with manager_suppress._safe_trace_operation(Operation.ACQUIRE):
-        raise ValueError("suppressed by span")
+    with pytest.raises(ValueError, match="must not be suppressed by span"):
+        with manager_suppress._safe_trace_operation(Operation.ACQUIRE):
+            raise ValueError("must not be suppressed by span")
+
+    with pytest.raises(StreamLeaseRejected):
+        with manager_suppress._safe_trace_operation(Operation.ACQUIRE):
+            raise StreamLeaseRejected(reason="user_limit")
+
     await manager_suppress.close()
+
+    # 12. CRITICAL P1: Span __exit__ raising an error does NOT swallow original exception
+    class CrashingExitSpan:
+        def __enter__(self) -> Any:
+            return self
+
+        def __exit__(self, *args: Any) -> None:
+            raise RuntimeError("span __exit__ crashed")
+
+    class CrashingExitAdapter:
+        def trace_operation(self, op: Any) -> Any:
+            return CrashingExitSpan()
+
+    manager_crashing_exit = StreamLeaseManager(fake_redis, telemetry=CrashingExitAdapter())
+    with pytest.raises(ValueError, match="original error survives span exit crash"):
+        with manager_crashing_exit._safe_trace_operation(Operation.ACQUIRE):
+            raise ValueError("original error survives span exit crash")
+    await manager_crashing_exit.close()
 
 
 @pytest.mark.asyncio

@@ -129,7 +129,8 @@ def classify_backend_error(exc: BaseException) -> BackendErrorKind:
 class TelemetryAdapter(Protocol):
     """
     Formal protocol defining the contract for stream lease telemetry and metrics adapters.
-    All implementations MUST guarantee non-blocking, best-effort execution.
+    Adapters must be failure-isolated by the manager and should perform low-latency,
+    non-blocking work.
     """
 
     def record_operation(
@@ -161,8 +162,8 @@ class TelemetryAdapter(Protocol):
         """Record an exception raised within a lifecycle hook callback."""
         ...
 
-    def set_hook_queue_depth(self, depth: int) -> None:
-        """Set the current pending queue depth of the background hook dispatcher."""
+    def record_hook_queue_change(self, delta: int) -> None:
+        """Record an incremental adjustment to the pending lifecycle hook queue depth."""
         ...
 
     def trace_operation(self, operation: Operation | str) -> AbstractContextManager[Any]:

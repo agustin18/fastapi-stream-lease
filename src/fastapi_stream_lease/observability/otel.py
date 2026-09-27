@@ -106,19 +106,11 @@ class OpenTelemetryMetrics:
             unit="1",
         )
 
-        # Store current depth for callback observation
-        self._current_queue_depth: int = 0
-        self.meter.create_observable_gauge(
+        self.hook_queue_depth_counter = self.meter.create_up_down_counter(
             "fastapi_stream_lease.hook_queue_depth",
-            callbacks=[self._observe_queue_depth],
-            description="Current number of queued lifecycle hooks in the background dispatcher.",
+            description="Current pending lifecycle hooks in background dispatcher across managers.",
             unit="1",
         )
-
-    def _observe_queue_depth(self, options: Any = None) -> list[Any]:
-        from opentelemetry.metrics import Observation
-
-        return [Observation(self._current_queue_depth)]
 
     def record_operation(
         self,
@@ -157,9 +149,9 @@ class OpenTelemetryMetrics:
         """Record a lifecycle hook callback exception."""
         self.hook_errors_counter.add(1)
 
-    def set_hook_queue_depth(self, depth: int) -> None:
-        """Update current hook dispatcher queue depth observed by gauge."""
-        self._current_queue_depth = depth
+    def record_hook_queue_change(self, delta: int) -> None:
+        """Record an incremental adjustment to the pending lifecycle hook queue depth."""
+        self.hook_queue_depth_counter.add(delta)
 
     def trace_operation(self, operation: Operation | str) -> AbstractContextManager[Any]:
         """

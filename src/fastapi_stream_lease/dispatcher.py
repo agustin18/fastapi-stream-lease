@@ -24,6 +24,7 @@ class HookDispatcher:
         sync_inline: bool = False,
         on_drop: Any | None = None,
         on_error: Any | None = None,
+        on_queue_change: Any | None = None,
     ) -> None:
         if max_queue_size <= 0:
             raise ValueError("max_queue_size must be greater than 0")
@@ -31,6 +32,7 @@ class HookDispatcher:
         self._sync_inline = sync_inline
         self._on_drop = on_drop
         self._on_error = on_error
+        self._on_queue_change = on_queue_change
         self._queue: asyncio.Queue[tuple[Any, tuple[Any, ...]] | None] | None = None
         self._worker_task: asyncio.Task[None] | None = None
         self._closed = False
@@ -81,6 +83,13 @@ class HookDispatcher:
             except Exception:
                 pass
 
+    def _notify_queue_change(self, delta: int) -> None:
+        if self._on_queue_change is not None and delta != 0:
+            try:
+                self._on_queue_change(delta)
+            except Exception:
+                pass
+
     async def _worker(self) -> None:
         """Background consumer executing queued callbacks in strict FIFO order."""
         assert self._queue is not None
@@ -89,6 +98,7 @@ class HookDispatcher:
             if item is None:
                 self._queue.task_done()
                 break
+            self._notify_queue_change(-1)
             hook_or_coro, args = item
             try:
                 if asyncio.iscoroutine(hook_or_coro):
@@ -116,6 +126,7 @@ class HookDispatcher:
             assert self._queue is not None
             self._queue.put_nowait((hook_or_coro, args))
             self._queued_count += 1
+            self._notify_queue_change(1)
             return True
         except asyncio.QueueFull:
             self._dropped_count += 1
@@ -188,6 +199,15 @@ class HookDispatcher:
 
         if drain and self._queue is not None:
             await self.drain(timeout=timeout)
+
+        if self._queue is not None:
+            purged = 0
+            while not self._queue.empty():
+                self._queue.get_nowait()
+                self._queue.task_done()
+                purged += 1
+            if purged > 0:
+                self._notify_queue_change(-purged)
 
         has_active_worker = (
             self._queue is not None
