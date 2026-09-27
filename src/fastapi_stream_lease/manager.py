@@ -74,9 +74,15 @@ class StreamLeaseManager:
     Coordinates distributed stream concurrency leases backed by atomic Redis Lua scripts.
     """
 
-    def __init__(self, redis: Any, config: LeaseConfig | None = None) -> None:
+    def __init__(
+        self,
+        redis: Any,
+        config: LeaseConfig | None = None,
+        metrics: Any = None,
+    ) -> None:
         self.redis = redis
         self.config: LeaseConfig = config or LeaseConfig()
+        self.metrics = metrics
         self.dispatcher = HookDispatcher(
             max_queue_size=self.config.hook_queue_size,
             sync_inline=False,
@@ -121,9 +127,13 @@ class StreamLeaseManager:
                 self.config.redis_ttl,
             )
         except Exception as exc:
+            duration = time.monotonic() - start_monotonic
             if is_network_error(exc):
                 self.dispatcher.dispatch(self.config.on_backend_error, exc)
                 if self.config.fail_open:
+                    if self.metrics is not None:
+                        self.metrics.record_fallback()
+                        self.metrics.record_operation("acquire", "fallback", duration)
                     logger.warning(
                         "Redis backend unavailable during acquire; "
                         "fail_open=True allows fallback lease %s: %s",
@@ -142,6 +152,8 @@ class StreamLeaseManager:
                     lease._is_fallback = True
                     self.dispatcher.dispatch(self.config.on_acquired, lease)
                     return lease
+                if self.metrics is not None:
+                    self.metrics.record_operation("acquire", "backend_error", duration)
                 logger.warning(
                     "Redis backend unavailable during acquire for user %s: %s",
                     user_id,
@@ -160,14 +172,22 @@ class StreamLeaseManager:
             raise
 
         code = int(result)
+        duration = time.monotonic() - start_monotonic
         if code == 2:
+            if self.metrics is not None:
+                self.metrics.record_operation("acquire", "rejected", duration)
             self.dispatcher.dispatch(self.config.on_rejected, user_id, "user_limit")
             raise StreamLeaseRejected(reason="user_limit")
         if code == 3:
+            if self.metrics is not None:
+                self.metrics.record_operation("acquire", "rejected", duration)
             self.dispatcher.dispatch(self.config.on_rejected, user_id, "global_limit")
             raise StreamLeaseRejected(reason="global_limit")
         if code != 1:
             raise RuntimeError(f"Unexpected stream lease acquisition return code: {code}")
+
+        if self.metrics is not None:
+            self.metrics.record_operation("acquire", "success", duration)
 
         lease = StreamLease(
             lease_id=lease_id,
@@ -191,6 +211,7 @@ class StreamLeaseManager:
             StreamLeaseUnavailable: If the Redis backend is unreachable.
         """
         check_global = 1 if self.config.max_global > 0 else 0
+        start_monotonic = time.monotonic()
         try:
             result = await self.redis.eval(
                 RENEW_SCRIPT,
@@ -202,9 +223,17 @@ class StreamLeaseManager:
                 self.config.redis_ttl,
                 check_global,
             )
-            return int(result) == 1
+            duration = time.monotonic() - start_monotonic
+            success = int(result) == 1
+            if self.metrics is not None:
+                outcome = "success" if success else "revoked"
+                self.metrics.record_operation("renew", outcome, duration)
+            return success
         except Exception as exc:
+            duration = time.monotonic() - start_monotonic
             if is_network_error(exc):
+                if self.metrics is not None:
+                    self.metrics.record_operation("renew", "backend_error", duration)
                 self.dispatcher.dispatch(self.config.on_backend_error, exc)
                 logger.warning(
                     "Network error renewing stream lease %s: %s",
@@ -227,6 +256,7 @@ class StreamLeaseManager:
         """
         Release an active lease immediately from Redis.
         """
+        start_monotonic = time.monotonic()
         try:
             await self.redis.eval(
                 RELEASE_SCRIPT,
@@ -235,8 +265,14 @@ class StreamLeaseManager:
                 lease.global_key,
                 lease.lease_id,
             )
+            duration = time.monotonic() - start_monotonic
+            if self.metrics is not None:
+                self.metrics.record_operation("release", "success", duration)
         except Exception as exc:
+            duration = time.monotonic() - start_monotonic
             if is_network_error(exc):
+                if self.metrics is not None:
+                    self.metrics.record_operation("release", "backend_error", duration)
                 self.dispatcher.dispatch(self.config.on_backend_error, exc)
                 logger.warning("Network error releasing stream lease %s: %s", lease.lease_id, exc)
             else:
@@ -382,6 +418,7 @@ class StreamLeaseManager:
         if retry_delay < 0:
             raise ValueError("retry_delay must be non-negative")
 
+        start_monotonic = time.monotonic()
         fingerprint = self.config.fingerprint_dict()
         fingerprint_json = json.dumps(fingerprint, sort_keys=True)
         config_key = self.config.config_key
@@ -392,6 +429,9 @@ class StreamLeaseManager:
                 # Atomic canonical registration: only sets if key does not exist (NX=True), no TTL
                 registered = await self.redis.set(config_key, fingerprint_json, nx=True)
                 if registered:
+                    duration = time.monotonic() - start_monotonic
+                    if self.metrics is not None:
+                        self.metrics.record_operation("verify_config", "success", duration)
                     return True
 
                 existing = await self.redis.get(config_key)
@@ -405,6 +445,9 @@ class StreamLeaseManager:
                     if attempt < retry_attempts - 1:
                         await asyncio.sleep(retry_delay)
                         continue
+                    duration = time.monotonic() - start_monotonic
+                    if self.metrics is not None:
+                        self.metrics.record_operation("verify_config", "backend_error", duration)
                     self.dispatcher.dispatch(self.config.on_backend_error, exc)
                     if strict:
                         raise StreamLeaseUnavailable(
@@ -424,7 +467,10 @@ class StreamLeaseManager:
                 )
                 raise
 
+        duration = time.monotonic() - start_monotonic
         if existing_data is None:
+            if self.metrics is not None:
+                self.metrics.record_operation("verify_config", "backend_error", duration)
             msg = f"Unable to establish or read canonical cluster configuration on '{config_key}'"
             if strict:
                 raise StreamLeaseUnavailable(
@@ -441,6 +487,8 @@ class StreamLeaseManager:
         }
 
         if mismatches:
+            if self.metrics is not None:
+                self.metrics.record_operation("verify_config", "rejected", duration)
             msg = (
                 f"Cluster configuration mismatch on key '{config_key}': "
                 f"worker has {fingerprint}, but cluster registered {existing_data}. "
@@ -451,4 +499,6 @@ class StreamLeaseManager:
             logger.warning(msg)
             return False
 
+        if self.metrics is not None:
+            self.metrics.record_operation("verify_config", "success", duration)
         return True
