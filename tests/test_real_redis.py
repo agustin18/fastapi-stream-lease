@@ -227,3 +227,126 @@ async def test_real_redis_verify_cluster_config_concurrent_race():
     finally:
         await client.delete(cfg_a.config_key)
         await _safe_close(client)
+
+
+@pytest.mark.asyncio
+async def test_real_redis_resource_plateau_under_stream_churn(real_manager):
+    """Verify asyncio tasks, memory, and Redis keys return to baseline after heavy stream churn."""
+    initial_tasks = len(asyncio.all_tasks())
+
+    async def sample_stream():
+        for i in range(5):
+            yield f"chunk_{i}"
+            await asyncio.sleep(0.02)
+
+    # Run multiple batches of streaming churn
+    for _batch_idx in range(3):
+
+        async def run_client(uid: int):
+            lease = await real_manager.acquire(f"soak_user_{uid}")
+            chunks = []
+            async for chunk in lease.wrap(sample_stream(), auto_renew=True, renew_interval=0.03):
+                chunks.append(chunk)
+            assert len(chunks) == 5
+
+        await asyncio.gather(*(run_client(i) for i in range(2)))
+
+    # Teardown & verification
+    active_count = await real_manager.get_active_count()
+    assert active_count == 0
+
+    # Ensure all background auto-renew tasks have completed cleanly
+    await asyncio.sleep(0.05)
+    final_tasks = len(asyncio.all_tasks())
+    assert final_tasks <= initial_tasks + 1
+
+
+@pytest.mark.asyncio
+async def test_real_redis_wrapper_overhead_budget(real_manager):
+    """Sanity check: verify StreamLeaseManager Python wrapper overhead is within 1ms budget."""
+    import statistics
+    import time
+
+    from fastapi_stream_lease.lua import ACQUIRE_SCRIPT, RELEASE_SCRIPT
+
+    client = real_manager.redis
+    raw_prefix = f"bench_raw_{uuid4().hex[:8]}"
+    wrap_prefix = f"bench_wrap_{uuid4().hex[:8]}"
+    raw_config = LeaseConfig(
+        lease_seconds=60.0, max_per_user=100, max_global=1000, key_prefix=raw_prefix
+    )
+    wrap_config = LeaseConfig(
+        lease_seconds=60.0, max_per_user=100, max_global=1000, key_prefix=wrap_prefix
+    )
+    bench_manager = StreamLeaseManager(client, wrap_config)
+
+    # Warm up connection
+    await client.ping()
+
+    raw_latencies: list[float] = []
+    wrapped_latencies: list[float] = []
+
+    iterations = 25
+    created_raw_keys: set[str] = set()
+    try:
+        for i in range(iterations):
+            user_id = f"user_{i}"
+            lease_id = f"raw_lease_{i}"
+            raw_user_key = raw_config.user_key(user_id)
+            raw_global_key = raw_config.global_key
+            created_raw_keys.add(raw_user_key)
+            created_raw_keys.add(raw_global_key)
+
+            if i % 2 == 0:
+                t0 = time.perf_counter()
+                await client.eval(
+                    ACQUIRE_SCRIPT,
+                    2,
+                    raw_user_key,
+                    raw_global_key,
+                    60.0,
+                    lease_id,
+                    100,
+                    1000,
+                    120.0,
+                )
+                await client.eval(RELEASE_SCRIPT, 2, raw_user_key, raw_global_key, lease_id)
+                raw_latencies.append(time.perf_counter() - t0)
+
+                t0 = time.perf_counter()
+                lease = await bench_manager.acquire(user_id)
+                await lease.release()
+                wrapped_latencies.append(time.perf_counter() - t0)
+            else:
+                t0 = time.perf_counter()
+                lease = await bench_manager.acquire(user_id)
+                await lease.release()
+                wrapped_latencies.append(time.perf_counter() - t0)
+
+                t0 = time.perf_counter()
+                await client.eval(
+                    ACQUIRE_SCRIPT,
+                    2,
+                    raw_user_key,
+                    raw_global_key,
+                    60.0,
+                    lease_id,
+                    100,
+                    1000,
+                    120.0,
+                )
+                await client.eval(RELEASE_SCRIPT, 2, raw_user_key, raw_global_key, lease_id)
+                raw_latencies.append(time.perf_counter() - t0)
+    finally:
+        if created_raw_keys:
+            await client.delete(*created_raw_keys)
+        await bench_manager.close(drain=True)
+
+    # Paired delta calculation (eliminates external variance)
+    deltas = [(w - r) * 1000.0 for w, r in zip(wrapped_latencies, raw_latencies, strict=True)]
+    median_overhead_ms = statistics.median(deltas)
+
+    # Overhead budget threshold: <= 1.0 ms
+    assert median_overhead_ms <= 1.0, (
+        f"Wrapper overhead exceeded budget: {median_overhead_ms:.3f}ms"
+    )
