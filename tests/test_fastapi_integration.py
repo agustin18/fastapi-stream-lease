@@ -7,7 +7,12 @@ from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
 from httpx import ASGITransport, AsyncClient
 
-from fastapi_stream_lease import StreamLeaseRejected, StreamLeaseUnavailable
+from fastapi_stream_lease import (
+    StreamLeaseManager,
+    StreamLeaseRejected,
+    StreamLeaseUnavailable,
+)
+from fastapi_stream_lease.lease import ProtectedStreamingResponse
 
 
 @pytest.fixture
@@ -254,8 +259,26 @@ async def test_fastapi_real_asgi_client_disconnect_determinism(fastapi_app, leas
     and releases the Redis lease immediately without requiring manual aclosing()
     or waiting for garbage collection.
     """
-    upstream_cleaned = False
     first_token_sent = asyncio.Event()
+    never_set_event = asyncio.Event()
+
+    close_started = asyncio.Event()
+    close_gate = asyncio.Event()
+    close_completed = asyncio.Event()
+
+    release_started = asyncio.Event()
+    release_gate = asyncio.Event()
+    release_completed = asyncio.Event()
+
+    orig_mgr_release = lease_manager.release
+
+    async def gated_mgr_release(lease):
+        release_started.set()
+        await release_gate.wait()
+        await orig_mgr_release(lease)
+        release_completed.set()
+
+    lease_manager.release = gated_mgr_release
 
     class UpstreamLLMStream:
         def __aiter__(self):
@@ -263,12 +286,13 @@ async def test_fastapi_real_asgi_client_disconnect_determinism(fastapi_app, leas
 
         async def __anext__(self):
             first_token_sent.set()
-            await client_disconnected.wait()
+            await never_set_event.wait()
             raise StopAsyncIteration
 
         async def aclose(self):
-            nonlocal upstream_cleaned
-            upstream_cleaned = True
+            close_started.set()
+            await close_gate.wait()
+            close_completed.set()
 
     @fastapi_app.get("/stream_real_disconnect")
     async def stream_disconnect_endpoint():
@@ -301,14 +325,29 @@ async def test_fastapi_real_asgi_client_disconnect_determinism(fastapi_app, leas
 
     app_task = asyncio.create_task(fastapi_app(scope, receive, send))
     await first_token_sent.wait()
+
+    # Trigger client disconnect while upstream is still waiting indefinitely
     client_disconnected.set()
+
+    # Upstream cleanup must start and app_task must not complete until close_gate is opened
+    await close_started.wait()
+    assert not app_task.done(), "app_task finished before upstream cleanup completed!"
+
+    close_gate.set()
+    await close_completed.wait()
+
+    # Redis release must start and app_task must not complete until release_gate is opened
+    await release_started.wait()
+    assert not app_task.done(), "app_task finished before Redis release completed!"
+
+    release_gate.set()
+    await release_completed.wait()
 
     from contextlib import suppress
 
     with suppress(asyncio.CancelledError):
         await asyncio.wait_for(app_task, timeout=5.0)
 
-    assert upstream_cleaned is True
     assert await lease_manager.get_active_count("user_asgi_disc") == 0
 
 
@@ -378,3 +417,67 @@ async def test_protected_streaming_response_cleanup_variants(cleanup_mode: str) 
         pass
 
     await resp(scope, receive, send)
+
+
+@pytest.mark.asyncio
+async def test_protected_streaming_response_cleans_unreleased_lease(fake_redis) -> None:
+    """Verifies that ProtectedStreamingResponse explicitly releases an unreleased lease."""
+    manager = StreamLeaseManager(fake_redis)
+    lease = await manager.acquire("unreleased_user")
+
+    async def empty_gen():
+        if False:
+            yield b""
+
+    resp = ProtectedStreamingResponse(empty_gen())
+    resp.lease = lease
+
+    scope = {"type": "http", "method": "GET", "headers": []}
+
+    async def receive():
+        return {"type": "http.disconnect"}
+
+    async def send(msg):
+        pass
+
+    assert not lease._is_released
+    await resp(scope, receive, send)
+    assert lease._is_released is True
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_protected_streaming_response_awaits_pending_release_task(fake_redis) -> None:
+    """Verifies that ProtectedStreamingResponse awaits a pending background release task."""
+    manager = StreamLeaseManager(fake_redis)
+    lease = await manager.acquire("pending_release_user")
+
+    async def empty_gen():
+        if False:
+            yield b""
+
+    resp = ProtectedStreamingResponse(empty_gen())
+    resp.lease = lease
+
+    release_finished = False
+
+    async def slow_release():
+        nonlocal release_finished
+        await asyncio.sleep(0.05)
+        release_finished = True
+
+    lease._is_released = True
+    release_task = asyncio.create_task(slow_release())
+    lease._release_task = release_task
+
+    scope = {"type": "http", "method": "GET", "headers": []}
+
+    async def receive():
+        return {"type": "http.disconnect"}
+
+    async def send(msg):
+        pass
+
+    await resp(scope, receive, send)
+    assert release_finished is True
+    await manager.close()

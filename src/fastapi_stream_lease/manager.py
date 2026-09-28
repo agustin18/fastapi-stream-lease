@@ -146,9 +146,10 @@ class StreamLeaseManager:
 
     def _safe_record_circuit_state(self, state: CircuitState | str) -> None:
         if self.telemetry is not None and hasattr(self.telemetry, "record_circuit_state"):
+            scope = self.config.telemetry_scope or self.config.key_prefix
             try:
                 try:
-                    self.telemetry.record_circuit_state(state, scope=self.config.key_prefix)
+                    self.telemetry.record_circuit_state(state, scope=scope)
                 except TypeError:
                     self.telemetry.record_circuit_state(state)
             except Exception:
@@ -160,10 +161,11 @@ class StreamLeaseManager:
         state: CircuitState | str = CircuitState.OPEN,
     ) -> None:
         if self.telemetry is not None and hasattr(self.telemetry, "record_short_circuit"):
+            scope = self.config.telemetry_scope or self.config.key_prefix
             try:
                 try:
                     self.telemetry.record_short_circuit(
-                        operation=operation, state=state, scope=self.config.key_prefix
+                        operation=operation, state=state, scope=scope
                     )
                 except TypeError:
                     self.telemetry.record_short_circuit()

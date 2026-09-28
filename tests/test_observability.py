@@ -988,3 +988,56 @@ def test_legacy_v03_telemetry_adapter_protocol_conformance() -> None:
     assert isinstance(prom, TelemetryAdapter)
     assert isinstance(prom, CircuitBreakerTelemetry)
     assert isinstance(prom, StreamLeaseTelemetry)
+
+
+@pytest.mark.asyncio
+async def test_multi_manager_shared_prefix_isolated_by_telemetry_scope(fake_redis) -> None:
+    """CRITICAL P2 AUDIT TEST (OBS-02):
+    Verifies that multiple managers sharing the same key_prefix can use distinct
+    telemetry_scope identifiers to avoid metric collisions in a shared Prometheus registry.
+    """
+    from prometheus_client import CollectorRegistry
+
+    from fastapi_stream_lease.circuit_breaker import BackendFailurePolicy, CircuitBreakerConfig
+
+    reg = CollectorRegistry()
+    prom = PrometheusMetrics(registry=reg)
+
+    policy_a = BackendFailurePolicy(circuit_breaker=CircuitBreakerConfig(failure_threshold=1))
+    policy_b = BackendFailurePolicy(circuit_breaker=CircuitBreakerConfig(failure_threshold=1))
+
+    cfg_a = LeaseConfig(
+        key_prefix="shared_llm",
+        telemetry_scope="worker_alpha",
+        failure_policy=policy_a,
+    )
+    cfg_b = LeaseConfig(
+        key_prefix="shared_llm",
+        telemetry_scope="worker_beta",
+        failure_policy=policy_b,
+    )
+
+    mgr_a = StreamLeaseManager(fake_redis, config=cfg_a, telemetry=prom)
+    mgr_b = StreamLeaseManager(fake_redis, config=cfg_b, telemetry=prom)
+
+    # Trip breaker on mgr_a only
+    assert mgr_a._circuit_breaker is not None
+    mgr_a._circuit_breaker.record_failure(ConnectionError("connection reset"))
+    mgr_a._safe_record_circuit_state(mgr_a.circuit_state)
+
+    # Verify state for worker_alpha is OPEN (2)
+    val_alpha = reg.get_sample_value(
+        "fastapi_stream_lease_circuit_state",
+        {"prefix": "worker_alpha"},
+    )
+    assert val_alpha == 2
+
+    # Verify state for worker_beta remains CLOSED (0)
+    val_beta = reg.get_sample_value(
+        "fastapi_stream_lease_circuit_state",
+        {"prefix": "worker_beta"},
+    )
+    assert val_beta == 0
+
+    await mgr_a.close()
+    await mgr_b.close()

@@ -20,6 +20,13 @@ T = TypeVar("T")
 
 
 try:
+    import anyio
+
+    _has_anyio = True
+except ImportError:  # pragma: no cover
+    _has_anyio = False
+
+try:
     from starlette.responses import StreamingResponse as _StarletteStreamingResponse
 except ImportError:  # pragma: no cover
     _StarletteStreamingResponse = object  # type: ignore[misc,assignment]
@@ -31,53 +38,104 @@ class ProtectedStreamingResponse(_StarletteStreamingResponse):
     aclose() cleanup on ASGI client disconnect, cancellation, or error.
     """
 
+    lease: StreamLease | None = None
+
     async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
         try:
             await super().__call__(scope, receive, send)
         finally:
-            aclose = getattr(self.body_iterator, "aclose", None)
-            if callable(aclose):
-                cleanup = aclose()
-                if inspect.isawaitable(cleanup):
-                    with suppress(Exception, asyncio.CancelledError):
-                        await asyncio.shield(cleanup)
+            if _has_anyio:
+                with anyio.CancelScope(shield=True):
+                    await self._cleanup_response()
+            else:  # pragma: no cover
+                await self._cleanup_response()
+
+    async def _cleanup_response(self) -> None:
+        aclose = getattr(self.body_iterator, "aclose", None)
+        if callable(aclose):
+            cleanup = aclose()
+            if inspect.isawaitable(cleanup):
+                with suppress(Exception, asyncio.CancelledError):
+                    await cleanup
+        if self.lease is not None:
+            if not self.lease._is_released:
+                with suppress(Exception, asyncio.CancelledError):
+                    await self.lease.release(reason="cancelled")
+            elif self.lease._release_task is not None and not self.lease._release_task.done():
+                with suppress(Exception, asyncio.CancelledError):
+                    await self.lease._release_task
 
 
-async def _close_single_target(target: Any, timeout: float) -> None:
+async def _close_single_target(target: Any, timeout: float) -> None:  # noqa: ASYNC109
     # 1. Look for aclose
     aclose = getattr(target, "aclose", None)
     if callable(aclose):
         try:
-            res = aclose()
-            if inspect.isawaitable(res):
-                await asyncio.wait_for(res, timeout=timeout)
+
+            async def _run_aclose() -> None:
+                if inspect.iscoroutinefunction(aclose):
+                    await asyncio.wait_for(aclose(), timeout=timeout)
+                else:
+                    res = aclose()
+                    if inspect.isawaitable(res):
+                        await asyncio.wait_for(res, timeout=timeout)
+
+            if _has_anyio:
+                with anyio.CancelScope(shield=True):
+                    await _run_aclose()
+            else:  # pragma: no cover
+                await _run_aclose()
             return
-        except (Exception, asyncio.TimeoutError):
+        except (Exception, asyncio.TimeoutError, asyncio.CancelledError):
             return
 
     # 2. Look for close (async or sync)
     close = getattr(target, "close", None)
     if callable(close):
         try:
-            res = close()
-            if inspect.isawaitable(res):
-                await asyncio.wait_for(res, timeout=timeout)
-        except (Exception, asyncio.TimeoutError):
+
+            async def _run_close() -> None:
+                if inspect.iscoroutinefunction(close):
+                    await asyncio.wait_for(close(), timeout=timeout)
+                else:
+                    # Sync close must be offloaded to worker thread to avoid event-loop starvation
+                    res = await asyncio.wait_for(asyncio.to_thread(close), timeout=timeout)
+                    if inspect.isawaitable(res):
+                        await asyncio.wait_for(res, timeout=timeout)
+
+            if _has_anyio:
+                with anyio.CancelScope(shield=True):
+                    await _run_close()
+            else:  # pragma: no cover
+                await _run_close()
+            return
+        except (Exception, asyncio.TimeoutError, asyncio.CancelledError):
             return
 
 
 async def _close_stream_source(
     source: Any,
     iterator: Any,
-    timeout: float = 2.0,
+    timeout: float = 2.0,  # noqa: ASYNC109
 ) -> None:
-    """Deterministically close upstream stream iterator and source objects."""
+    """
+    Deterministically close upstream stream iterator and source objects within
+    a global timeout budget.
+    """
     targets: list[Any] = [iterator]
     if source is not iterator:
         targets.append(source)
 
+    deadline = time.monotonic() + timeout
     for target in targets:
-        await _close_single_target(target, timeout=timeout)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            logger.warning(
+                "Upstream cleanup timeout budget exhausted (%.2fs); skipping remaining targets",
+                timeout,
+            )
+            break
+        await _close_single_target(target, timeout=remaining)
 
 
 def _safe_uncancel() -> None:
@@ -106,6 +164,7 @@ class StreamLease:
     _context_lease_lost: asyncio.Event = field(
         default_factory=asyncio.Event, init=False, repr=False
     )
+    _release_task: asyncio.Task[None] | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.expires_at = self.created_monotonic + self.manager.config.lease_seconds
@@ -158,19 +217,35 @@ class StreamLease:
     async def release(self, reason: str = "manual") -> None:
         """Explicitly release this lease from Redis."""
         if self._is_released:
+            if self._release_task is not None and not self._release_task.done():
+                await self._await_release_task(self._release_task)
             return
+
         self._is_released = True
+        if self._is_fallback:
+            self.manager.dispatcher.dispatch(self.manager.config.on_released, self, reason)
+            return
+
+        async def _do_release() -> None:
+            try:
+                await self.manager.release(self)
+            finally:
+                self.manager.dispatcher.dispatch(self.manager.config.on_released, self, reason)
+
+        task = asyncio.create_task(_do_release())
+        self._release_task = task
+        await self._await_release_task(task)
+
+    async def _await_release_task(self, task: asyncio.Task[None]) -> None:
+        if task.done():
+            return
         cancelled = False
         try:
-            if not self._is_fallback:
-                task = asyncio.create_task(self.manager.release(self))
-                try:
-                    await asyncio.shield(task)
-                except asyncio.CancelledError:
-                    cancelled = True
-                    await asyncio.wait({task})
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+            await asyncio.wait({task})
         finally:
-            self.manager.dispatcher.dispatch(self.manager.config.on_released, self, reason)
             if cancelled:
                 raise asyncio.CancelledError()
 
@@ -338,7 +413,7 @@ class StreamLease:
                 "Starlette or FastAPI must be installed to use as_streaming_response()."
             ) from None
 
-        return ProtectedStreamingResponse(
+        resp = ProtectedStreamingResponse(
             self.wrap(
                 stream,
                 auto_renew=auto_renew,
@@ -350,3 +425,5 @@ class StreamLease:
             headers=headers,
             **kwargs,
         )
+        resp.lease = self
+        return resp

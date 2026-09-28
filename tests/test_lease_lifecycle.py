@@ -1454,3 +1454,169 @@ async def test_wrap_stream_close_source_handles_synchronous_aclose(lease_manager
 
     assert sync_aclose_called is True
     assert await lease_manager.get_active_count("user_sync_aclose") == 0
+
+
+@pytest.mark.asyncio
+async def test_wrap_stream_close_source_synchronous_blocking_close_timed_out(
+    fake_redis,
+) -> None:
+    """CRITICAL P1 AUDIT TEST (UP-05-R2):
+    Verifies that a synchronous blocking close() method is offloaded from the event loop
+    and bounded by upstream_cleanup_timeout, preventing worker event-loop starvation.
+    """
+    config = LeaseConfig(lease_seconds=5.0, upstream_cleanup_timeout=0.05)
+    manager = StreamLeaseManager(fake_redis, config=config)
+
+    class SyncBlockingStream:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise StopAsyncIteration
+
+        def close(self):
+            # Blocking synchronous work
+            time.sleep(0.5)
+
+    lease = await manager.acquire("user_sync_block")
+    wrapped = lease.wrap(SyncBlockingStream(), auto_renew=False, close_source=True)
+
+    t0 = time.monotonic()
+    async for _ in wrapped:
+        pass
+    elapsed = time.monotonic() - t0
+
+    # Must complete near timeout (e.g. < 0.25s), NOT 0.5s
+    assert elapsed < 0.35
+    assert await manager.get_active_count("user_sync_block") == 0
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_wrap_stream_close_source_global_budget_exhaustion(fake_redis) -> None:
+    """CRITICAL P2 AUDIT TEST (UP-04):
+    Verifies that upstream_cleanup_timeout applies as a global budget across distinct
+    iterator and source targets without allowing 2x timeout consumption.
+    """
+    config = LeaseConfig(lease_seconds=5.0, upstream_cleanup_timeout=0.06)
+    manager = StreamLeaseManager(fake_redis, config=config)
+
+    class SlowIterator:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise StopAsyncIteration
+
+        async def aclose(self):
+            await asyncio.sleep(0.1)
+
+    class SlowSource:
+        def __aiter__(self):
+            return SlowIterator()
+
+        async def aclose(self):
+            await asyncio.sleep(0.1)
+
+    lease = await manager.acquire("user_budget")
+    wrapped = lease.wrap(SlowSource(), auto_renew=False, close_source=True)
+
+    t0 = time.monotonic()
+    async for _ in wrapped:
+        pass
+    elapsed = time.monotonic() - t0
+
+    # Total teardown must be strictly bounded by the global budget, not 2x (0.2s)
+    assert elapsed < 0.15
+    assert await manager.get_active_count("user_budget") == 0
+    await manager.close()
+
+
+@pytest.mark.parametrize(
+    "invalid_scope",
+    [123, True, False, ["scope"]],
+)
+def test_lease_config_telemetry_scope_validation(invalid_scope: Any) -> None:
+    """Verifies strict validation of telemetry_scope parameter."""
+    with pytest.raises(TypeError, match="telemetry_scope must be a string"):
+        LeaseConfig(telemetry_scope=invalid_scope)
+
+
+@pytest.mark.asyncio
+async def test_lease_concurrent_release_awaits_in_flight_release(lease_manager) -> None:
+    """Verifies that calling release() while a release is in-flight safely awaits completion."""
+    lease = await lease_manager.acquire("user_concurrent_rel")
+
+    orig_release = lease_manager.release
+    release_finished = False
+
+    async def slow_release(target):
+        nonlocal release_finished
+        await asyncio.sleep(0.04)
+        await orig_release(target)
+        release_finished = True
+
+    lease_manager.release = slow_release
+
+    # First release starts task
+    t1 = asyncio.create_task(lease.release())
+    await asyncio.sleep(0.01)
+
+    # Second release enters line 214-215 (self._is_released and task in flight)
+    assert lease._is_released is True
+    await lease.release()
+
+    await t1
+    assert release_finished is True
+    assert await lease_manager.get_active_count("user_concurrent_rel") == 0
+
+
+@pytest.mark.asyncio
+async def test_await_release_task_early_exit_when_done(lease_manager) -> None:
+    """Verifies that _await_release_task returns immediately if task is already done."""
+    lease = await lease_manager.acquire("user_done_task")
+
+    async def immediate():
+        return
+
+    task = asyncio.create_task(immediate())
+    await task
+    assert task.done()
+
+    # Must return without error
+    await lease._await_release_task(task)
+    await lease.release()
+
+
+@pytest.mark.asyncio
+async def test_wrap_stream_close_source_sync_close_returning_coroutine(fake_redis) -> None:
+    """Verifies handling when a sync def close() method returns an awaitable coroutine."""
+    config = LeaseConfig(lease_seconds=5.0, upstream_cleanup_timeout=0.5)
+    manager = StreamLeaseManager(fake_redis, config=config)
+
+    cleaned_up = False
+
+    class SyncDefReturningCoroutine:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise StopAsyncIteration
+
+        def close(self):
+            # Sync function returning an awaitable coroutine
+            async def _coro():
+                nonlocal cleaned_up
+                cleaned_up = True
+
+            return _coro()
+
+    lease = await manager.acquire("user_sync_returning_coro")
+    wrapped = lease.wrap(SyncDefReturningCoroutine(), auto_renew=False, close_source=True)
+
+    async for _ in wrapped:
+        pass
+
+    assert cleaned_up is True
+    assert await manager.get_active_count("user_sync_returning_coro") == 0
+    await manager.close()
