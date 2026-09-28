@@ -160,9 +160,19 @@ class StreamLease:
         if self._is_released:
             return
         self._is_released = True
-        if not self._is_fallback:
-            await self.manager.release(self)
-        self.manager.dispatcher.dispatch(self.manager.config.on_released, self, reason)
+        cancelled = False
+        try:
+            if not self._is_fallback:
+                task = asyncio.create_task(self.manager.release(self))
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    cancelled = True
+                    await asyncio.wait({task})
+        finally:
+            self.manager.dispatcher.dispatch(self.manager.config.on_released, self, reason)
+            if cancelled:
+                raise asyncio.CancelledError()
 
     def _start_auto_renew(
         self, interval: float | None = None

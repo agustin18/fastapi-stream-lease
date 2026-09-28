@@ -210,6 +210,35 @@ async def test_direct_lease_context_releases_on_cancellation(lease_manager):
 
 
 @pytest.mark.asyncio
+async def test_lease_release_awaits_background_release_on_cancellation(lease_manager) -> None:
+    lease = await lease_manager.acquire("slow_release_user")
+
+    orig_mgr_release = lease_manager.release
+    release_completed = False
+
+    async def slow_release(target_lease):
+        nonlocal release_completed
+        await asyncio.sleep(0.05)
+        await orig_mgr_release(target_lease)
+        release_completed = True
+
+    lease_manager.release = slow_release
+
+    async def run_release():
+        await lease.release()
+
+    task = asyncio.create_task(run_release())
+    await asyncio.sleep(0.01)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert release_completed is True
+    assert await lease_manager.get_active_count("slow_release_user") == 0
+
+
+@pytest.mark.asyncio
 async def test_wrap_rejects_invalid_renew_interval_and_releases(lease_manager):
     async def quick_generator():
         yield "data"
