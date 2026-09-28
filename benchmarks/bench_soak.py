@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import os
 import resource
@@ -90,7 +91,11 @@ async def run_soak(
     if renew_interval <= 0 or renew_interval >= lease_seconds:
         raise ValueError(f"renew_interval must be > 0 and < lease_seconds, got {renew_interval}")
 
-    client = redis.from_url(redis_url)
+    # S08: Size connection pool proportionally to benchmark concurrency.
+    # When tearing down up to (target_concurrency + burst_rate) streams concurrently,
+    # the client connection pool must accommodate simultaneous lease releases and queries.
+    pool_size = max(100, (target_concurrency + burst_rate) * 2)
+    client = redis.from_url(redis_url, max_connections=pool_size)
     try:
         await client.ping()
     except Exception as exc:
@@ -223,7 +228,10 @@ async def run_soak(
             t_now = time.monotonic() - t_start_soak
             cur_rss = get_current_rss_kb()
             cur_tasks = len(asyncio.all_tasks())
-            cur_redis_leases = await manager.get_active_count()
+            try:
+                cur_redis_leases = await manager.get_active_count()
+            except Exception:
+                cur_redis_leases = -1
             samples.append(
                 {
                     "time_s": round(t_now, 2),
@@ -233,7 +241,10 @@ async def run_soak(
                     "redis_leases": cur_redis_leases,
                 }
             )
-            await asyncio.sleep(sample_interval)
+            try:
+                await asyncio.sleep(sample_interval)
+            except asyncio.CancelledError:
+                break
 
     t_start_soak = time.monotonic()
     generator_task = asyncio.create_task(load_generator())
@@ -248,7 +259,10 @@ async def run_soak(
         elapsed_soak = time.monotonic() - t_start_soak
         cur_rss = get_current_rss_kb()
         cur_tasks = len(asyncio.all_tasks())
-        cur_redis = await manager.get_active_count()
+        try:
+            cur_redis = await manager.get_active_count()
+        except Exception:
+            cur_redis = -1
         print(
             f"    [{elapsed_soak:5.1f}s / {duration_seconds:.0f}s] "
             f"Active: {active_streams:4d} | Redis: {cur_redis:4d} | "
@@ -260,7 +274,8 @@ async def run_soak(
     print("\n[Phase 2] Draining in-flight streams & checking teardown invariants...")
     stop_event.set()
     await generator_task
-    await monitor_task
+    with contextlib.suppress(asyncio.CancelledError):
+        await monitor_task
 
     # Allow event loop and lingering socket callbacks to settle cleanly
     await asyncio.sleep(0.5)
