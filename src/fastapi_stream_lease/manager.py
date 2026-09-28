@@ -72,11 +72,6 @@ class StreamLeaseManager:
         )
 
     @property
-    def circuit_breaker(self) -> CircuitBreaker | None:
-        """Internal worker-local circuit breaker state machine, or None if disabled."""
-        return self._circuit_breaker
-
-    @property
     def circuit_state(self) -> CircuitState | None:
         """Current operational state of the circuit breaker, or None if disabled."""
         if self._circuit_breaker is not None:
@@ -431,15 +426,15 @@ class StreamLeaseManager:
                 lease.global_key,
                 lease.lease_id,
             )
-            if self.circuit_breaker is not None:
-                self.circuit_breaker.record_success()
+            if self._circuit_breaker is not None:
+                self._circuit_breaker.record_success()
             duration = time.monotonic() - start_monotonic
             self._safe_record_operation(Operation.RELEASE, Outcome.SUCCESS, duration)
         except Exception as exc:
             duration = time.monotonic() - start_monotonic
             if is_network_error(exc):
-                if self.circuit_breaker is not None:
-                    self.circuit_breaker.record_failure(exc)
+                if self._circuit_breaker is not None:
+                    self._circuit_breaker.record_failure(exc)
                 self._safe_record_backend_error(exc)
                 self._safe_record_operation(Operation.RELEASE, Outcome.BACKEND_ERROR, duration)
                 self.dispatcher.dispatch(self.config.on_backend_error, exc)

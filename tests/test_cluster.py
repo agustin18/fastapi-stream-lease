@@ -676,8 +676,8 @@ async def test_cluster_circuit_breaker_outage_and_recovery():
     try:
         # 1. Acquire initial active lease
         lease = await manager.acquire("user_cluster_cb")
-        assert manager.circuit_breaker is not None
-        assert manager.circuit_breaker.state == CircuitState.CLOSED
+        assert manager._circuit_breaker is not None
+        assert manager.circuit_state == CircuitState.CLOSED
 
         # Discover slot nodes
         slot = await client.cluster_keyslot(config.global_key)
@@ -710,7 +710,7 @@ async def test_cluster_circuit_breaker_outage_and_recovery():
             with suppress(StreamLeaseUnavailable):
                 await manager.acquire(f"user_cluster_probe_{i}")
 
-        assert manager.circuit_breaker.state == CircuitState.OPEN
+        assert manager.circuit_state == CircuitState.OPEN
 
         # 4. Next acquire fast-fails because breaker is OPEN
         with pytest.raises(StreamLeaseUnavailable, match="Circuit breaker is OPEN"):
@@ -724,8 +724,8 @@ async def test_cluster_circuit_breaker_outage_and_recovery():
         # 6. Existing lease renewal attempts Redis (golden asymmetry) and heals breaker
         renewed = await manager.renew(lease)
         assert renewed is True
-        assert manager.circuit_breaker.state == CircuitState.CLOSED
-        assert manager.circuit_breaker.consecutive_failures == 0
+        assert manager.circuit_state == CircuitState.CLOSED
+        assert manager._circuit_breaker.consecutive_failures == 0
 
         # 7. Subsequent acquire succeeds
         lease2 = await manager.acquire("user_cluster_recovered")

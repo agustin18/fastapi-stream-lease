@@ -387,8 +387,8 @@ async def test_real_redis_circuit_breaker_half_open_probe_recovery(real_manager)
         assert manager.circuit_state == CircuitState.CLOSED
 
         # 1. Trip breaker to OPEN via transient error
-        assert manager.circuit_breaker is not None
-        manager.circuit_breaker.record_failure(redis.exceptions.ConnectionError("simulated"))
+        assert manager._circuit_breaker is not None
+        manager._circuit_breaker.record_failure(redis.exceptions.ConnectionError("simulated"))
         assert manager.circuit_state == CircuitState.OPEN
 
         # 2. Acquire fast-fails during OPEN without hitting Redis
@@ -406,7 +406,7 @@ async def test_real_redis_circuit_breaker_half_open_probe_recovery(real_manager)
 
         # Real Redis answered and executed script -> breaker healed back to CLOSED!
         assert manager.circuit_state == CircuitState.CLOSED
-        assert manager.circuit_breaker.consecutive_failures == 0
+        assert manager._circuit_breaker.consecutive_failures == 0
 
         # 5. Subsequent acquire proceeds normally
         lease2 = await manager.acquire("user_post_recovery")

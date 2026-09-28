@@ -753,8 +753,8 @@ async def test_sentinel_circuit_breaker_failover_and_recovery(sentinel_cluster):
 
     # 1. Acquire initial active lease while master is healthy
     lease = await manager.acquire("user_cb")
-    assert manager.circuit_breaker is not None
-    assert manager.circuit_breaker.state == CircuitState.CLOSED
+    assert manager._circuit_breaker is not None
+    assert manager.circuit_state == CircuitState.CLOSED
 
     # Discover current topology
     cur_master = await sentinel.discover_master(service_name)
@@ -785,7 +785,7 @@ async def test_sentinel_circuit_breaker_failover_and_recovery(sentinel_cluster):
         with suppress(StreamLeaseUnavailable):
             await manager.acquire(f"user_cb_probe_{i}")
 
-    assert manager.circuit_breaker.state == CircuitState.OPEN
+    assert manager.circuit_state == CircuitState.OPEN
 
     # 4. Next acquire fast-fails because breaker is OPEN
     with pytest.raises(StreamLeaseUnavailable, match="Circuit breaker is OPEN"):
@@ -805,8 +805,8 @@ async def test_sentinel_circuit_breaker_failover_and_recovery(sentinel_cluster):
     # 6. Existing lease renewal attempts Redis (golden asymmetry) and heals breaker
     renewed = await manager.renew(lease)
     assert renewed is True
-    assert manager.circuit_breaker.state == CircuitState.CLOSED
-    assert manager.circuit_breaker.consecutive_failures == 0
+    assert manager.circuit_state == CircuitState.CLOSED
+    assert manager._circuit_breaker.consecutive_failures == 0
 
     # 7. Subsequent acquire succeeds against new master
     lease2 = await manager.acquire("user_cb_recovered")

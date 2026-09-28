@@ -280,14 +280,14 @@ def test_manager_circuit_state_property() -> None:
     mock_redis = AsyncMock()
     # Breaker disabled -> None
     mgr_no_cb = StreamLeaseManager(redis=mock_redis)
-    assert mgr_no_cb.circuit_breaker is None
+    assert mgr_no_cb._circuit_breaker is None
     assert mgr_no_cb.circuit_state is None
 
     # Breaker enabled -> CircuitState.CLOSED
     cb_cfg = CircuitBreakerConfig()
     policy = BackendFailurePolicy(circuit_breaker=cb_cfg)
     mgr_with_cb = StreamLeaseManager(redis=mock_redis, config=LeaseConfig(failure_policy=policy))
-    assert mgr_with_cb.circuit_breaker is not None
+    assert mgr_with_cb._circuit_breaker is not None
     assert mgr_with_cb.circuit_state == CircuitState.CLOSED
 
 
@@ -302,18 +302,18 @@ async def test_manager_acquire_circuit_breaker_open_fail_closed() -> None:
     config = LeaseConfig(failure_policy=policy)
     manager = StreamLeaseManager(redis=mock_redis, config=config, telemetry=telemetry)
 
-    assert manager.circuit_breaker is not None
+    assert manager._circuit_breaker is not None
 
     # First attempt: network error trips failure count to 1
     with pytest.raises(StreamLeaseUnavailable):
         await manager.acquire("u1")
-    assert manager.circuit_breaker.state == CircuitState.CLOSED
+    assert manager.circuit_state == CircuitState.CLOSED
     assert mock_redis.eval.call_count == 1
 
     # Second attempt: network error trips failure count to 2 -> OPEN
     with pytest.raises(StreamLeaseUnavailable):
         await manager.acquire("u1")
-    assert manager.circuit_breaker.state == CircuitState.OPEN
+    assert manager.circuit_state == CircuitState.OPEN
     assert mock_redis.eval.call_count == 2
 
     # Third attempt: Breaker is OPEN -> fails fast WITHOUT touching Redis
@@ -338,7 +338,7 @@ async def test_manager_acquire_circuit_breaker_open_fail_open() -> None:
     assert lease1._is_fallback is True
     lease2 = await manager.acquire("u1")
     assert lease2._is_fallback is True
-    assert manager.circuit_breaker.state == CircuitState.OPEN
+    assert manager.circuit_state == CircuitState.OPEN
     assert mock_redis.eval.call_count == 2
 
     # 3rd attempt: Breaker is OPEN -> generates fallback WITHOUT touching Redis!
@@ -370,7 +370,7 @@ async def test_golden_asymmetry_renew_never_blocked_by_open_circuit_breaker() ->
     with pytest.raises(StreamLeaseUnavailable):
         await manager.acquire("u3")
 
-    assert manager.circuit_breaker.state == CircuitState.OPEN
+    assert manager.circuit_state == CircuitState.OPEN
 
     # Breaker is OPEN. New acquire fails fast without network
     with pytest.raises(StreamLeaseUnavailable, match="Circuit breaker is OPEN"):
@@ -384,8 +384,8 @@ async def test_golden_asymmetry_renew_never_blocked_by_open_circuit_breaker() ->
     renew_ok = await manager.renew(lease)
     assert renew_ok is True
     # The successful renew called Redis AND healed the breaker!
-    assert manager.circuit_breaker.state == CircuitState.CLOSED
-    assert manager.circuit_breaker.consecutive_failures == 0
+    assert manager.circuit_state == CircuitState.CLOSED
+    assert manager._circuit_breaker.consecutive_failures == 0
 
 
 @pytest.mark.asyncio
@@ -399,13 +399,13 @@ async def test_manager_renew_failure_records_circuit_breaker_failure() -> None:
     manager = StreamLeaseManager(redis=mock_redis, config=config)
 
     lease = await manager.acquire("u1")
-    assert manager.circuit_breaker.consecutive_failures == 0
+    assert manager._circuit_breaker.consecutive_failures == 0
 
     mock_redis.eval.side_effect = redis.exceptions.ConnectionError("Renew failed")
     with pytest.raises(StreamLeaseUnavailable):
         await manager.renew(lease)
 
-    assert manager.circuit_breaker.consecutive_failures == 1
+    assert manager._circuit_breaker.consecutive_failures == 1
 
 
 @pytest.mark.asyncio
@@ -422,12 +422,12 @@ async def test_manager_release_with_circuit_breaker() -> None:
 
     # Release success
     await manager.release(lease)
-    assert manager.circuit_breaker.consecutive_failures == 0
+    assert manager._circuit_breaker.consecutive_failures == 0
 
     # Release network failure
     mock_redis.eval.side_effect = redis.exceptions.ConnectionError("Release failed")
     await manager.release(lease)
-    assert manager.circuit_breaker.consecutive_failures == 1
+    assert manager._circuit_breaker.consecutive_failures == 1
 
 
 @pytest.mark.asyncio
@@ -443,18 +443,18 @@ async def test_manager_get_active_count_circuit_breaker() -> None:
     # Success path
     count = await manager.get_active_count("u1")
     assert count == 5
-    assert manager.circuit_breaker.consecutive_failures == 0
+    assert manager._circuit_breaker.consecutive_failures == 0
 
     # Network failure path
     mock_redis.eval.side_effect = redis.exceptions.ConnectionError("Count failed")
     with pytest.raises(StreamLeaseUnavailable):
         await manager.get_active_count("u1")
-    assert manager.circuit_breaker.consecutive_failures == 1
+    assert manager._circuit_breaker.consecutive_failures == 1
 
     # Trip breaker to OPEN
     with pytest.raises(StreamLeaseUnavailable):
         await manager.get_active_count("u1")
-    assert manager.circuit_breaker.state == CircuitState.OPEN
+    assert manager.circuit_state == CircuitState.OPEN
 
     # Breaker is OPEN -> fast-fails without network call
     eval_call_count_before = mock_redis.eval.call_count
@@ -783,11 +783,12 @@ async def test_manager_half_open_acquire_429_heals_breaker() -> None:
     manager = StreamLeaseManager(redis=mock_redis, config=config)
 
     # Trip breaker
-    manager.circuit_breaker.record_failure(redis.exceptions.ConnectionError("trip"))
-    assert manager.circuit_breaker.state == CircuitState.OPEN
+    assert manager._circuit_breaker is not None
+    manager._circuit_breaker.record_failure(redis.exceptions.ConnectionError("trip"))
+    assert manager.circuit_state == CircuitState.OPEN
 
     await asyncio.sleep(0.015)
-    assert manager.circuit_breaker.state == CircuitState.HALF_OPEN
+    assert manager.circuit_state == CircuitState.HALF_OPEN
 
     # Acquire returns 429
     with pytest.raises(StreamLeaseRejected) as exc_info:
@@ -795,8 +796,8 @@ async def test_manager_half_open_acquire_429_heals_breaker() -> None:
     assert exc_info.value.reason == "user_limit"
 
     # Backend was reachable! Breaker MUST be healed to CLOSED!
-    assert manager.circuit_breaker.state == CircuitState.CLOSED
-    assert manager.circuit_breaker.consecutive_failures == 0
+    assert manager.circuit_state == CircuitState.CLOSED
+    assert manager._circuit_breaker.consecutive_failures == 0
 
 
 @pytest.mark.asyncio
@@ -812,9 +813,10 @@ async def test_manager_half_open_acquire_cancellation_releases_probe() -> None:
     manager = StreamLeaseManager(redis=mock_redis, config=config)
 
     # Trip breaker
-    manager.circuit_breaker.record_failure(redis.exceptions.ConnectionError("trip"))
+    assert manager._circuit_breaker is not None
+    manager._circuit_breaker.record_failure(redis.exceptions.ConnectionError("trip"))
     await asyncio.sleep(0.015)
-    assert manager.circuit_breaker.state == CircuitState.HALF_OPEN
+    assert manager.circuit_state == CircuitState.HALF_OPEN
 
     with pytest.raises(asyncio.CancelledError):
         await manager.acquire("u1")
@@ -823,7 +825,7 @@ async def test_manager_half_open_acquire_cancellation_releases_probe() -> None:
     mock_redis.eval = AsyncMock(return_value=1)
     lease = await manager.acquire("u2")
     assert lease.lease_id is not None
-    assert manager.circuit_breaker.state == CircuitState.CLOSED
+    assert manager.circuit_state == CircuitState.CLOSED
 
 
 @pytest.mark.asyncio
@@ -839,8 +841,9 @@ async def test_manager_open_renew_zero_heals_breaker() -> None:
     lease = await manager.acquire("u1")
 
     # Trip breaker to OPEN
-    manager.circuit_breaker.record_failure(redis.exceptions.ConnectionError("trip"))
-    assert manager.circuit_breaker.state == CircuitState.OPEN
+    assert manager._circuit_breaker is not None
+    manager._circuit_breaker.record_failure(redis.exceptions.ConnectionError("trip"))
+    assert manager.circuit_state == CircuitState.OPEN
 
     # Renew returns 0 (lease expired/evicted in Redis)
     mock_redis.eval.side_effect = None
@@ -850,5 +853,5 @@ async def test_manager_open_renew_zero_heals_breaker() -> None:
     assert renew_ok is False
 
     # Redis answered and executed script -> breaker MUST be healed to CLOSED!
-    assert manager.circuit_breaker.state == CircuitState.CLOSED
-    assert manager.circuit_breaker.consecutive_failures == 0
+    assert manager.circuit_state == CircuitState.CLOSED
+    assert manager._circuit_breaker.consecutive_failures == 0

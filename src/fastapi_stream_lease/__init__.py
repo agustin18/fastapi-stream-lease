@@ -3,6 +3,7 @@ from __future__ import annotations
 from fastapi_stream_lease.circuit_breaker import (
     BackendFailurePolicy,
     CircuitBreakerConfig,
+    CircuitState,
     FallbackMode,
 )
 from fastapi_stream_lease.config import LeaseConfig
@@ -21,6 +22,7 @@ __version__ = "0.3.0"
 __all__ = [
     "BackendFailurePolicy",
     "CircuitBreakerConfig",
+    "CircuitState",
     "ConfigurationMismatchError",
     "FallbackMode",
     "LeaseConfig",

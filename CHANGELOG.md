@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.3.0 — 2026-09-28
+
+- **Adaptive Circuit Breaker & Thundering Herd Protection**: Added production-grade circuit breaker (`CircuitBreakerConfig`, `CircuitState`, `BackendFailurePolicy`) safeguarding Redis backends during outages, Sentinel failovers, and network partitions. Features state transitions (`CLOSED`, `OPEN`, `HALF_OPEN`), bounded probe concurrency (`half_open_max_probes`), jittered exponential recovery backoff, and fast-failing with `StreamLeaseUnavailable` or graceful fallback under `FallbackMode.FAIL_OPEN`.
+- **Golden Asymmetry & Epoch-Based RAII Permits**: Active stream renewals bypass circuit breaker open states to prioritize existing connections over new requests. Successful renewals or reachable backend probes immediately heal the breaker to `CLOSED`. Generation-tracked RAII permits (`CircuitPermit`) ensure cancellation and async timeout safety without leaking half-open probe slots or corrupting state across epochs.
+- **Strict Exception Classification**: Refined transient classification to exclude deterministic configuration, pool, and auth failures (`MaxConnectionsError`, `AuthenticationError`, `AuthorizationError`, `ExternalAuthProviderError`, `ClusterCrossSlotError`), while preserving transient handling for `ReadOnlyError`, `ClusterDownError`, and nested `RedisClusterException` network causes across `redis-py` 5.0.0 through 5.2+.
+- **Encapsulated Circuit State API**: Publicly exported `CircuitState` enum (`CLOSED`, `OPEN`, `HALF_OPEN`) from package root and exposed read-only `manager.circuit_state` property on `StreamLeaseManager`, keeping internal breaker mechanics and mutability cleanly encapsulated.
+- **Cluster Configuration Fingerprinting for Failure Policy**: Integrated `BackendFailurePolicy` and circuit breaker parameters into atomic startup fingerprint verification (`verify_cluster_config`), preventing configuration drift across distributed worker nodes.
+- **Observability Adapters (Prometheus & OpenTelemetry)**: Added production-ready observability integrations and examples with standardized metric labels for acquire latency, active stream counts, reject reasons (`user_limit`, `global_limit`, `circuit_open`), lease renewals, and backend reachability.
+- **Production Benchmark & Soak Harnesses**: Added reproducible benchmark scripts (`scripts/benchmark.py`) and soak testing tools (`scripts/soak_test.py`) validating low-latency performance ($O(1)$ Lua operations) and zero memory or task leaks under sustained concurrency.
+- **Nightly Chaos & Matrix Verification**: Introduced automated continuous chaos testing across Redis Sentinel and 6-node Redis Cluster topologies validating zero stream drops and self-healing under primary crashes.
+
 ## 0.2.0 — 2026-09-27
 
 - **6-Node Redis Cluster Validation & Chaos Resilience Suite**: Added end-to-end integration and chaos failover test suite running against a production-grade 6-node Redis Cluster (3 masters, 3 replicas, 16,384 hash slots) verifying zero stream drops across live primary promotions and transparent recovery from `MOVED` redirections.
