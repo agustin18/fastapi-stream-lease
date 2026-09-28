@@ -111,6 +111,9 @@ async def run_soak(
         key_prefix=f"soak_{run_uuid}",
     )
     manager = StreamLeaseManager(redis=client, config=config)
+    # Dedicated monitor client to isolate observation queries from streaming traffic
+    monitor_client = redis.from_url(redis_url, max_connections=10)
+    monitor_manager = StreamLeaseManager(redis=monitor_client, config=config)
 
     print("=" * 70)
     print("FASTAPI-STREAM-LEASE SUSTAINED SOAK & RESOURCE PLATEAU BENCHMARK")
@@ -229,7 +232,7 @@ async def run_soak(
             cur_rss = get_current_rss_kb()
             cur_tasks = len(asyncio.all_tasks())
             try:
-                cur_redis_leases = await manager.get_active_count()
+                cur_redis_leases = await monitor_manager.get_active_count()
             except Exception:
                 cur_redis_leases = -1
             samples.append(
@@ -260,7 +263,7 @@ async def run_soak(
         cur_rss = get_current_rss_kb()
         cur_tasks = len(asyncio.all_tasks())
         try:
-            cur_redis = await manager.get_active_count()
+            cur_redis = await monitor_manager.get_active_count()
         except Exception:
             cur_redis = -1
         print(
@@ -311,10 +314,12 @@ async def run_soak(
             total_ghost_leases += await client.zcard(k)
 
     await manager.close(drain=True)
+    await monitor_manager.close(drain=False)
     # Wipe any keys after measurement
     if remaining_keys:
         await client.delete(*remaining_keys)
     await client.aclose()
+    await monitor_client.aclose()
 
     zero_ghost_leases = total_ghost_leases == 0
     zero_residual_keys = len(remaining_keys) == 0

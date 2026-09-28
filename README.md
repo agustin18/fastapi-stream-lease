@@ -278,6 +278,15 @@ Therefore, **an `OPEN` circuit breaker never blocks renewal attempts**. Active s
   await manager.verify_cluster_config(strict=True)
   ```
   During transient Redis reconnects or Sentinel master elections (which typically resolve in 1–3 seconds), `verify_cluster_config()` retries across a short bounded window (`retry_attempts=3`, `retry_delay=0.1s` by default). If the coordination backend remains unavailable past all retries, `strict=True` raises `StreamLeaseUnavailable` to trigger fail-fast container exit so Kubernetes restarts the container or does not route traffic to unverified pods.
+- **Redis Connection Pool Sizing (High Concurrency & Fan-Out):**
+  In modern `redis-py` (v8.1+), the default asynchronous `ConnectionPool` caps capacity to `max_connections=100` if not explicitly specified. In high-concurrency streaming services (handling hundreds of concurrent active SSE or WebSocket streams with periodic background auto-renewals and simultaneous client disconnections), ensure your Redis client connection pool is sized adequately to prevent client-side `MaxConnectionsError`:
+  ```python
+  import redis.asyncio as redis
+
+  # Size max_connections to accommodate peak concurrent streams and renewals
+  pool = redis.ConnectionPool.from_url("redis://localhost:6379/0", max_connections=500)
+  client = redis.Redis.from_pool(pool)
+  ```
 
 ### Changing Cluster Configuration Safely
 
