@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from math import isfinite
 from typing import Any
 
+from fastapi_stream_lease.circuit_breaker import BackendFailurePolicy, FallbackMode
+
 
 @dataclass(frozen=True)
 class LeaseConfig:
@@ -45,7 +47,17 @@ class LeaseConfig:
     hook_queue_size: int = 1024
     """Maximum capacity of the background hook queue before dropping telemetry events."""
 
+    failure_policy: BackendFailurePolicy | None = None
+    """Encapsulated failure degradation policy and circuit breaker configuration."""
+
     def __post_init__(self) -> None:
+        if self.failure_policy is None:
+            mode = FallbackMode.FAIL_OPEN if self.fail_open else FallbackMode.FAIL_CLOSED
+            object.__setattr__(self, "failure_policy", BackendFailurePolicy(fallback_mode=mode))
+        else:
+            object.__setattr__(
+                self, "fail_open", self.failure_policy.fallback_mode == FallbackMode.FAIL_OPEN
+            )
         if not isfinite(self.lease_seconds) or self.lease_seconds <= 0:
             raise ValueError("lease_seconds must be finite and greater than 0")
         if self.max_per_user < 0:

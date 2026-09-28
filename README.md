@@ -155,6 +155,63 @@ When `fail_open=True` is enabled in `LeaseConfig`, the manager grants fallback l
 - **Local Time Basis:** Fallback leases use `time.monotonic()` locally and are isolated to the executing worker process.
 - **No Retroactive Registration:** Active fallback leases do not attempt retroactive registration into Redis when connectivity returns. They complete locally and release normally.
 
+## Backend Failure Policy & Worker-Local Circuit Breaker
+
+During sustained Redis outages, network partitions, or slow master failovers, repeatedly sending requests to an unreachable backend wastes event-loop time, fills connection pools, and increases application latency. `fastapi-stream-lease` provides an opt-in, worker-local circuit breaker and failure degradation policy to protect your event loops.
+
+```python
+from fastapi_stream_lease import (
+    BackendFailurePolicy,
+    CircuitBreakerConfig,
+    FallbackMode,
+    LeaseConfig,
+    StreamLeaseManager,
+)
+
+policy = BackendFailurePolicy(
+    fallback_mode=FallbackMode.FAIL_CLOSED,  # Or FallbackMode.FAIL_OPEN
+    circuit_breaker=CircuitBreakerConfig(
+        failure_threshold=5,  # Consecutive transient errors before tripping OPEN
+        recovery_timeout=10.0,  # Base cooldown seconds before HALF_OPEN testing
+        jitter=1.0,  # Random uniform jitter added to recovery window
+        half_open_max_probes=1,  # Max concurrent probe requests allowed in HALF_OPEN
+    ),
+)
+
+config = LeaseConfig(
+    max_per_user=2,
+    max_global=100,
+    lease_seconds=30.0,
+    failure_policy=policy,
+)
+manager = StreamLeaseManager(redis=client, config=config)
+```
+
+### Circuit Breaker States & Transitions
+
+1. **`CLOSED` (Normal Operation):** All requests proceed to Redis. Transient network/timeout errors increment consecutive failure counters. Non-transient errors (such as authentication or configuration errors) and local connection pool exhaustion (`MaxConnectionsError`) are ignored.
+2. **`OPEN` (Fast-Failing):** When consecutive transient errors reach `failure_threshold`, the circuit breaker trips to `OPEN`. For the duration of `recovery_timeout + uniform(0, jitter)`:
+   - If `fallback_mode=FAIL_CLOSED`: `acquire()` immediately raises `StreamLeaseUnavailable` (`HTTP 503 Service Unavailable`) without attempting any network I/O.
+   - If `fallback_mode=FAIL_OPEN`: `acquire()` immediately grants an in-memory fallback lease without touching Redis.
+3. **`HALF_OPEN` (Controlled Probing):** When the recovery cooldown elapses, the breaker admits up to `half_open_max_probes` concurrent trial requests to test backend health:
+   - If a probe successfully communicates with Redis, the backend is proven reachable: the circuit immediately heals back to `CLOSED`, resetting all failure counters. (Note: rate-limiting outcomes such as HTTP 429 `StreamLeaseRejected` still prove the backend is healthy and heal the circuit).
+   - If a probe encounters a transient error, the circuit immediately trips back to `OPEN` with a fresh recovery timeout and jitter.
+   - If a probe is cancelled (`asyncio.CancelledError`) or encounters an unhandled non-transient error, RAII probe tracking automatically releases the probe slot so subsequent requests can test recovery without getting stuck.
+
+### The Golden Asymmetry: Renewals Never Block
+
+Acquisition (`acquire()`) and renewal (`renew()`) have asymmetric failure costs:
+- **`acquire()`** creates new concurrency. Fast-failing an acquire protects the backend from additional load during an outage.
+- **`renew()`** protects existing, active streams. If an active stream misses renewals for `lease_seconds`, it is terminated.
+
+Therefore, **an `OPEN` circuit breaker never blocks renewal attempts**. Active streams continue attempting renewals during their remaining TTL (Adaptive Grace Period). If Redis recovers before lease TTL expires, the first successful renewal immediately heals the circuit breaker back to `CLOSED`, allowing subsequent acquisitions to resume seamlessly for that manager instance.
+
+### Architecture & Anti-Herd Mitigations
+
+- **Worker-Local Semantics:** State is maintained in-memory per `StreamLeaseManager` instance. There is zero distributed coordination in Redis to manage circuit breaker state, eliminating circular dependencies (we never ask Redis whether Redis is alive).
+- **Probabilistic Herd Mitigation:** `half_open_max_probes` limits probe concurrency per `StreamLeaseManager` instance. Random recovery jitter (`recovery_timeout + uniform(0, jitter)`) statistically desynchronizes probe attempts across multi-worker clusters, preventing thundering herd spikes when Redis recovers.
+- **Cluster Fingerprint Compatibility:** Circuit breaker settings are worker-local operational tuning parameters. They are not part of the shared Redis canonical configuration fingerprint (`{prefix}:config`), allowing rolling tuning changes across workers without configuration mismatch errors.
+
 ## Production and Operational Guide
 
 - **Redis Client Timeouts:** Always configure explicit timeouts on your Redis client (e.g. `socket_timeout=1.0, socket_connect_timeout=1.0`). Without timeouts, an unreachable Redis instance can block asyncio event loop execution indefinitely.

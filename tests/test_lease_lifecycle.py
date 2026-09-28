@@ -488,10 +488,14 @@ async def test_manager_non_network_errors_in_renew_release_and_count(lease_manag
         ("SlotNotCoveredError", True),
         ("TryAgainError", True),
         ("ClusterError", True),
-        (ConnectionResetError, True),
-        (asyncio.TimeoutError, True),
-        (OSError, True),
+        (ConnectionError, True),
+        (OSError, False),
         ("ClusterCrossSlotError", False),
+        ("CrossSlotTransactionError", False),
+        ("InvalidPipelineStack", False),
+        ("MaxConnectionsError", False),
+        ("ExternalAuthProviderError", False),
+        ("RedisClusterException", False),
         (redis.exceptions.AuthenticationError, False),
         ("AuthorizationError", False),
         (redis.exceptions.ResponseError, False),
@@ -510,6 +514,30 @@ def test_is_network_error_helper(exc_class_or_name, expected):
 
     exc = exc_cls() if exc_cls is asyncio.TimeoutError else exc_cls("test error")
     assert is_network_error(exc) is expected
+
+
+def test_redis_cluster_exception_with_cause() -> None:
+    from fastapi_stream_lease.manager import is_network_error
+
+    cluster_exc_cls = getattr(redis.exceptions, "RedisClusterException", None)
+    if cluster_exc_cls is None:
+        pytest.skip("RedisClusterException not available in this redis-py version")
+
+    # Bare cluster exception without transient cause -> False (e.g. cross-slot, programming bug)
+    bare_exc = cluster_exc_cls("EVAL - all keys must map to the same key slot")
+    assert is_network_error(bare_exc) is False
+
+    # Cluster exception caused by underlying transient error -> True
+    conn_cause = ConnectionError("Connection refused")
+    wrapped_conn = cluster_exc_cls("Cannot connect to cluster")
+    wrapped_conn.__cause__ = conn_cause
+    assert is_network_error(wrapped_conn) is True
+
+    # Cluster exception caused by non-transient error -> False
+    auth_cause = redis.exceptions.AuthenticationError("Auth failure")
+    wrapped_auth = cluster_exc_cls("Auth failed on cluster node")
+    wrapped_auth.__cause__ = auth_cause
+    assert is_network_error(wrapped_auth) is False
 
 
 def test_safe_uncancel_edge_cases(monkeypatch):
