@@ -111,7 +111,7 @@ class PrometheusMetrics:
                 "Last observed state of the worker-local circuit breaker during manager "
                 "activity (0=closed, 1=half_open, 2=open)."
             ),
-            ["prefix"],
+            ["scope"],
             registry=self.registry,
         )
 
@@ -121,7 +121,7 @@ class PrometheusMetrics:
                 "Total backend calls prevented from reaching Redis because the circuit "
                 "breaker denied a permit."
             ),
-            ["operation", "state", "prefix"],
+            ["operation", "state", "scope"],
             registry=self.registry,
         )
         self.circuit_short_circuited_total = self.short_circuited_total
@@ -176,7 +176,7 @@ class PrometheusMetrics:
     ) -> None:
         """Record the current circuit breaker state on the Prometheus gauge."""
         c_state = coerce_circuit_state(state)
-        self.circuit_state.labels(prefix=str(scope)).set(float(CIRCUIT_STATE_NUMERIC[c_state]))
+        self.circuit_state.labels(scope=str(scope)).set(float(CIRCUIT_STATE_NUMERIC[c_state]))
 
     def record_short_circuit(
         self,
@@ -190,7 +190,7 @@ class PrometheusMetrics:
         self.short_circuited_total.labels(
             operation=op_enum.value,
             state=st_enum.value,
-            prefix=str(scope),
+            scope=str(scope),
         ).inc()
 
     def trace_operation(self, operation: Operation | str) -> AbstractContextManager[Any]:

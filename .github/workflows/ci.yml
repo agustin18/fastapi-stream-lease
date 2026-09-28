@@ -236,6 +236,22 @@ jobs:
       - name: Run test suite with redis-py 5.0.0 floor
         run: uv run --no-sync --python 3.12 pytest -o addopts=''
 
+  test-fastapi-min:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      - name: Set up Python 3.10
+        run: uv python install 3.10
+      - name: Install dependencies with minimum FastAPI & Starlette floor
+        run: |
+          uv sync --locked --extra dev --python 3.10
+          uv pip install "fastapi==0.100.0" "starlette==0.27.0"
+          uv run --no-sync --python 3.10 python -c 'import fastapi, starlette; assert fastapi.__version__ == "0.100.0"; assert starlette.__version__ == "0.27.0"'
+      - name: Run FastAPI integration test suite with floor dependencies
+        run: uv run --no-sync --python 3.10 pytest -o addopts='' tests/test_fastapi_integration.py -v
+
   test-cluster:
     runs-on: ubuntu-latest
     steps:

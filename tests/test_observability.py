@@ -787,19 +787,18 @@ async def test_prometheus_circuit_breaker_metrics() -> None:
     # Initial state gauge value with default scope
     metrics.record_circuit_state(CircuitState.CLOSED)
     assert (
-        registry.get_sample_value("fastapi_stream_lease_circuit_state", {"prefix": "default"})
-        == 0.0
+        registry.get_sample_value("fastapi_stream_lease_circuit_state", {"scope": "default"}) == 0.0
     )
 
     metrics.record_circuit_state(CircuitState.HALF_OPEN, scope="custom_prefix")
     assert (
-        registry.get_sample_value("fastapi_stream_lease_circuit_state", {"prefix": "custom_prefix"})
+        registry.get_sample_value("fastapi_stream_lease_circuit_state", {"scope": "custom_prefix"})
         == 1.0
     )
 
     metrics.record_circuit_state("open", scope="custom_prefix")
     assert (
-        registry.get_sample_value("fastapi_stream_lease_circuit_state", {"prefix": "custom_prefix"})
+        registry.get_sample_value("fastapi_stream_lease_circuit_state", {"scope": "custom_prefix"})
         == 2.0
     )
 
@@ -809,14 +808,14 @@ async def test_prometheus_circuit_breaker_metrics() -> None:
     assert (
         registry.get_sample_value(
             "fastapi_stream_lease_short_circuited_total",
-            {"operation": "acquire", "state": "open", "prefix": "custom_prefix"},
+            {"operation": "acquire", "state": "open", "scope": "custom_prefix"},
         )
         == 1.0
     )
     assert (
         registry.get_sample_value(
             "fastapi_stream_lease_short_circuited_total",
-            {"operation": "count", "state": "half_open", "prefix": "custom_prefix"},
+            {"operation": "count", "state": "half_open", "scope": "custom_prefix"},
         )
         == 1.0
     )
@@ -846,7 +845,7 @@ async def test_manager_circuit_breaker_metrics_integration(fake_redis) -> None:
 
     # Initially CLOSED
     assert (
-        registry.get_sample_value("fastapi_stream_lease_circuit_state", {"prefix": "stream_lease"})
+        registry.get_sample_value("fastapi_stream_lease_circuit_state", {"scope": "stream_lease"})
         == 0.0
     )
 
@@ -857,7 +856,7 @@ async def test_manager_circuit_breaker_metrics_integration(fake_redis) -> None:
 
     # Circuit breaker tripped to OPEN: gauge must be 2.0
     assert (
-        registry.get_sample_value("fastapi_stream_lease_circuit_state", {"prefix": "stream_lease"})
+        registry.get_sample_value("fastapi_stream_lease_circuit_state", {"scope": "stream_lease"})
         == 2.0
     )
 
@@ -868,7 +867,7 @@ async def test_manager_circuit_breaker_metrics_integration(fake_redis) -> None:
     assert (
         registry.get_sample_value(
             "fastapi_stream_lease_short_circuited_total",
-            {"operation": "acquire", "state": "open", "prefix": "stream_lease"},
+            {"operation": "acquire", "state": "open", "scope": "stream_lease"},
         )
         == 1.0
     )
@@ -880,7 +879,7 @@ async def test_manager_circuit_breaker_metrics_integration(fake_redis) -> None:
     assert (
         registry.get_sample_value(
             "fastapi_stream_lease_short_circuited_total",
-            {"operation": "count", "state": "open", "prefix": "stream_lease"},
+            {"operation": "count", "state": "open", "scope": "stream_lease"},
         )
         == 1.0
     )
@@ -915,25 +914,25 @@ async def test_multi_manager_shared_metrics_scoping_no_collision(fake_redis) -> 
 
     # Manager heavy is OPEN (2.0)
     assert (
-        registry.get_sample_value("fastapi_stream_lease_circuit_state", {"prefix": "llm_heavy"})
+        registry.get_sample_value("fastapi_stream_lease_circuit_state", {"scope": "llm_heavy"})
         == 2.0
     )
 
     # Manager light remains CLOSED (0.0) without collision!
     assert (
-        registry.get_sample_value("fastapi_stream_lease_circuit_state", {"prefix": "llm_light"})
+        registry.get_sample_value("fastapi_stream_lease_circuit_state", {"scope": "llm_light"})
         == 0.0
     )
 
     # Acquire on light succeeds and reinforces CLOSED state
     lease_l = await manager_light.acquire("user_l")
     assert (
-        registry.get_sample_value("fastapi_stream_lease_circuit_state", {"prefix": "llm_light"})
+        registry.get_sample_value("fastapi_stream_lease_circuit_state", {"scope": "llm_light"})
         == 0.0
     )
     # Heavy still remains OPEN (2.0)
     assert (
-        registry.get_sample_value("fastapi_stream_lease_circuit_state", {"prefix": "llm_heavy"})
+        registry.get_sample_value("fastapi_stream_lease_circuit_state", {"scope": "llm_heavy"})
         == 2.0
     )
 
@@ -1028,14 +1027,14 @@ async def test_multi_manager_shared_prefix_isolated_by_telemetry_scope(fake_redi
     # Verify state for worker_alpha is OPEN (2)
     val_alpha = reg.get_sample_value(
         "fastapi_stream_lease_circuit_state",
-        {"prefix": "worker_alpha"},
+        {"scope": "worker_alpha"},
     )
     assert val_alpha == 2
 
     # Verify state for worker_beta remains CLOSED (0)
     val_beta = reg.get_sample_value(
         "fastapi_stream_lease_circuit_state",
-        {"prefix": "worker_beta"},
+        {"scope": "worker_beta"},
     )
     assert val_beta == 0
 

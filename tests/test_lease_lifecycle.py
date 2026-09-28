@@ -1532,6 +1532,64 @@ async def test_wrap_stream_close_source_global_budget_exhaustion(fake_redis) -> 
     await manager.close()
 
 
+@pytest.mark.asyncio
+async def test_wrap_stream_close_source_synchronous_blocking_aclose_timed_out(
+    fake_redis,
+) -> None:
+    """CRITICAL P2 AUDIT TEST (UP-R3-01):
+    Verifies that a synchronous blocking aclose() method is offloaded from the event loop
+    and bounded by upstream_cleanup_timeout, preventing worker event-loop starvation.
+    """
+    config = LeaseConfig(lease_seconds=5.0, upstream_cleanup_timeout=0.05)
+    manager = StreamLeaseManager(fake_redis, config=config)
+
+    class SyncBlockingAcloseStream:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise StopAsyncIteration
+
+        def aclose(self):
+            # Blocking synchronous work disguised as aclose()
+            time.sleep(0.5)
+
+    lease = await manager.acquire("user_sync_aclose_block")
+    wrapped = lease.wrap(SyncBlockingAcloseStream(), auto_renew=False, close_source=True)
+
+    t0 = time.monotonic()
+    async for _ in wrapped:
+        pass
+    elapsed = time.monotonic() - t0
+
+    # Must complete near timeout (e.g. < 0.35s), NOT 0.5s
+    assert elapsed < 0.35
+    assert await manager.get_active_count("user_sync_aclose_block") == 0
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_release_task_universal_anyio_shielding(lease_manager) -> None:
+    """CRITICAL P2 AUDIT TEST (UP-R3-03):
+    Verifies that StreamLease._await_release_task is universally protected against
+    AnyIO-level cancellation scopes in standalone lease usage.
+    """
+    import anyio
+
+    lease = await lease_manager.acquire("user_anyio_universal")
+    assert await lease_manager.get_active_count("user_anyio_universal") == 1
+
+    # Cancelled AnyIO scope calling lease.release()
+    with anyio.CancelScope() as scope:
+        scope.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await lease.release()
+
+    # Even though AnyIO was cancelled, release completed in Redis without leaking
+    assert lease._is_released is True
+    assert await lease_manager.get_active_count("user_anyio_universal") == 0
+
+
 @pytest.mark.parametrize(
     "invalid_scope",
     [123, True, False, ["scope"]],
@@ -1619,4 +1677,38 @@ async def test_wrap_stream_close_source_sync_close_returning_coroutine(fake_redi
 
     assert cleaned_up is True
     assert await manager.get_active_count("user_sync_returning_coro") == 0
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_wrap_stream_close_source_sync_aclose_returning_coroutine(fake_redis) -> None:
+    """Verifies handling when a sync def aclose() method returns an awaitable coroutine."""
+    config = LeaseConfig(lease_seconds=5.0, upstream_cleanup_timeout=0.5)
+    manager = StreamLeaseManager(fake_redis, config=config)
+
+    cleaned_up = False
+
+    class SyncDefAcloseReturningCoroutine:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise StopAsyncIteration
+
+        def aclose(self):
+            # Sync function disguised as aclose returning an awaitable coroutine
+            async def _coro():
+                nonlocal cleaned_up
+                cleaned_up = True
+
+            return _coro()
+
+    lease = await manager.acquire("user_sync_aclose_returning_coro")
+    wrapped = lease.wrap(SyncDefAcloseReturningCoroutine(), auto_renew=False, close_source=True)
+
+    async for _ in wrapped:
+        pass
+
+    assert cleaned_up is True
+    assert await manager.get_active_count("user_sync_aclose_returning_coro") == 0
     await manager.close()

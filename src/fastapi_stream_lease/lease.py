@@ -4,7 +4,7 @@ import asyncio
 import inspect
 import logging
 import time
-from collections.abc import AsyncIterable, AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterable, AsyncIterator
 from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, TypeVar
@@ -73,10 +73,11 @@ async def _close_single_target(target: Any, timeout: float) -> None:  # noqa: AS
         try:
 
             async def _run_aclose() -> None:
-                if inspect.iscoroutinefunction(aclose):
+                if inspect.iscoroutinefunction(aclose) or isinstance(target, AsyncGenerator):
                     await asyncio.wait_for(aclose(), timeout=timeout)
                 else:
-                    res = aclose()
+                    # Sync or non-coroutine aclose offloaded to worker thread
+                    res = await asyncio.wait_for(asyncio.to_thread(aclose), timeout=timeout)
                     if inspect.isawaitable(res):
                         await asyncio.wait_for(res, timeout=timeout)
 
@@ -244,7 +245,11 @@ class StreamLease:
             await asyncio.shield(task)
         except asyncio.CancelledError:
             cancelled = True
-            await asyncio.wait({task})
+            if _has_anyio:
+                with anyio.CancelScope(shield=True):
+                    await asyncio.wait({task})
+            else:  # pragma: no cover
+                await asyncio.wait({task})
         finally:
             if cancelled:
                 raise asyncio.CancelledError()

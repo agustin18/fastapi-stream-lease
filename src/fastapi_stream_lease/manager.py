@@ -548,8 +548,8 @@ class StreamLeaseManager:
         Context manager for acquiring and safely releasing a stream lease for scoped
         executions (such as WebSockets, background tasks, or pub/sub loops).
 
-        For HTTP StreamingResponse (SSE / LLM tokens), use `lease = await acquire()`
-        and `return StreamingResponse(lease.wrap(...))` instead.
+        For HTTP StreamingResponse (SSE / LLM tokens), use `await manager.stream(...)`
+        or `return lease.as_streaming_response(...)` instead.
 
         Example:
             async with lease_manager.lease(user_id=42) as lease:

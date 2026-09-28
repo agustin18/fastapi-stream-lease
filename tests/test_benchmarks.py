@@ -215,6 +215,15 @@ def test_plateau_stability_criteria(
             True,
             False,
         ),
+        # Monitor starvation: expected >= 6 samples, but got < 3 samples (event loop frozen)
+        (
+            [
+                {"time_s": 0.0, "rss_kb": 35000},
+                {"time_s": 9.0, "rss_kb": 35500},
+            ],
+            True,
+            False,
+        ),
     ],
 )
 def test_evaluate_plateau_stability(
@@ -223,8 +232,12 @@ def test_evaluate_plateau_stability(
     expected_stable: bool,
 ) -> None:
     """Verify memory plateau evaluation with steady-state vs transient smoke discrimination."""
+    # When samples has 2 items with t=0 and t=9, pass expected_samples=10 to test starvation
+    expected_samples = 10 if len(samples) == 2 and samples[-1]["time_s"] == 9.0 else None
     stable, _slope, _abs_growth, _rel_growth = evaluate_plateau_stability(
-        samples, assert_plateau=assert_plateau
+        samples,
+        assert_plateau=assert_plateau,
+        expected_samples=expected_samples,
     )
     assert stable is expected_stable
 
