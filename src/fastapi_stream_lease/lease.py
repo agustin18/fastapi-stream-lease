@@ -37,8 +37,10 @@ class ProtectedStreamingResponse(_StarletteStreamingResponse):
         finally:
             aclose = getattr(self.body_iterator, "aclose", None)
             if callable(aclose):
-                with suppress(Exception):
-                    await aclose()
+                cleanup = aclose()
+                if inspect.isawaitable(cleanup):
+                    with suppress(Exception, asyncio.CancelledError):
+                        await asyncio.shield(cleanup)
 
 
 async def _close_single_target(target: Any, timeout: float) -> None:

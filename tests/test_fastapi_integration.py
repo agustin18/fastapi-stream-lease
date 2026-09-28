@@ -313,8 +313,19 @@ async def test_fastapi_real_asgi_client_disconnect_determinism(fastapi_app, leas
 
 
 @pytest.mark.asyncio
-async def test_protected_streaming_response_handles_body_without_aclose() -> None:
-    """Verifies ProtectedStreamingResponse safely completes when body_iterator lacks aclose."""
+@pytest.mark.parametrize(
+    "cleanup_mode",
+    [
+        "no_aclose",
+        "non_awaitable",
+        "raises_exception",
+        "raises_cancelled",
+    ],
+)
+async def test_protected_streaming_response_cleanup_variants(cleanup_mode: str) -> None:
+    """Verifies ProtectedStreamingResponse safely handles missing,
+    non-awaitable, erroring, and cancelled aclose calls.
+    """
     from fastapi_stream_lease import ProtectedStreamingResponse
 
     async def dummy_gen():
@@ -322,15 +333,30 @@ async def test_protected_streaming_response_handles_body_without_aclose() -> Non
 
     resp = ProtectedStreamingResponse(dummy_gen())
 
-    # Delete aclose if present or replace body_iterator with plain iterator
-    class PlainIter:
+    class MockIter:
         def __aiter__(self):
             return self
 
         async def __anext__(self):
             raise StopAsyncIteration
 
-    resp.body_iterator = PlainIter()
+    mock_iter = MockIter()
+    if cleanup_mode == "non_awaitable":
+        mock_iter.aclose = lambda: None  # type: ignore[attr-defined]
+    elif cleanup_mode == "raises_exception":
+
+        async def failing():
+            raise RuntimeError("cleanup failed")
+
+        mock_iter.aclose = failing  # type: ignore[attr-defined]
+    elif cleanup_mode == "raises_cancelled":
+
+        async def cancelling():
+            raise asyncio.CancelledError()
+
+        mock_iter.aclose = cancelling  # type: ignore[attr-defined]
+
+    resp.body_iterator = mock_iter
 
     scope = {
         "type": "http",
