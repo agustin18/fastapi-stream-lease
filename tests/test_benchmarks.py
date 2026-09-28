@@ -4,8 +4,13 @@ from __future__ import annotations
 
 import pytest
 
-from benchmarks.bench_soak import build_parser as build_soak_parser
-from benchmarks.bench_soak import compute_linear_slope
+from benchmarks.bench_soak import (
+    build_parser as build_soak_parser,
+)
+from benchmarks.bench_soak import (
+    compute_linear_slope,
+    evaluate_plateau_stability,
+)
 from benchmarks.bench_wrapper_overhead import (
     build_parser as build_overhead_parser,
 )
@@ -170,6 +175,61 @@ def test_plateau_stability_criteria(
 
 
 @pytest.mark.parametrize(
+    ("samples", "assert_plateau", "expected_stable"),
+    [
+        # Empty or single sample
+        ([], True, False),
+        ([], False, True),
+        ([{"time_s": 0.0, "rss_kb": 10240}], True, False),
+        ([{"time_s": 0.0, "rss_kb": 10240}], False, True),
+        # >= 6 samples: steady-state slope and growth evaluated on second half
+        (
+            [{"time_s": float(i), "rss_kb": 50000 + (10 * i)} for i in range(10)],
+            True,
+            True,
+        ),
+        # >= 6 samples: excessive steady-state slope (> 0.15 MB/s)
+        (
+            [{"time_s": float(i), "rss_kb": 50000 + (300 * i)} for i in range(10)],
+            True,
+            False,
+        ),
+        # < 6 samples: transient startup ramp with slope > 0.15 but bounded growth
+        (
+            [
+                {"time_s": 0.0, "rss_kb": 35000},
+                {"time_s": 1.0, "rss_kb": 38000},
+                {"time_s": 2.0, "rss_kb": 40000},
+                {"time_s": 3.0, "rss_kb": 41000},
+                {"time_s": 4.0, "rss_kb": 42000},
+            ],
+            True,
+            True,
+        ),
+        # < 6 samples: excessive absolute growth (> 15 MB)
+        (
+            [
+                {"time_s": 0.0, "rss_kb": 35000},
+                {"time_s": 2.0, "rss_kb": 55000},
+            ],
+            True,
+            False,
+        ),
+    ],
+)
+def test_evaluate_plateau_stability(
+    samples: list[dict[str, float]],
+    assert_plateau: bool,
+    expected_stable: bool,
+) -> None:
+    """Verify memory plateau evaluation with steady-state vs transient smoke discrimination."""
+    stable, _slope, _abs_growth, _rel_growth = evaluate_plateau_stability(
+        samples, assert_plateau=assert_plateau
+    )
+    assert stable is expected_stable
+
+
+@pytest.mark.parametrize(
     (
         "zero_ghosts",
         "zero_residual_keys",
@@ -287,17 +347,18 @@ def test_nightly_and_ci_cli_arguments_are_valid() -> None:
     assert parsed_ns.burst_duration == 15.0
     assert parsed_ns.assert_plateau is True
 
-    # Smoke soak invocation
-    smoke_soak_args = [
-        "--duration",
-        "5",
-        "--target-concurrency",
-        "10",
-        "--lease-seconds",
-        "4.0",
-        "--renew-interval",
-        "1.0",
-    ]
-    parsed_ss = soak_parser.parse_args(smoke_soak_args)
-    assert parsed_ss.duration == 5.0
-    assert parsed_ss.target_concurrency == 10
+    # Smoke soak invocation (supports both 5s smoke and 10s steady-state smoke)
+    for duration in ["5", "10"]:
+        smoke_soak_args = [
+            "--duration",
+            duration,
+            "--target-concurrency",
+            "10",
+            "--lease-seconds",
+            "4.0",
+            "--renew-interval",
+            "1.0",
+        ]
+        parsed_ss = soak_parser.parse_args(smoke_soak_args)
+        assert parsed_ss.duration == float(duration)
+        assert parsed_ss.target_concurrency == 10

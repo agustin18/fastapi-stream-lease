@@ -184,7 +184,7 @@ jobs:
             --noise-floor-ms 0.20
       - name: Smoke test soak workload
         run: |
-          uv run python benchmarks/bench_soak.py --duration 5 --target-concurrency 10 --lease-seconds 4.0 --renew-interval 1.0
+          uv run python benchmarks/bench_soak.py --duration 10 --target-concurrency 10 --lease-seconds 4.0 --renew-interval 1.0
 
   test-sentinel:
     runs-on: ubuntu-latest
