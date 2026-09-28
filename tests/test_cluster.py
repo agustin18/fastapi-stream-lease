@@ -657,7 +657,9 @@ async def test_cluster_circuit_breaker_failover_and_recovery():
         "REDIS_CLUSTER_NODES", "redis-cluster-1:7000,redis-cluster-2:7001,redis-cluster-3:7002"
     )
     first_node = nodes_env.split(",")[0].strip()
-    client = RedisCluster.from_url(f"redis://{first_node}", socket_timeout=0.5)
+    client = RedisCluster.from_url(
+        f"redis://{first_node}", socket_timeout=0.5, cluster_error_retry_attempts=0
+    )
     await wait_for_cluster_ready(client)
 
     cb_cfg = CircuitBreakerConfig(failure_threshold=2, recovery_timeout=5.0, jitter=0.0)
@@ -717,7 +719,7 @@ async def test_cluster_circuit_breaker_failover_and_recovery():
 
         # 5. Wait for paused node to wake up and cluster to stabilize
         await pause_task
-        await asyncio.sleep(1.0)
+        await asyncio.sleep(3.5)
         await wait_for_cluster_ready(client)
 
         # 6. Existing lease renewal attempts Redis (golden asymmetry) and heals breaker

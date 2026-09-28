@@ -764,27 +764,26 @@ async def test_sentinel_circuit_breaker_failover_and_recovery(sentinel_cluster):
     with suppress(Exception):
         await client.execute_command("WAIT", 1, 1000)
 
-    # Trigger forced failover
-    admin_conn = aioredis.from_url(f"redis://{first_sentinel_host}:{first_sentinel_port}")
-    try:
-        await admin_conn.execute_command("SENTINEL", "failover", service_name)
-    finally:
-        await safe_close_client(admin_conn)
-
-    # 2. While election is in progress, pause old master to ensure connection errors
+    # 2. Pause current master to trigger consecutive connection timeouts
     conn_old_master = aioredis.from_url(
         f"redis://{cur_master[0]}:{cur_master[1]}", socket_timeout=0.5
     )
-    try:
-        with suppress(Exception):
-            await conn_old_master.execute_command("DEBUG", "SLEEP", 2.5)
-    finally:
-        await safe_close_client(conn_old_master)
+
+    async def pause_node() -> None:
+        try:
+            await conn_old_master.execute_command("DEBUG", "SLEEP", 3.0)
+        except Exception:
+            pass
+        finally:
+            await safe_close_client(conn_old_master)
+
+    pause_task = asyncio.create_task(pause_node())
+    await asyncio.sleep(0.1)
 
     # 3. Consecutive acquires fail during outage and trip the breaker to OPEN
-    for _ in range(3):
+    for i in range(3):
         with suppress(StreamLeaseUnavailable):
-            await manager.acquire("user_cb_probe")
+            await manager.acquire(f"user_cb_probe_{i}")
 
     assert manager.circuit_breaker.state == CircuitState.OPEN
 
@@ -792,7 +791,14 @@ async def test_sentinel_circuit_breaker_failover_and_recovery(sentinel_cluster):
     with pytest.raises(StreamLeaseUnavailable, match="Circuit breaker is OPEN"):
         await manager.acquire("user_cb_fast_fail")
 
-    # 5. Wait for Sentinel to settle on promoted master
+    # 5. Trigger Sentinel failover to promote replica while old master is paused
+    admin_conn = aioredis.from_url(f"redis://{first_sentinel_host}:{first_sentinel_port}")
+    try:
+        await admin_conn.execute_command("SENTINEL", "failover", service_name)
+    finally:
+        await safe_close_client(admin_conn)
+
+    # Wait for Sentinel to settle on promoted master
     new_master = await wait_for_writable_master(sentinel, service_name, timeout=25.0)
     assert new_master != cur_master
 
@@ -805,5 +811,8 @@ async def test_sentinel_circuit_breaker_failover_and_recovery(sentinel_cluster):
     # 7. Subsequent acquire succeeds against new master
     lease2 = await manager.acquire("user_cb_recovered")
     assert lease2.lease_id is not None
+    await lease.release()
+    await lease2.release()
     await manager.close()
     await safe_close_client(client)
+    await pause_task
