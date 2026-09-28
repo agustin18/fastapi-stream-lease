@@ -14,12 +14,17 @@ from redis.asyncio.sentinel import Sentinel
 from redis.exceptions import ConnectionError
 
 from fastapi_stream_lease import (
+    BackendFailurePolicy,
+    CircuitBreakerConfig,
     ConfigurationMismatchError,
+    FallbackMode,
     LeaseConfig,
     StreamLease,
     StreamLeaseLost,
     StreamLeaseManager,
+    StreamLeaseUnavailable,
 )
+from fastapi_stream_lease.circuit_breaker import CircuitState
 
 pytestmark = pytest.mark.skipif(
     not os.environ.get("REDIS_SENTINEL_HOSTS"),
@@ -710,5 +715,95 @@ async def test_sentinel_mock_outage_exceeding_lease_ttl_terminates_stream(sentin
             manager.redis.eval = AsyncMock(side_effect=ConnectionError("Master unreachable"))
             await asyncio.sleep(1.5)
 
+    await manager.close()
+    await safe_close_client(client)
+
+
+@pytest.mark.asyncio
+async def test_sentinel_circuit_breaker_failover_and_recovery(sentinel_cluster):
+    """
+    Verify circuit breaker integration under real Redis Sentinel failover:
+    1. Acquire a lease using manager with circuit breaker enabled (failure_threshold=2).
+    2. Induce failover / master outage by pausing master node.
+    3. Consecutive acquire failures record transient errors and trip breaker to OPEN.
+    4. Subsequent acquire fails fast with StreamLeaseUnavailable without hitting Redis.
+    5. Meanwhile, renewing existing lease continues attempting Redis (golden asymmetry).
+    6. Once failover settles and new master is elected, renewal succeeds and
+       heals breaker to CLOSED.
+    7. Subsequent acquire succeeds against the new master.
+    """
+    sentinel = sentinel_cluster["sentinel"]
+    service_name = sentinel_cluster["service_name"]
+
+    await wait_for_sentinel_settled(sentinel, sentinel_cluster["sentinel_hosts"], service_name)
+    client = sentinel.master_for(service_name, socket_timeout=0.5)
+    await client.ping()
+
+    cb_cfg = CircuitBreakerConfig(failure_threshold=2, recovery_timeout=5.0, jitter=0.0)
+    policy = BackendFailurePolicy(fallback_mode=FallbackMode.FAIL_CLOSED, circuit_breaker=cb_cfg)
+    prefix = f"sentinel_cb_{uuid4().hex[:8]}"
+    config = LeaseConfig(
+        lease_seconds=15.0,
+        max_per_user=2,
+        max_global=10,
+        key_prefix=prefix,
+        failure_policy=policy,
+    )
+    manager = StreamLeaseManager(redis=client, config=config)
+
+    # 1. Acquire initial active lease while master is healthy
+    lease = await manager.acquire("user_cb")
+    assert manager.circuit_breaker is not None
+    assert manager.circuit_breaker.state == CircuitState.CLOSED
+
+    # Discover current topology
+    cur_master = await sentinel.discover_master(service_name)
+    first_sentinel_host, first_sentinel_port = sentinel_cluster["sentinel_hosts"][0]
+
+    # Flush replication to replica so lease survives failover
+    with suppress(Exception):
+        await client.execute_command("WAIT", 1, 1000)
+
+    # Trigger forced failover
+    admin_conn = aioredis.from_url(f"redis://{first_sentinel_host}:{first_sentinel_port}")
+    try:
+        await admin_conn.execute_command("SENTINEL", "failover", service_name)
+    finally:
+        await safe_close_client(admin_conn)
+
+    # 2. While election is in progress, pause old master to ensure connection errors
+    conn_old_master = aioredis.from_url(
+        f"redis://{cur_master[0]}:{cur_master[1]}", socket_timeout=0.5
+    )
+    try:
+        with suppress(Exception):
+            await conn_old_master.execute_command("DEBUG", "SLEEP", 2.5)
+    finally:
+        await safe_close_client(conn_old_master)
+
+    # 3. Consecutive acquires fail during outage and trip the breaker to OPEN
+    for _ in range(3):
+        with suppress(StreamLeaseUnavailable):
+            await manager.acquire("user_cb_probe")
+
+    assert manager.circuit_breaker.state == CircuitState.OPEN
+
+    # 4. Next acquire fast-fails because breaker is OPEN
+    with pytest.raises(StreamLeaseUnavailable, match="Circuit breaker is OPEN"):
+        await manager.acquire("user_cb_fast_fail")
+
+    # 5. Wait for Sentinel to settle on promoted master
+    new_master = await wait_for_writable_master(sentinel, service_name, timeout=25.0)
+    assert new_master != cur_master
+
+    # 6. Existing lease renewal attempts Redis (golden asymmetry) and heals breaker
+    renewed = await manager.renew(lease)
+    assert renewed is True
+    assert manager.circuit_breaker.state == CircuitState.CLOSED
+    assert manager.circuit_breaker.consecutive_failures == 0
+
+    # 7. Subsequent acquire succeeds against new master
+    lease2 = await manager.acquire("user_cb_recovered")
+    assert lease2.lease_id is not None
     await manager.close()
     await safe_close_client(client)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import time
 from typing import Any
 from unittest.mock import AsyncMock, patch
@@ -11,11 +12,14 @@ from fastapi_stream_lease.circuit_breaker import (
     BackendFailurePolicy,
     CircuitBreaker,
     CircuitBreakerConfig,
+    CircuitPermit,
     CircuitState,
     FallbackMode,
+    is_transient_error,
 )
 from fastapi_stream_lease.config import LeaseConfig
 from fastapi_stream_lease.exceptions import (
+    StreamLeaseRejected,
     StreamLeaseUnavailable,
 )
 from fastapi_stream_lease.manager import StreamLeaseManager
@@ -50,14 +54,25 @@ class DummyTelemetry(TelemetryAdapter):
     [
         (0, 10.0, 1.0, 1),
         (-1, 10.0, 1.0, 1),
+        (True, 10.0, 1.0, 1),
+        (1.5, 10.0, 1.0, 1),
+        (float("inf"), 10.0, 1.0, 1),
+        (float("nan"), 10.0, 1.0, 1),
         (5, 0.0, 1.0, 1),
         (5, -1.0, 1.0, 1),
+        (5, True, 1.0, 1),
         (5, float("inf"), 1.0, 1),
         (5, float("nan"), 1.0, 1),
         (5, 10.0, -0.5, 1),
+        (5, 10.0, True, 1),
         (5, 10.0, float("inf"), 1),
+        (5, 10.0, float("nan"), 1),
         (5, 10.0, 1.0, 0),
         (5, 10.0, 1.0, -1),
+        (5, 10.0, 1.0, True),
+        (5, 10.0, 1.0, 1.5),
+        (5, 10.0, 1.0, float("inf")),
+        (5, 10.0, 1.0, float("nan")),
     ],
 )
 def test_circuit_breaker_config_validation_invalid(
@@ -410,3 +425,234 @@ async def test_manager_get_active_count_circuit_breaker() -> None:
     with pytest.raises(StreamLeaseUnavailable, match="Circuit breaker is OPEN"):
         await manager.get_active_count("u1")
     assert mock_redis.eval.call_count == eval_call_count_before
+
+
+# ============================================================================
+# Unit Tests: CB-01, CB-02, CB-03, CB-05 Regression Verifications
+# ============================================================================
+
+
+@pytest.mark.parametrize(
+    "exc,expected_transient",
+    [
+        (redis.exceptions.MaxConnectionsError("Pool exhausted"), False),
+        (
+            getattr(
+                redis.exceptions,
+                "ExternalAuthProviderError",
+                redis.exceptions.AuthenticationError,
+            )("Auth failure"),
+            False,
+        ),
+        (redis.exceptions.AuthenticationError("Auth error"), False),
+        (redis.exceptions.AuthorizationError("Authz error"), False),
+        (redis.exceptions.ClusterCrossSlotError("Cross slot"), False),
+        (redis.exceptions.DataError("Data error"), False),
+        (redis.exceptions.ResponseError("WRONGTYPE"), False),
+        (FileNotFoundError("Missing file"), False),
+        (PermissionError("Denied"), False),
+        (ValueError("Bad value"), False),
+        (redis.exceptions.ConnectionError("Connection lost"), True),
+        (redis.exceptions.TimeoutError("Redis timeout"), True),
+        (redis.exceptions.ReadOnlyError("Replica write"), True),
+        (redis.exceptions.ClusterDownError("Cluster down"), True),
+        (redis.exceptions.MasterDownError("Master down"), True),
+        (redis.exceptions.SlotNotCoveredError("Uncovered slot"), True),
+        (redis.exceptions.TryAgainError("Try again"), True),
+        (ConnectionRefusedError("Refused"), True),
+        (ConnectionResetError("Reset"), True),
+        (TimeoutError("Builtin timeout"), True),
+        (asyncio.TimeoutError(), True),
+    ],
+)
+def test_error_classification_transient_vs_non_transient(
+    exc: BaseException, expected_transient: bool
+) -> None:
+    assert is_transient_error(exc) is expected_transient
+
+
+def test_circuit_permit_half_open_lifecycle() -> None:
+    cb = CircuitBreaker(
+        CircuitBreakerConfig(
+            failure_threshold=1, recovery_timeout=0.01, jitter=0.0, half_open_max_probes=1
+        )
+    )
+    cb.record_failure(redis.exceptions.ConnectionError("trip"))
+    assert cb.state == CircuitState.OPEN
+
+    time.sleep(0.015)
+    assert cb.state == CircuitState.HALF_OPEN
+
+    permit1 = cb.acquire_permit()
+    assert isinstance(permit1, CircuitPermit)
+    assert permit1.allowed is True
+    assert permit1.is_probe is True
+
+    # Concurrent request exceeds half_open_max_probes=1
+    permit2 = cb.acquire_permit()
+    assert permit2.allowed is False
+    assert permit2.is_probe is False
+
+    # Probing succeeds (backend is reachable)
+    permit1.record_backend_reachable()
+    permit1.release()
+    assert cb.state == CircuitState.CLOSED
+    assert cb.consecutive_failures == 0
+
+    permit3 = cb.acquire_permit()
+    assert permit3.allowed is True
+    assert permit3.is_probe is False
+    permit3.release()
+
+
+def test_circuit_permit_half_open_cancellation_releases_probe() -> None:
+    cb = CircuitBreaker(
+        CircuitBreakerConfig(
+            failure_threshold=1, recovery_timeout=0.01, jitter=0.0, half_open_max_probes=1
+        )
+    )
+    cb.record_failure(redis.exceptions.ConnectionError("trip"))
+    time.sleep(0.015)
+    assert cb.state == CircuitState.HALF_OPEN
+
+    permit = cb.acquire_permit()
+    assert permit.allowed is True
+    assert permit.is_probe is True
+
+    # Permit is cancelled without settlement -> release() frees probe slot
+    permit.release()
+
+    # Next attempt should be allowed as probe instead of remaining blocked
+    permit_next = cb.acquire_permit()
+    assert permit_next.allowed is True
+    assert permit_next.is_probe is True
+    permit_next.release()
+
+
+def test_circuit_permit_half_open_non_transient_error_releases_probe() -> None:
+    cb = CircuitBreaker(
+        CircuitBreakerConfig(
+            failure_threshold=1, recovery_timeout=0.01, jitter=0.0, half_open_max_probes=1
+        )
+    )
+    cb.record_failure(redis.exceptions.ConnectionError("trip"))
+    time.sleep(0.015)
+    assert cb.state == CircuitState.HALF_OPEN
+
+    permit = cb.acquire_permit()
+    assert permit.allowed is True
+
+    # Non-transient failure (e.g. AuthenticationError)
+    auth_err = redis.exceptions.AuthenticationError("Invalid credentials")
+    permit.record_failure(auth_err)
+    permit.release()
+
+    # Breaker should not trip back to OPEN for non-transient, and probe slot is released
+    assert cb.state == CircuitState.HALF_OPEN
+    permit_next = cb.acquire_permit()
+    assert permit_next.allowed is True
+    permit_next.release()
+
+
+def test_circuit_permit_standalone_and_noop_edges() -> None:
+    # 1. Breaker is None
+    permit = CircuitPermit(allowed=True, is_probe=True, breaker=None)
+    permit.record_backend_reachable()
+    # Double invocation when settled is a no-op
+    permit.record_backend_reachable()
+    permit.release()
+
+    permit2 = CircuitPermit(allowed=True, is_probe=True, breaker=None)
+    permit2.record_failure()
+    # Double invocation when settled is a no-op
+    permit2.record_failure()
+    permit2.release()
+
+    # 2. _release_probe when in flight is 0 is a no-op
+    cb = CircuitBreaker()
+    assert cb._half_open_probes_in_flight == 0
+    cb._release_probe()
+    assert cb._half_open_probes_in_flight == 0
+
+
+@pytest.mark.asyncio
+async def test_manager_half_open_acquire_429_heals_breaker() -> None:
+    mock_redis = AsyncMock()
+    # Return code 2: user limit reached
+    mock_redis.eval = AsyncMock(return_value=2)
+
+    cb_cfg = CircuitBreakerConfig(failure_threshold=1, recovery_timeout=0.01, jitter=0.0)
+    policy = BackendFailurePolicy(fallback_mode=FallbackMode.FAIL_CLOSED, circuit_breaker=cb_cfg)
+    config = LeaseConfig(failure_policy=policy)
+    manager = StreamLeaseManager(redis=mock_redis, config=config)
+
+    # Trip breaker
+    manager.circuit_breaker.record_failure(redis.exceptions.ConnectionError("trip"))
+    assert manager.circuit_breaker.state == CircuitState.OPEN
+
+    await asyncio.sleep(0.015)
+    assert manager.circuit_breaker.state == CircuitState.HALF_OPEN
+
+    # Acquire returns 429
+    with pytest.raises(StreamLeaseRejected) as exc_info:
+        await manager.acquire("u1")
+    assert exc_info.value.reason == "user_limit"
+
+    # Backend was reachable! Breaker MUST be healed to CLOSED!
+    assert manager.circuit_breaker.state == CircuitState.CLOSED
+    assert manager.circuit_breaker.consecutive_failures == 0
+
+
+@pytest.mark.asyncio
+async def test_manager_half_open_acquire_cancellation_releases_probe() -> None:
+    mock_redis = AsyncMock()
+    mock_redis.eval = AsyncMock(side_effect=asyncio.CancelledError())
+
+    cb_cfg = CircuitBreakerConfig(
+        failure_threshold=1, recovery_timeout=0.01, jitter=0.0, half_open_max_probes=1
+    )
+    policy = BackendFailurePolicy(fallback_mode=FallbackMode.FAIL_CLOSED, circuit_breaker=cb_cfg)
+    config = LeaseConfig(failure_policy=policy)
+    manager = StreamLeaseManager(redis=mock_redis, config=config)
+
+    # Trip breaker
+    manager.circuit_breaker.record_failure(redis.exceptions.ConnectionError("trip"))
+    await asyncio.sleep(0.015)
+    assert manager.circuit_breaker.state == CircuitState.HALF_OPEN
+
+    with pytest.raises(asyncio.CancelledError):
+        await manager.acquire("u1")
+
+    # Probe slot was released! Next acquire should not be rejected as probe in flight
+    mock_redis.eval = AsyncMock(return_value=1)
+    lease = await manager.acquire("u2")
+    assert lease.lease_id is not None
+    assert manager.circuit_breaker.state == CircuitState.CLOSED
+
+
+@pytest.mark.asyncio
+async def test_manager_open_renew_zero_heals_breaker() -> None:
+    mock_redis = AsyncMock()
+    mock_redis.eval = AsyncMock(return_value=1)
+
+    cb_cfg = CircuitBreakerConfig(failure_threshold=1, recovery_timeout=10.0, jitter=0.0)
+    policy = BackendFailurePolicy(fallback_mode=FallbackMode.FAIL_CLOSED, circuit_breaker=cb_cfg)
+    config = LeaseConfig(failure_policy=policy)
+    manager = StreamLeaseManager(redis=mock_redis, config=config)
+
+    lease = await manager.acquire("u1")
+
+    # Trip breaker to OPEN
+    manager.circuit_breaker.record_failure(redis.exceptions.ConnectionError("trip"))
+    assert manager.circuit_breaker.state == CircuitState.OPEN
+
+    # Renew returns 0 (lease expired/evicted in Redis)
+    mock_redis.eval.side_effect = None
+    mock_redis.eval.return_value = 0
+
+    renew_ok = await manager.renew(lease)
+    assert renew_ok is False
+
+    # Redis answered and executed script -> breaker MUST be healed to CLOSED!
+    assert manager.circuit_breaker.state == CircuitState.CLOSED
+    assert manager.circuit_breaker.consecutive_failures == 0
