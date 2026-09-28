@@ -156,6 +156,13 @@ class BackendFailurePolicy:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "fallback_mode", coerce_fallback_mode(self.fallback_mode))
+        if self.circuit_breaker is not None and not isinstance(
+            self.circuit_breaker, CircuitBreakerConfig
+        ):
+            raise TypeError(
+                "circuit_breaker must be an instance of CircuitBreakerConfig or None, "
+                f"got {type(self.circuit_breaker).__name__}"
+            )
 
 
 class CircuitPermit:

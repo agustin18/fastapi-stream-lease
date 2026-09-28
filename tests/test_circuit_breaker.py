@@ -117,6 +117,14 @@ def test_backend_failure_policy_invalid_mode() -> None:
         BackendFailurePolicy(fallback_mode="invalid_mode")  # type: ignore[arg-type]
 
 
+@pytest.mark.parametrize("invalid_cb", ["foo", 123, True, [], {}])
+def test_backend_failure_policy_invalid_circuit_breaker_type(invalid_cb: Any) -> None:
+    with pytest.raises(
+        TypeError, match="circuit_breaker must be an instance of CircuitBreakerConfig or None"
+    ):
+        BackendFailurePolicy(circuit_breaker=invalid_cb)
+
+
 # ============================================================================
 # Unit Tests: State Machine Transitions
 # ============================================================================
@@ -266,6 +274,21 @@ def test_lease_config_failure_policy_defaults() -> None:
     cfg_custom = LeaseConfig(failure_policy=explicit_policy)
     assert cfg_custom.failure_policy == explicit_policy
     assert cfg_custom.fail_open is True
+
+
+def test_manager_circuit_state_property() -> None:
+    mock_redis = AsyncMock()
+    # Breaker disabled -> None
+    mgr_no_cb = StreamLeaseManager(redis=mock_redis)
+    assert mgr_no_cb.circuit_breaker is None
+    assert mgr_no_cb.circuit_state is None
+
+    # Breaker enabled -> CircuitState.CLOSED
+    cb_cfg = CircuitBreakerConfig()
+    policy = BackendFailurePolicy(circuit_breaker=cb_cfg)
+    mgr_with_cb = StreamLeaseManager(redis=mock_redis, config=LeaseConfig(failure_policy=policy))
+    assert mgr_with_cb.circuit_breaker is not None
+    assert mgr_with_cb.circuit_state == CircuitState.CLOSED
 
 
 @pytest.mark.asyncio

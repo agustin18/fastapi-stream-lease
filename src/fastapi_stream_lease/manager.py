@@ -12,6 +12,7 @@ from uuid import uuid4
 from fastapi_stream_lease.circuit_breaker import (
     CircuitBreaker,
     CircuitPermit,
+    CircuitState,
     FallbackMode,
     is_network_error,
 )
@@ -74,6 +75,13 @@ class StreamLeaseManager:
     def circuit_breaker(self) -> CircuitBreaker | None:
         """Internal worker-local circuit breaker state machine, or None if disabled."""
         return self._circuit_breaker
+
+    @property
+    def circuit_state(self) -> CircuitState | None:
+        """Current operational state of the circuit breaker, or None if disabled."""
+        if self._circuit_breaker is not None:
+            return self._circuit_breaker.state
+        return None
 
     def _on_hook_drop(self) -> None:
         if self.telemetry is not None:
