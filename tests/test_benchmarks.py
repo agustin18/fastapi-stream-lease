@@ -175,24 +175,26 @@ def test_plateau_stability_criteria(
 
 
 @pytest.mark.parametrize(
-    ("samples", "assert_plateau", "expected_stable"),
+    ("samples", "assert_plateau", "expected_stable", "expected_samples"),
     [
         # Empty or single sample
-        ([], True, False),
-        ([], False, True),
-        ([{"time_s": 0.0, "rss_kb": 10240}], True, False),
-        ([{"time_s": 0.0, "rss_kb": 10240}], False, True),
+        ([], True, False, None),
+        ([], False, True, None),
+        ([{"time_s": 0.0, "rss_kb": 10240}], True, False, None),
+        ([{"time_s": 0.0, "rss_kb": 10240}], False, True, None),
         # >= 6 samples: steady-state slope and growth evaluated on second half
         (
             [{"time_s": float(i), "rss_kb": 50000 + (10 * i)} for i in range(10)],
             True,
             True,
+            None,
         ),
         # >= 6 samples: excessive steady-state slope (> 0.15 MB/s)
         (
             [{"time_s": float(i), "rss_kb": 50000 + (300 * i)} for i in range(10)],
             True,
             False,
+            None,
         ),
         # < 6 samples: transient startup ramp with slope > 0.15 but bounded growth
         (
@@ -205,6 +207,7 @@ def test_plateau_stability_criteria(
             ],
             True,
             True,
+            None,
         ),
         # < 6 samples: excessive absolute growth (> 15 MB)
         (
@@ -214,6 +217,7 @@ def test_plateau_stability_criteria(
             ],
             True,
             False,
+            None,
         ),
         # Monitor starvation: expected >= 6 samples, but got < 3 samples (event loop frozen)
         (
@@ -223,6 +227,20 @@ def test_plateau_stability_criteria(
             ],
             True,
             False,
+            10,
+        ),
+        # BENCH-33-01: Exactly 5 samples when 10 expected must fail starvation validation
+        (
+            [
+                {"time_s": 0.0, "rss_kb": 35000},
+                {"time_s": 1.0, "rss_kb": 35000},
+                {"time_s": 2.0, "rss_kb": 35000},
+                {"time_s": 3.0, "rss_kb": 35000},
+                {"time_s": 4.0, "rss_kb": 35000},
+            ],
+            True,
+            False,
+            10,
         ),
     ],
 )
@@ -230,10 +248,9 @@ def test_evaluate_plateau_stability(
     samples: list[dict[str, float]],
     assert_plateau: bool,
     expected_stable: bool,
+    expected_samples: int | None,
 ) -> None:
     """Verify memory plateau evaluation with steady-state vs transient smoke discrimination."""
-    # When samples has 2 items with t=0 and t=9, pass expected_samples=10 to test starvation
-    expected_samples = 10 if len(samples) == 2 and samples[-1]["time_s"] == 9.0 else None
     stable, _slope, _abs_growth, _rel_growth = evaluate_plateau_stability(
         samples,
         assert_plateau=assert_plateau,

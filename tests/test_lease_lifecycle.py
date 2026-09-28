@@ -1712,3 +1712,99 @@ async def test_wrap_stream_close_source_sync_aclose_returning_coroutine(fake_red
     assert cleaned_up is True
     assert await manager.get_active_count("user_sync_aclose_returning_coro") == 0
     await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_wrap_stream_anyio_cancel_scope_standalone(lease_manager) -> None:
+    """Verifies that lease.wrap() correctly cleans up upstream and releases lease
+    when cancelled inside an AnyIO CancelScope without ProtectedStreamingResponse (QA-33-02).
+    """
+    import anyio
+
+    upstream_cleaned = False
+
+    class SimpleStream:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            await asyncio.sleep(0.01)
+            return b"chunk"
+
+        async def aclose(self):
+            nonlocal upstream_cleaned
+            upstream_cleaned = True
+
+    lease = await lease_manager.acquire("user_anyio_wrap")
+    assert await lease_manager.get_active_count("user_anyio_wrap") == 1
+
+    with anyio.CancelScope() as scope:
+        wrapped = lease.wrap(SimpleStream(), auto_renew=False, close_source=True)
+        async for _ in wrapped:
+            scope.cancel()
+
+    assert upstream_cleaned is True
+    assert lease._is_released is True
+    assert await lease_manager.get_active_count("user_anyio_wrap") == 0
+
+
+@pytest.mark.asyncio
+async def test_manager_lease_context_manager_anyio_cancel_scope(lease_manager) -> None:
+    """Verifies that async with manager.lease() cleanly releases under an AnyIO CancelScope
+    (QA-33-02).
+    """
+    import anyio
+
+    lease_ref = None
+    with anyio.CancelScope() as scope:
+        with pytest.raises(asyncio.CancelledError):
+            async with lease_manager.lease("user_anyio_ctx") as lease:
+                lease_ref = lease
+                assert await lease_manager.get_active_count("user_anyio_ctx") == 1
+                scope.cancel()
+
+    assert lease_ref is not None
+    assert lease_ref._is_released is True
+    assert await lease_manager.get_active_count("user_anyio_ctx") == 0
+
+
+@pytest.mark.asyncio
+async def test_wrap_stream_close_source_composite_sync_awaitable_budget_enforced(
+    fake_redis,
+) -> None:
+    """Verifies that a sync close returning an awaitable coroutine enforces the remaining
+    budget and does not double the timeout (UP-33-01).
+    """
+    config = LeaseConfig(lease_seconds=5.0, upstream_cleanup_timeout=0.2)
+    manager = StreamLeaseManager(fake_redis, config=config)
+
+    class CompositeCloseStream:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise StopAsyncIteration
+
+        def close(self):
+            import time
+
+            time.sleep(0.08)  # Consumes 80ms of 200ms budget
+
+            async def _coro():
+                await asyncio.sleep(0.4)  # Needs 400ms, which exceeds remaining budget!
+
+            return _coro()
+
+    lease = await manager.acquire("user_composite_budget")
+    wrapped = lease.wrap(CompositeCloseStream(), auto_renew=False, close_source=True)
+
+    t0 = time.monotonic()
+    async for _ in wrapped:
+        pass
+    elapsed = time.monotonic() - t0
+
+    # Total elapsed time should be bounded close to upstream_cleanup_timeout (0.2s), not ~0.48s
+    assert elapsed < 0.35
+    assert lease._is_released is True
+    assert await manager.get_active_count("user_composite_budget") == 0
+    await manager.close()

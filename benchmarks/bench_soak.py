@@ -24,6 +24,7 @@ import argparse
 import asyncio
 import contextlib
 import json
+import math
 import os
 import resource
 import sys
@@ -83,13 +84,15 @@ def evaluate_plateau_stability(
     if len(samples) < 2:
         return (not assert_plateau, 0.0, 0.0, 0.0)
 
-    # BENCH-R3-01: Detect monitor starvation (e.g. event loop blocking or monitor failure)
-    if (
-        expected_samples is not None
-        and expected_samples >= 6
-        and len(samples) < max(2, expected_samples // 2)
-    ):
-        return (False, 0.0, 0.0, 0.0)
+    # BENCH-R3-01 & BENCH-33-01: Detect monitor starvation
+    # (e.g. event loop blocking or monitor failure)
+    if expected_samples is not None:
+        required_samples = max(
+            6 if expected_samples >= 6 else 2,
+            math.ceil(expected_samples / 2),
+        )
+        if len(samples) < required_samples:
+            return (False, 0.0, 0.0, 0.0)
 
     has_steady_state = len(samples) >= 6
     steady_samples = samples[len(samples) // 2 :] if has_steady_state else samples
