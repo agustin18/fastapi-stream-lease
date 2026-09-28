@@ -222,8 +222,7 @@ class StreamLeaseManager:
             if not permit.allowed:
                 duration = 0.0
                 if (
-                    self.config.failure_policy is not None
-                    and self.config.failure_policy.fallback_mode == FallbackMode.FAIL_OPEN
+                    self.config.effective_failure_policy.fallback_mode == FallbackMode.FAIL_OPEN
                 ):
                     self._safe_record_fallback()
                     self._safe_record_operation(Operation.ACQUIRE, Outcome.FALLBACK, duration)

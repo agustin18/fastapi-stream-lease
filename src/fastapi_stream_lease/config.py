@@ -4,7 +4,11 @@ from dataclasses import dataclass
 from math import isfinite
 from typing import Any
 
-from fastapi_stream_lease.circuit_breaker import BackendFailurePolicy, FallbackMode
+from fastapi_stream_lease.circuit_breaker import (
+    BackendFailurePolicy,
+    CircuitBreakerConfig,
+    FallbackMode,
+)
 
 
 @dataclass(frozen=True)
@@ -51,10 +55,24 @@ class LeaseConfig:
     """Encapsulated failure degradation policy and circuit breaker configuration."""
 
     def __post_init__(self) -> None:
-        if self.failure_policy is None:
-            mode = FallbackMode.FAIL_OPEN if self.fail_open else FallbackMode.FAIL_CLOSED
-            object.__setattr__(self, "failure_policy", BackendFailurePolicy(fallback_mode=mode))
-        else:
+        if self.failure_policy is not None:
+            if isinstance(self.failure_policy, dict):
+                cb_raw = self.failure_policy.get("circuit_breaker")
+                if isinstance(cb_raw, dict):
+                    cb_obj = CircuitBreakerConfig(**cb_raw)
+                else:
+                    cb_obj = cb_raw
+                mode_raw = self.failure_policy.get("fallback_mode", FallbackMode.FAIL_CLOSED)
+                object.__setattr__(
+                    self,
+                    "failure_policy",
+                    BackendFailurePolicy(circuit_breaker=cb_obj, fallback_mode=mode_raw),
+                )
+            elif not isinstance(self.failure_policy, BackendFailurePolicy):
+                raise TypeError(
+                    "failure_policy must be an instance of BackendFailurePolicy or None, "
+                    f"got {type(self.failure_policy).__name__}"
+                )
             object.__setattr__(
                 self, "fail_open", self.failure_policy.fallback_mode == FallbackMode.FAIL_OPEN
             )
@@ -125,3 +143,15 @@ class LeaseConfig:
             "lease_seconds": self.lease_seconds,
             "fail_open": self.fail_open,
         }
+
+    @property
+    def effective_failure_policy(self) -> BackendFailurePolicy:
+        """
+        Effective failure policy. Returns explicit failure_policy if set,
+        or synthesizes a policy matching fail_open if failure_policy is None.
+        """
+        if self.failure_policy is not None:
+            return self.failure_policy
+        mode = FallbackMode.FAIL_OPEN if self.fail_open else FallbackMode.FAIL_CLOSED
+        return BackendFailurePolicy(fallback_mode=mode)
+

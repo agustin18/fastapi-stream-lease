@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from dataclasses import asdict, replace
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
@@ -260,12 +261,14 @@ def test_circuit_breaker_reset() -> None:
 
 def test_lease_config_failure_policy_defaults() -> None:
     cfg_closed = LeaseConfig(fail_open=False)
-    assert cfg_closed.failure_policy.fallback_mode == FallbackMode.FAIL_CLOSED
-    assert cfg_closed.failure_policy.circuit_breaker is None
+    assert cfg_closed.failure_policy is None
+    assert cfg_closed.effective_failure_policy.fallback_mode == FallbackMode.FAIL_CLOSED
+    assert cfg_closed.effective_failure_policy.circuit_breaker is None
 
     cfg_open = LeaseConfig(fail_open=True)
-    assert cfg_open.failure_policy.fallback_mode == FallbackMode.FAIL_OPEN
-    assert cfg_open.failure_policy.circuit_breaker is None
+    assert cfg_open.failure_policy is None
+    assert cfg_open.effective_failure_policy.fallback_mode == FallbackMode.FAIL_OPEN
+    assert cfg_open.effective_failure_policy.circuit_breaker is None
 
     explicit_policy = BackendFailurePolicy(
         fallback_mode=FallbackMode.FAIL_OPEN,
@@ -273,7 +276,52 @@ def test_lease_config_failure_policy_defaults() -> None:
     )
     cfg_custom = LeaseConfig(failure_policy=explicit_policy)
     assert cfg_custom.failure_policy == explicit_policy
+    assert cfg_custom.effective_failure_policy == explicit_policy
     assert cfg_custom.fail_open is True
+
+
+def test_lease_config_dataclass_replace_fail_open() -> None:
+    """Verifies that dataclasses.replace correctly flips fail_open without being overridden by failure_policy."""
+    cfg = LeaseConfig()
+    assert cfg.fail_open is False
+    assert cfg.failure_policy is None
+
+    cfg2 = replace(cfg, fail_open=True)
+    assert cfg2.fail_open is True
+    assert cfg2.failure_policy is None
+    assert cfg2.effective_failure_policy.fallback_mode == FallbackMode.FAIL_OPEN
+
+    cfg3 = replace(cfg2, fail_open=False)
+    assert cfg3.fail_open is False
+    assert cfg3.failure_policy is None
+    assert cfg3.effective_failure_policy.fallback_mode == FallbackMode.FAIL_CLOSED
+
+
+def test_lease_config_asdict_roundtrip() -> None:
+    """Verifies that LeaseConfig can be round-tripped through dataclasses.asdict."""
+    # 1. Default config
+    cfg_default = LeaseConfig()
+    data_default = asdict(cfg_default)
+    cfg_default_rebuilt = LeaseConfig(**data_default)
+    assert cfg_default_rebuilt == cfg_default
+    assert cfg_default_rebuilt.failure_policy is None
+
+    # 2. Config with custom failure policy and circuit breaker
+    policy = BackendFailurePolicy(
+        fallback_mode=FallbackMode.FAIL_OPEN,
+        circuit_breaker=CircuitBreakerConfig(failure_threshold=7, recovery_timeout=5.0),
+    )
+    cfg_custom = LeaseConfig(failure_policy=policy)
+    data_custom = asdict(cfg_custom)
+    cfg_custom_rebuilt = LeaseConfig(**data_custom)
+    assert cfg_custom_rebuilt.failure_policy == policy
+    assert cfg_custom_rebuilt.fail_open is True
+    assert cfg_custom_rebuilt.effective_failure_policy == policy
+
+
+def test_lease_config_invalid_failure_policy_type() -> None:
+    with pytest.raises(TypeError, match="failure_policy must be an instance of BackendFailurePolicy or None"):
+        LeaseConfig(failure_policy="invalid_string")  # type: ignore[arg-type]
 
 
 def test_manager_circuit_state_property() -> None:
