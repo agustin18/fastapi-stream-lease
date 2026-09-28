@@ -263,8 +263,8 @@ async def test_fastapi_real_asgi_client_disconnect_determinism(fastapi_app, leas
 
         async def __anext__(self):
             first_token_sent.set()
-            await asyncio.sleep(2.0)
-            return "token_data\n"
+            await client_disconnected.wait()
+            raise StopAsyncIteration
 
         async def aclose(self):
             nonlocal upstream_cleaned
@@ -305,8 +305,8 @@ async def test_fastapi_real_asgi_client_disconnect_determinism(fastapi_app, leas
 
     from contextlib import suppress
 
-    with suppress(Exception):
-        await asyncio.wait_for(app_task, timeout=2.0)
+    with suppress(asyncio.CancelledError):
+        await asyncio.wait_for(app_task, timeout=5.0)
 
     assert upstream_cleaned is True
     assert await lease_manager.get_active_count("user_asgi_disc") == 0
