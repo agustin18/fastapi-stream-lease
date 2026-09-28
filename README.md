@@ -247,7 +247,9 @@ Therefore, **an `OPEN` circuit breaker never blocks renewal attempts**. Active s
   metrics = OpenTelemetryMetrics()
   manager = StreamLeaseManager(redis=client, config=config, telemetry=metrics)
   ```
-  Exposes standardized metrics (`operations_total`, `operation_duration_seconds`, `lost_total`, `backend_errors_total`, `fallback_total`, `hook_dropped_total`, `hook_queue_depth`) with bounded label cardinality.
+  Exposes standardized metrics (`operations_total`, `operation_duration_seconds`, `lost_total`, `backend_errors_total`, `fallback_total`, `hook_dropped_total`, `hook_queue_depth`, `circuit_state`, `short_circuited_total`) with bounded label cardinality.
+  - **Multi-Manager Isolation (`telemetry_scope`):** When multiple managers share a single Prometheus registry or OpenTelemetry meter, configure distinct static `telemetry_scope` values on `LeaseConfig` (e.g. `LeaseConfig(telemetry_scope="llm_heavy")`). Circuit breaker metrics (`circuit_state`, `short_circuited_total`) are labeled with `scope` (defaulting to `key_prefix`). `telemetry_scope` must be static and low-cardinality; do not use dynamic user IDs or request identifiers.
+  - **Upstream Stream Teardown & Ownership (`close_source=True`):** When wrapping streams via `manager.stream()`, `lease.as_streaming_response()`, or `lease.wrap()`, `fastapi-stream-lease` assumes ownership of closing the underlying upstream stream upon client disconnect, completion, or error, releasing active Redis leases deterministically without ghost leases. To retain caller ownership and prevent closing the source, pass `close_source=False`. Synchronous close methods are offloaded to worker threads; `upstream_cleanup_timeout` (default 2.0s) bounds how long teardown waits without blocking the event loop.
 
 - **Zero-Dependency Lifecycle Hooks (Custom Telemetry):**
   Alternatively, `LeaseConfig` provides zero-dependency callback hooks (supporting both sync and async callables) to plug directly into Datadog, StatsD, or Sentry:

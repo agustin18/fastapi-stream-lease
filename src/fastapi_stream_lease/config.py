@@ -55,10 +55,15 @@ class LeaseConfig:
     """Encapsulated failure degradation policy and circuit breaker configuration."""
 
     upstream_cleanup_timeout: float = 2.0
-    """Maximum duration (in seconds) to wait for upstream stream aclose() before releasing lease."""
+    """Maximum duration (in seconds) to wait for upstream stream aclose() or close()
+    cleanup before releasing the Redis lease. For synchronous close methods offloaded
+    to worker threads, this bounds how long teardown waits, but cannot forcibly kill
+    threads already executing in the worker pool."""
 
     telemetry_scope: str | None = None
-    """Optional telemetry scope identifier for isolating metrics across managers."""
+    """Optional static, low-cardinality telemetry scope identifier for isolating metrics
+    across multiple managers sharing a telemetry registry (e.g. 'llm_heavy', 'worker_alpha').
+    Must not contain high-cardinality dynamic data (e.g. user IDs). Defaults to key_prefix."""
 
     def __post_init__(self) -> None:
         if self.failure_policy is not None:

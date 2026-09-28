@@ -183,7 +183,7 @@ class OpenTelemetryMetrics:
         c_state = coerce_circuit_state(state)
         self.circuit_state_gauge.set(
             CIRCUIT_STATE_NUMERIC[c_state],
-            {"prefix": str(scope)},
+            {"scope": str(scope)},
         )
 
     def record_short_circuit(
@@ -200,7 +200,7 @@ class OpenTelemetryMetrics:
             {
                 "operation": op_enum.value,
                 "state": st_enum.value,
-                "prefix": str(scope),
+                "scope": str(scope),
             },
         )
 

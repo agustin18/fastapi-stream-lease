@@ -4,7 +4,7 @@ import asyncio
 import inspect
 import logging
 import time
-from collections.abc import AsyncIterable, AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterable, AsyncIterator
 from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, TypeVar
@@ -66,19 +66,22 @@ class ProtectedStreamingResponse(_StarletteStreamingResponse):
                     await self.lease._release_task
 
 
-async def _close_single_target(target: Any, timeout: float) -> None:  # noqa: ASYNC109
+async def _close_single_target(target: Any, deadline: float) -> None:
     # 1. Look for aclose
     aclose = getattr(target, "aclose", None)
     if callable(aclose):
         try:
 
             async def _run_aclose() -> None:
-                if inspect.iscoroutinefunction(aclose):
-                    await asyncio.wait_for(aclose(), timeout=timeout)
+                remaining = max(0.001, deadline - time.monotonic())
+                if inspect.iscoroutinefunction(aclose) or isinstance(target, AsyncGenerator):
+                    await asyncio.wait_for(aclose(), timeout=remaining)
                 else:
-                    res = aclose()
+                    # Sync or non-coroutine aclose offloaded to worker thread
+                    res = await asyncio.wait_for(asyncio.to_thread(aclose), timeout=remaining)
                     if inspect.isawaitable(res):
-                        await asyncio.wait_for(res, timeout=timeout)
+                        remaining = max(0.001, deadline - time.monotonic())
+                        await asyncio.wait_for(res, timeout=remaining)
 
             if _has_anyio:
                 with anyio.CancelScope(shield=True):
@@ -86,7 +89,11 @@ async def _close_single_target(target: Any, timeout: float) -> None:  # noqa: AS
             else:  # pragma: no cover
                 await _run_aclose()
             return
-        except (Exception, asyncio.TimeoutError, asyncio.CancelledError):
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            logger.debug("Cleanup timed out or cancelled for upstream target %r", target)
+            return
+        except Exception as exc:
+            logger.debug("Suppressed exception while closing upstream target %r: %s", target, exc)
             return
 
     # 2. Look for close (async or sync)
@@ -95,13 +102,15 @@ async def _close_single_target(target: Any, timeout: float) -> None:  # noqa: AS
         try:
 
             async def _run_close() -> None:
+                remaining = max(0.001, deadline - time.monotonic())
                 if inspect.iscoroutinefunction(close):
-                    await asyncio.wait_for(close(), timeout=timeout)
+                    await asyncio.wait_for(close(), timeout=remaining)
                 else:
                     # Sync close must be offloaded to worker thread to avoid event-loop starvation
-                    res = await asyncio.wait_for(asyncio.to_thread(close), timeout=timeout)
+                    res = await asyncio.wait_for(asyncio.to_thread(close), timeout=remaining)
                     if inspect.isawaitable(res):
-                        await asyncio.wait_for(res, timeout=timeout)
+                        remaining = max(0.001, deadline - time.monotonic())
+                        await asyncio.wait_for(res, timeout=remaining)
 
             if _has_anyio:
                 with anyio.CancelScope(shield=True):
@@ -109,7 +118,11 @@ async def _close_single_target(target: Any, timeout: float) -> None:  # noqa: AS
             else:  # pragma: no cover
                 await _run_close()
             return
-        except (Exception, asyncio.TimeoutError, asyncio.CancelledError):
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            logger.debug("Cleanup timed out or cancelled for upstream target %r", target)
+            return
+        except Exception as exc:
+            logger.debug("Suppressed exception while closing upstream target %r: %s", target, exc)
             return
 
 
@@ -135,7 +148,7 @@ async def _close_stream_source(
                 timeout,
             )
             break
-        await _close_single_target(target, timeout=remaining)
+        await _close_single_target(target, deadline=deadline)
 
 
 def _safe_uncancel() -> None:
@@ -244,7 +257,11 @@ class StreamLease:
             await asyncio.shield(task)
         except asyncio.CancelledError:
             cancelled = True
-            await asyncio.wait({task})
+            if _has_anyio:
+                with anyio.CancelScope(shield=True):
+                    await asyncio.wait({task})
+            else:  # pragma: no cover
+                await asyncio.wait({task})
         finally:
             if cancelled:
                 raise asyncio.CancelledError()

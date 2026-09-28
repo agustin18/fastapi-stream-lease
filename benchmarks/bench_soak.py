@@ -24,6 +24,7 @@ import argparse
 import asyncio
 import contextlib
 import json
+import math
 import os
 import resource
 import sys
@@ -72,6 +73,7 @@ def compute_linear_slope(times: list[float], values: list[float]) -> float:
 def evaluate_plateau_stability(
     samples: list[dict[str, Any]],
     assert_plateau: bool = True,
+    expected_samples: int | None = None,
 ) -> tuple[bool, float, float, float]:
     """
     Evaluate memory stability across sampled VmRSS measurements.
@@ -81,6 +83,16 @@ def evaluate_plateau_stability(
     """
     if len(samples) < 2:
         return (not assert_plateau, 0.0, 0.0, 0.0)
+
+    # BENCH-R3-01 & BENCH-33-01: Detect monitor starvation
+    # (e.g. event loop blocking or monitor failure)
+    if expected_samples is not None:
+        required_samples = max(
+            6 if expected_samples >= 6 else 2,
+            math.ceil(expected_samples / 2),
+        )
+        if len(samples) < required_samples:
+            return (False, 0.0, 0.0, 0.0)
 
     has_steady_state = len(samples) >= 6
     steady_samples = samples[len(samples) // 2 :] if has_steady_state else samples
@@ -363,8 +375,13 @@ async def run_soak(
     zero_residual_keys = len(remaining_keys) == 0
 
     # M02: Robust linear regression slope & plateau calculation
+    expected_samples = max(2, int(duration_seconds / sample_interval))
     plateau_stable, rss_slope_mb_per_sec, abs_growth_mb, rss_growth_pct = (
-        evaluate_plateau_stability(samples, assert_plateau=assert_plateau)
+        evaluate_plateau_stability(
+            samples,
+            assert_plateau=assert_plateau,
+            expected_samples=expected_samples,
+        )
     )
 
     # S04 & S07: unexpected_rejections must be 0, zero ghost leases AND zero residual keys
