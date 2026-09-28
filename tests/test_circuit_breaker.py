@@ -16,6 +16,8 @@ from fastapi_stream_lease.circuit_breaker import (
     CircuitPermit,
     CircuitState,
     FallbackMode,
+    is_availability_error,
+    is_network_error,
     is_transient_error,
 )
 from fastapi_stream_lease.config import LeaseConfig
@@ -154,6 +156,26 @@ def test_circuit_breaker_ignores_non_transient_errors() -> None:
     permit = breaker.acquire_permit()
     assert permit.allowed is True
     permit.release()
+
+
+def test_circuit_breaker_classification_max_connections_error() -> None:
+    max_conn_cls = getattr(redis.exceptions, "MaxConnectionsError", None)
+    if max_conn_cls is None:
+        pytest.skip("MaxConnectionsError not available in redis version")
+    exc = max_conn_cls("Too many connections")
+
+    # BC-02 invariant: MaxConnectionsError is NOT transient for circuit breaker
+    assert is_transient_error(exc) is False
+
+    # But it IS an availability error (and network error) for retry and 503 normalization
+    assert is_availability_error(exc) is True
+    assert is_network_error(exc) is True
+
+    # It does NOT trip the breaker
+    breaker = CircuitBreaker(CircuitBreakerConfig(failure_threshold=1))
+    breaker.record_failure(exc)
+    assert breaker.consecutive_failures == 0
+    assert breaker.state == CircuitState.CLOSED
 
 
 @pytest.mark.parametrize(
@@ -394,6 +416,52 @@ async def test_manager_acquire_circuit_breaker_open_fail_open() -> None:
     assert lease3._is_fallback is True
     assert mock_redis.eval.call_count == 2  # Zero network roundtrip!
     assert telemetry.fallbacks == 3
+
+
+@pytest.mark.asyncio
+async def test_manager_acquire_max_connections_error_fail_closed_normalizes_to_503() -> None:
+    max_conn_cls = getattr(redis.exceptions, "MaxConnectionsError", None)
+    if max_conn_cls is None:
+        pytest.skip("MaxConnectionsError not available in redis version")
+
+    mock_redis = AsyncMock()
+    mock_redis.eval.side_effect = max_conn_cls("Pool exhausted")
+
+    manager = StreamLeaseManager(redis=mock_redis, config=LeaseConfig(fail_open=False))
+    with pytest.raises(StreamLeaseUnavailable, match="Stream lease coordination backend is temporarily unavailable"):
+        await manager.acquire("u1")
+
+
+@pytest.mark.asyncio
+async def test_manager_acquire_max_connections_error_fail_open_does_not_create_fallback() -> None:
+    max_conn_cls = getattr(redis.exceptions, "MaxConnectionsError", None)
+    if max_conn_cls is None:
+        pytest.skip("MaxConnectionsError not available in redis version")
+
+    mock_redis = AsyncMock()
+    mock_redis.eval.side_effect = max_conn_cls("Pool exhausted")
+
+    # Even with fail_open=True, MaxConnectionsError must NOT bypass limits by creating fallback
+    manager = StreamLeaseManager(redis=mock_redis, config=LeaseConfig(fail_open=True))
+    with pytest.raises(StreamLeaseUnavailable, match="Stream lease coordination backend is temporarily unavailable"):
+        await manager.acquire("u1")
+
+
+@pytest.mark.asyncio
+async def test_manager_renew_max_connections_error_raises_stream_lease_unavailable() -> None:
+    max_conn_cls = getattr(redis.exceptions, "MaxConnectionsError", None)
+    if max_conn_cls is None:
+        pytest.skip("MaxConnectionsError not available in redis version")
+
+    mock_redis = AsyncMock()
+    mock_redis.eval = AsyncMock(return_value=1)
+    manager = StreamLeaseManager(redis=mock_redis)
+    lease = await manager.acquire("u1")
+
+    # Renew throws MaxConnectionsError -> must raise StreamLeaseUnavailable so worker enters grace period
+    mock_redis.eval.side_effect = max_conn_cls("Pool exhausted")
+    with pytest.raises(StreamLeaseUnavailable, match="Stream lease coordination backend is temporarily unavailable"):
+        await manager.renew(lease)
 
 
 @pytest.mark.asyncio
