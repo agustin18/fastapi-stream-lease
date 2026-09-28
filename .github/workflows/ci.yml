@@ -39,6 +39,9 @@ jobs:
       - name: Check Spelling (codespell)
         run: uv run codespell
 
+      - name: Audit Dependencies for Known Vulnerabilities (pip-audit)
+        run: uv run --with pip-audit pip-audit
+
   test:
     runs-on: ubuntu-latest
     services:

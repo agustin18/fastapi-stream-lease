@@ -45,12 +45,15 @@ app = FastAPI(lifespan=lifespan)
 
 
 def authenticate_token(token: str | None) -> str:
-    expected = os.environ.get("STREAM_DEMO_TOKEN", "local-secret")
-    if not token or not hmac.compare_digest(token, expected):
-        raise ValueError("Invalid authentication token")
+    expected = os.environ.get("STREAM_DEMO_TOKEN")
+    if not expected or not token or not hmac.compare_digest(token, expected):
+        raise ValueError("Invalid authentication token (STREAM_DEMO_TOKEN must be set)")
     return "demo-user"
 
 
+# Note on WebSocket auth: Passing authentication tokens via query string is used here only
+# for convenient browser testing. In production, authenticate WebSockets via secure HTTP-only
+# cookies, handshake headers, or short-lived pre-authenticated connection tickets.
 @app.websocket("/ws")
 async def websocket_endpoint(
     websocket: WebSocket,

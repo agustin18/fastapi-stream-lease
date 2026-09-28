@@ -146,7 +146,7 @@ The manager context and `async with lease` both renew while open. Handle normal 
 | **Slow Observability / Metric Hooks** | All lifecycle hooks (`on_acquired`, `on_released`, `on_lost`, `on_rejected`, `on_backend_error`) run out-of-band via an internal bounded FIFO queue and threadpool (`asyncio.to_thread` for sync callables). | **Strong Guarantee** | Slow APM/Datadog/StatsD calls cannot delay stream cancellation, block acquire returns, or consume renewal retry windows. |
 | **Redis Sentinel Master Failover** | `READONLY` transitions during replica write are retried. Asynchronous Redis replication can lose recently acknowledged writes if a master fails before syncing; un-replicated leases are detected as lost on next renewal and cancelled cleanly. In split-brain network partitions, divergent masters can temporarily allow concurrent leases across partitions until the partition heals or `min-replicas-to-write` blocks writes on the isolated master. | **High Availability** | Seamlessly rides out master elections shorter than remaining `lease_seconds` when the lease state is present on the promoted replica. Divergent writes are terminated rather than resurrected. `min-replicas-to-write` can bound or reduce the stale-master write window during network partitions, at the cost of write availability. Redis Sentinel remains eventually consistent and cannot guarantee a strict cluster-wide concurrency bound across all network partitions. |
 | **Redis Cluster Multi-Key Coordination** | Keys share hash tag `{prefix}` (`{prefix}:user:...` and `{prefix}:global`), guaranteeing placement on the same hash slot for atomic Lua execution. | **Atomic Lua Execution** | Atomically validates both per-user and global capacity in a single Redis round-trip without `CROSSSLOT` errors. Coordinated keys share one cluster slot, which can become a hot slot at extreme throughput. |
-| **Redis Cluster Slot Failover & Replication** | Replicated leases and configuration keys survive slot promotion when a replica is elected. Acknowledged writes (leases or `{prefix}:config`) that have not reached the promoted replica before master failure may be lost. Un-replicated leases are detected as lost on next renewal and cleanly cancelled. Redis Cluster uses asynchronous replication and does not guarantee strict consistency during failures/partitions; `WAIT` minimizes this window but does not provide CP guarantees. | **High Availability** | Seamlessly transitions across cluster node failover when lease state reached the promoted replica. Streams with un-replicated leases are terminated on next renewal rather than resurrected. Different concurrency domains (different `{prefix}`) distribute across cluster shards, but all keys for a single prefix reside on one hash slot. |
+| **Redis Cluster Slot Failover & Replication** | Replicated leases and configuration keys survive slot promotion when a replica is elected. Acknowledged writes (leases or `{prefix}:config`) that have not reached the promoted replica before master failure may be lost. Un-replicated leases are detected as lost on next renewal and cleanly cancelled. Redis Cluster uses asynchronous replication and may lose recently acknowledged writes during failovers. Applications requiring stronger acknowledgment semantics can evaluate Redis replication controls separately; these do not provide CP guarantees. | **High Availability** | Seamlessly transitions across cluster node failover when lease state reached the promoted replica. Streams with un-replicated leases are terminated on next renewal rather than resurrected. Different concurrency domains (different `{prefix}`) distribute across cluster shards, but all keys for a single prefix reside on one hash slot. |
 
 ### Fail-Open Fallback Lease Lifecycle
 
@@ -336,8 +336,32 @@ Because `{prefix}:config` is persistent (stored with `SET ... NX` without TTL ex
 - [`examples/prometheus_metrics_demo.py`](examples/prometheus_metrics_demo.py): Prometheus metrics integration with zero-dependency lifecycle hooks.
 - [`examples/sse_client_resilient.py`](examples/sse_client_resilient.py): Resilient Python SSE client with exponential backoff & jitter.
 
+## Security Best Practices
+
+1. **Authenticated Opaque Principal IDs:**
+   - Always derive `user_id` from a verified authenticated principal (e.g. session user ID, UUID, database primary key).
+   - **Never pass raw, unverified client input** (such as path parameters or query strings) directly as `user_id`. Doing so allows malicious clients to create arbitrary keys in Redis and bypass concurrency bounds.
+   - Avoid using sensitive PII (emails, full names) or raw bearer tokens as `user_id`, as these appear in Redis keys (`{prefix}:user:{user_id}`) and operational debug logs.
+2. **Dependency Floors vs. Production Security:**
+   - The test matrix validates compatibility down to minimum floors (`fastapi>=0.100.0`, `starlette>=0.27.0`, `redis>=5.0.0`).
+   - These are **compatibility floors**, not security recommendations. Production deployments should always maintain up-to-date versions of FastAPI, Starlette, and Redis to benefit from upstream security patches and CVE remediations.
+3. **Automated Vulnerability Scanning:**
+   - All commits and pull requests are audited in CI via `pip-audit` to detect known vulnerabilities across dependencies.
+
+## Stability & Versioning Policy
+
+- **Semantic Versioning (SemVer):** `fastapi-stream-lease` strictly follows SemVer.
+- **Public API Contract:**
+  - Symbols exported from the top-level package (`fastapi_stream_lease`) constitute the public API: `StreamLeaseManager`, `StreamLease`, `LeaseConfig`, circuit breaker configurations (`CircuitBreakerConfig`, `CircuitState`, `BackendFailurePolicy`, `FallbackMode`), and exceptions (`StreamLeaseError`, etc.).
+  - `ProtectedStreamingResponse` is an integration implementation detail of `manager.stream(...)` and `lease.as_streaming_response(...)`; while accessible for custom subclassing, standard applications should rely on the high-level manager and lease methods.
+  - Internal modules, private helper methods prefixed with `_`, and internal Lua script layouts are not covered by stability guarantees and may change between minor releases.
+- **Observability Contract:**
+  - Exported metric names (`fastapi_stream_lease_*`) and dimensional label keys (`scope`, `operation`, `state`) are treated as breaking-change contracts and will remain consistent across major versions.
+- **Path to v1.0.0:**
+  - Version `0.4.0` represents feature completeness. The subsequent `v1.0.0` release is a formal declaration of long-term API stability and freeze following external community bake time.
+
 ## Contributing and security
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the local workflow and [SECURITY.md](SECURITY.md) for private vulnerability reports. Changes are proposed through pull requests and merged by the maintainer after CI passes. The package is licensed under [MIT](LICENSE).
 
-CI checks formatting, lint, strict static typing, Redis 5, 7, and 8 behavior, Redis Sentinel and 6-node Redis Cluster failover chaos validation, package build, and 100% combined statement and branch coverage. Reports and feedback from production deployments are welcome for continuously documenting operational limits.
+CI checks formatting, lint, strict static typing, dependency vulnerability scanning (pip-audit), Redis 5, 7, and 8 behavior, Redis Sentinel and 6-node Redis Cluster failover chaos validation, package build, and 100% combined statement and branch coverage. Reports and feedback from production deployments are welcome for continuously documenting operational limits.

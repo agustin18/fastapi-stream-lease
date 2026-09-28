@@ -78,9 +78,12 @@ app = FastAPI(title="LLM Streaming Protection Demo", lifespan=lifespan)
 
 
 async def authenticated_user(api_key: str = Depends(api_key_header)) -> str:
-    expected = os.environ.get("STREAM_DEMO_TOKEN", "local-secret")
-    if not hmac.compare_digest(api_key, expected):
-        raise HTTPException(status_code=401, detail="Invalid API key")
+    expected = os.environ.get("STREAM_DEMO_TOKEN")
+    if not expected or not hmac.compare_digest(api_key, expected):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid API key (ensure STREAM_DEMO_TOKEN is set in environment)",
+        )
     return "user-enterprise-1"
 
 
