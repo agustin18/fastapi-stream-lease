@@ -641,16 +641,15 @@ async def test_cluster_verify_cluster_config_across_failover(cluster_client):
 
 
 @pytest.mark.asyncio
-async def test_cluster_circuit_breaker_failover_and_recovery():
+async def test_cluster_circuit_breaker_outage_and_recovery():
     """
-    Verify circuit breaker integration under real Redis Cluster outage/failover:
+    Verify circuit breaker integration under real Redis Cluster outage and recovery:
     1. Acquire a lease using manager with circuit breaker enabled (failure_threshold=2).
     2. Flush replication with WAIT.
     3. Induce master pause on the slot primary node to trigger transient socket timeouts.
     4. Consecutive acquire failures record transient errors and trip breaker to OPEN.
     5. Breaker fast-fails new requests while OPEN without contacting Redis.
-    6. Once node recovers / failover settles, renewing existing lease succeeds and
-       heals breaker to CLOSED.
+    6. Once node recovers, renewing existing lease succeeds and heals breaker to CLOSED.
     7. Subsequent acquire succeeds against the cluster.
     """
     nodes_env = os.environ.get(

@@ -35,7 +35,6 @@ _TRANSIENT_REDIS_ERRORS: tuple[type[BaseException], ...] = tuple(
         "SlotNotCoveredError",
         "TryAgainError",
         "ClusterError",
-        "RedisClusterException",
     )
     if (cls := getattr(redis.exceptions, name, None)) is not None
 )
@@ -46,18 +45,26 @@ _TRANSIENT_BUILTIN_ERRORS: tuple[type[BaseException], ...] = (
     asyncio.TimeoutError,
 )
 
+_REDIS_CLUSTER_EXCEPTION_CLS = getattr(redis.exceptions, "RedisClusterException", None)
+
 
 def is_transient_error(exc: BaseException) -> bool:
     """
     Return True if an exception represents a transient network, timeout, or cluster issue.
     Returns False for non-transient errors such as connection pool exhaustion, authentication,
-    invalid Redis commands, or local OS errors.
+    invalid Redis commands, cross-slot violations, or local OS errors.
     """
     if isinstance(exc, _NON_TRANSIENT_CONNECTION_ERRORS):
         return False
     if isinstance(exc, _TRANSIENT_REDIS_ERRORS):
         return True
-    return bool(isinstance(exc, _TRANSIENT_BUILTIN_ERRORS))
+    if isinstance(exc, _TRANSIENT_BUILTIN_ERRORS):
+        return True
+    if _REDIS_CLUSTER_EXCEPTION_CLS is not None and isinstance(exc, _REDIS_CLUSTER_EXCEPTION_CLS):
+        if exc.__cause__ is not None:
+            return is_transient_error(exc.__cause__)
+        return False
+    return False
 
 
 # Backwards compatibility alias for manager module
@@ -157,19 +164,22 @@ class CircuitPermit:
 
     Guarantees that probe counters are cleaned up in HALF_OPEN state regardless of
     whether the operation succeeds, fails, is rejected by business limits, or is
-    interrupted by task cancellation.
+    interrupted by task cancellation. Permits carry a recovery epoch generation token
+    to ensure stale in-flight probe completions do not corrupt newer recovery generations.
     """
 
-    __slots__ = ("_breaker", "_settled", "allowed", "is_probe")
+    __slots__ = ("_breaker", "_settled", "allowed", "generation", "is_probe")
 
     def __init__(
         self,
         allowed: bool,
         is_probe: bool = False,
+        generation: int = 0,
         breaker: CircuitBreaker | None = None,
     ) -> None:
         self.allowed = allowed
         self.is_probe = is_probe
+        self.generation = generation
         self._breaker = breaker
         self._settled = False
 
@@ -179,7 +189,7 @@ class CircuitPermit:
             return
         self._settled = True
         if self._breaker is not None:
-            self._breaker.record_success()
+            self._breaker._record_permit_success(self)
 
     def record_failure(self, exc: BaseException | None = None) -> None:
         """Record a backend failure; trips the breaker if transient, or releases probe if not."""
@@ -187,7 +197,7 @@ class CircuitPermit:
             return
         self._settled = True
         if self._breaker is not None:
-            self._breaker.record_failure(exc)
+            self._breaker._record_permit_failure(self, exc)
 
     def release(self) -> None:
         """
@@ -199,7 +209,7 @@ class CircuitPermit:
         if not self._settled:
             self._settled = True
             if self.is_probe and self._breaker is not None:
-                self._breaker._release_probe()
+                self._breaker._release_probe(self)
 
 
 @dataclass
@@ -213,8 +223,11 @@ class CircuitBreaker:
     - Zero Distributed Coordination: The circuit breaker does not query Redis to determine
       health, eliminating circular dependencies during Redis outages.
     - Probabilistic Herd Mitigation: half_open_max_probes limits concurrent probes per
-      worker process, while random recovery jitter desynchronizes probe attempts across
-      the fleet to mitigate thundering herds without distributed locks.
+      StreamLeaseManager instance, while random recovery jitter desynchronizes probe attempts
+      across the fleet to mitigate thundering herds without distributed locks.
+    - Generational Isolation: Each trip to OPEN, recovery success, or reset advances an epoch
+      generation token. In-flight probes from earlier generations cannot corrupt current
+      recovery state.
     """
 
     config: CircuitBreakerConfig = field(default_factory=CircuitBreakerConfig)
@@ -222,6 +235,7 @@ class CircuitBreaker:
     _consecutive_failures: int = field(default=0, init=False)
     _open_until_monotonic: float = field(default=0.0, init=False)
     _half_open_probes_in_flight: int = field(default=0, init=False)
+    _generation: int = field(default=0, init=False)
 
     @property
     def state(self) -> CircuitState:
@@ -235,6 +249,11 @@ class CircuitBreaker:
         """Count of contiguous transient errors recorded."""
         return self._consecutive_failures
 
+    @property
+    def generation(self) -> int:
+        """Current recovery epoch generation."""
+        return self._generation
+
     def acquire_permit(self) -> CircuitPermit:
         """
         Acquire a permit to execute an outbound backend request.
@@ -244,10 +263,14 @@ class CircuitBreaker:
         """
         current_state = self.state
         if current_state == CircuitState.CLOSED:
-            return CircuitPermit(allowed=True, is_probe=False, breaker=self)
+            return CircuitPermit(
+                allowed=True, is_probe=False, generation=self._generation, breaker=self
+            )
 
         if current_state == CircuitState.OPEN:
-            return CircuitPermit(allowed=False, is_probe=False, breaker=self)
+            return CircuitPermit(
+                allowed=False, is_probe=False, generation=self._generation, breaker=self
+            )
 
         # HALF_OPEN state
         if self._state != CircuitState.HALF_OPEN:
@@ -256,46 +279,47 @@ class CircuitBreaker:
 
         if self._half_open_probes_in_flight < self.config.half_open_max_probes:
             self._half_open_probes_in_flight += 1
-            return CircuitPermit(allowed=True, is_probe=True, breaker=self)
+            return CircuitPermit(
+                allowed=True, is_probe=True, generation=self._generation, breaker=self
+            )
 
-        return CircuitPermit(allowed=False, is_probe=False, breaker=self)
+        return CircuitPermit(
+            allowed=False, is_probe=False, generation=self._generation, breaker=self
+        )
 
-    def allow_request(self) -> bool:
-        """
-        Check whether an outbound request should proceed.
-
-        Returns:
-            bool: True if request is allowed, False if rejected fast.
-        """
-        current_state = self.state
-        if current_state == CircuitState.CLOSED:
-            return True
-
-        if current_state == CircuitState.OPEN:
-            return False
-
-        # HALF_OPEN state
-        if self._state != CircuitState.HALF_OPEN:
-            self._state = CircuitState.HALF_OPEN
-            self._half_open_probes_in_flight = 0
-
-        if self._half_open_probes_in_flight < self.config.half_open_max_probes:
-            self._half_open_probes_in_flight += 1
-            return True
-
-        return False
-
-    def _release_probe(self) -> None:
+    def _release_probe(self, permit: CircuitPermit | None = None) -> None:
         """Release an in-flight probe slot back to the breaker in HALF_OPEN state."""
-        if self._half_open_probes_in_flight > 0:
+        if permit is not None and permit.generation != self._generation:
+            # Stale permit from older epoch; ignore
+            return
+        if self._state == CircuitState.HALF_OPEN and self._half_open_probes_in_flight > 0:
             self._half_open_probes_in_flight -= 1
+
+    def _record_permit_success(self, permit: CircuitPermit) -> None:
+        """Record success from a permit, respecting generation isolation."""
+        if permit.generation != self._generation:
+            # Stale permit from a previous generation; drop
+            return
+        self.record_success()
+
+    def _record_permit_failure(
+        self, permit: CircuitPermit, exc: BaseException | None = None
+    ) -> None:
+        """Record failure from a permit, respecting generation isolation."""
+        if permit.generation != self._generation:
+            # Stale permit from a previous generation; drop
+            return
+        self.record_failure(exc)
 
     def record_success(self) -> None:
         """Record a successful backend operation, closing the circuit if in recovery."""
+        was_open_or_recovering = self._state != CircuitState.CLOSED
         self._consecutive_failures = 0
         self._half_open_probes_in_flight = 0
         self._state = CircuitState.CLOSED
         self._open_until_monotonic = 0.0
+        if was_open_or_recovering:
+            self._generation += 1
 
     def record_failure(self, exc: BaseException | None = None) -> None:
         """
@@ -326,6 +350,7 @@ class CircuitBreaker:
         self._state = CircuitState.OPEN
         self._open_until_monotonic = time.monotonic() + duration
         self._half_open_probes_in_flight = 0
+        self._generation += 1
 
     def reset(self) -> None:
         """Explicitly reset circuit breaker back to initial CLOSED state."""
@@ -333,3 +358,4 @@ class CircuitBreaker:
         self._consecutive_failures = 0
         self._open_until_monotonic = 0.0
         self._half_open_probes_in_flight = 0
+        self._generation += 1

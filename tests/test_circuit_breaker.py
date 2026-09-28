@@ -128,7 +128,9 @@ def test_circuit_breaker_initial_state() -> None:
     )
     assert breaker.state == CircuitState.CLOSED
     assert breaker.consecutive_failures == 0
-    assert breaker.allow_request() is True
+    permit = breaker.acquire_permit()
+    assert permit.allowed is True
+    permit.release()
 
 
 def test_circuit_breaker_ignores_non_transient_errors() -> None:
@@ -140,7 +142,9 @@ def test_circuit_breaker_ignores_non_transient_errors() -> None:
     breaker.record_failure(ValueError("Bad value"))
     assert breaker.consecutive_failures == 0
     assert breaker.state == CircuitState.CLOSED
-    assert breaker.allow_request() is True
+    permit = breaker.acquire_permit()
+    assert permit.allowed is True
+    permit.release()
 
 
 @pytest.mark.parametrize(
@@ -163,7 +167,7 @@ def test_circuit_breaker_trips_to_open_on_threshold(
 
     assert breaker.state == expected_state
     if expected_state == CircuitState.OPEN:
-        assert breaker.allow_request() is False
+        assert breaker.acquire_permit().allowed is False
 
 
 def test_circuit_breaker_half_open_transition_and_probe_success() -> None:
@@ -178,21 +182,26 @@ def test_circuit_breaker_half_open_transition_and_probe_success() -> None:
     breaker.record_failure(redis.exceptions.ConnectionError("err1"))
     breaker.record_failure(redis.exceptions.ConnectionError("err2"))
     assert breaker.state == CircuitState.OPEN
-    assert breaker.allow_request() is False
+    assert breaker.acquire_permit().allowed is False
 
     # Simulate passage of time past recovery_timeout
     with patch("time.monotonic", return_value=time.monotonic() + 1.5):
         assert breaker.state == CircuitState.HALF_OPEN
         # First probe should be allowed
-        assert breaker.allow_request() is True
+        p1 = breaker.acquire_permit()
+        assert p1.allowed is True
         # Second concurrent request while probe in flight should be rejected
-        assert breaker.allow_request() is False
+        p2 = breaker.acquire_permit()
+        assert p2.allowed is False
 
         # Probe succeeds
-        breaker.record_success()
+        p1.record_backend_reachable()
+        p1.release()
         assert breaker.state == CircuitState.CLOSED
         assert breaker.consecutive_failures == 0
-        assert breaker.allow_request() is True
+        p3 = breaker.acquire_permit()
+        assert p3.allowed is True
+        p3.release()
 
 
 def test_circuit_breaker_half_open_probe_failure_reopens() -> None:
@@ -211,12 +220,14 @@ def test_circuit_breaker_half_open_probe_failure_reopens() -> None:
     base_time = time.monotonic()
     with patch("time.monotonic", return_value=base_time + 1.5):
         assert breaker.state == CircuitState.HALF_OPEN
-        assert breaker.allow_request() is True
+        p1 = breaker.acquire_permit()
+        assert p1.allowed is True
 
         # Probe fails
-        breaker.record_failure(redis.exceptions.ConnectionError("still dead"))
+        p1.record_failure(redis.exceptions.ConnectionError("still dead"))
+        p1.release()
         assert breaker.state == CircuitState.OPEN
-        assert breaker.allow_request() is False
+        assert breaker.acquire_permit().allowed is False
 
 
 def test_circuit_breaker_reset() -> None:
@@ -229,7 +240,9 @@ def test_circuit_breaker_reset() -> None:
     breaker.reset()
     assert breaker.state == CircuitState.CLOSED
     assert breaker.consecutive_failures == 0
-    assert breaker.allow_request() is True
+    permit = breaker.acquire_permit()
+    assert permit.allowed is True
+    permit.release()
 
 
 # ============================================================================
@@ -471,6 +484,28 @@ def test_error_classification_transient_vs_non_transient(
     assert is_transient_error(exc) is expected_transient
 
 
+def test_redis_cluster_exception_transient_classification() -> None:
+    cluster_exc_cls = getattr(redis.exceptions, "RedisClusterException", None)
+    if cluster_exc_cls is None:
+        pytest.skip("RedisClusterException not available in this redis-py version")
+
+    # Bare cluster exception without cause -> non-transient
+    bare_exc = cluster_exc_cls("EVAL - all keys must map to the same key slot")
+    assert is_transient_error(bare_exc) is False
+
+    # Cluster exception caused by underlying transient error -> transient
+    conn_cause = ConnectionError("Connection refused")
+    wrapped_conn = cluster_exc_cls("Cannot connect to cluster")
+    wrapped_conn.__cause__ = conn_cause
+    assert is_transient_error(wrapped_conn) is True
+
+    # Cluster exception caused by non-transient error -> non-transient
+    auth_cause = redis.exceptions.AuthenticationError("Auth failure")
+    wrapped_auth = cluster_exc_cls("Auth failed on cluster node")
+    wrapped_auth.__cause__ = auth_cause
+    assert is_transient_error(wrapped_auth) is False
+
+
 def test_circuit_permit_half_open_lifecycle() -> None:
     cb = CircuitBreaker(
         CircuitBreakerConfig(
@@ -573,6 +608,144 @@ def test_circuit_permit_standalone_and_noop_edges() -> None:
     assert cb._half_open_probes_in_flight == 0
     cb._release_probe()
     assert cb._half_open_probes_in_flight == 0
+
+
+def test_circuit_permit_generation_isolation_reopen_and_stale_release() -> None:
+    breaker = CircuitBreaker(
+        CircuitBreakerConfig(
+            failure_threshold=1,
+            recovery_timeout=10.0,
+            jitter=0.0,
+            half_open_max_probes=1,
+        )
+    )
+    assert breaker.generation == 0
+
+    # Trip to OPEN (epoch 1)
+    breaker.record_failure(redis.exceptions.ConnectionError("trip1"))
+    assert breaker.state == CircuitState.OPEN
+    assert breaker.generation == 1
+
+    # Transition to HALF_OPEN (epoch 1)
+    with patch("time.monotonic", return_value=time.monotonic() + 15.0):
+        assert breaker.state == CircuitState.HALF_OPEN
+        probe_a = breaker.acquire_permit()
+        assert probe_a.allowed is True
+        assert probe_a.is_probe is True
+        assert probe_a.generation == 1
+        assert breaker._half_open_probes_in_flight == 1
+
+        # While probe_a is in flight, an error trips breaker back to OPEN (epoch 2)
+        breaker.record_failure(redis.exceptions.ConnectionError("trip2"))
+        assert breaker.state == CircuitState.OPEN
+        assert breaker.generation == 2
+        assert breaker._half_open_probes_in_flight == 0
+
+    # Transition to HALF_OPEN (epoch 2)
+    with patch("time.monotonic", return_value=time.monotonic() + 30.0):
+        assert breaker.state == CircuitState.HALF_OPEN
+        probe_b = breaker.acquire_permit()
+        assert probe_b.allowed is True
+        assert probe_b.is_probe is True
+        assert probe_b.generation == 2
+        assert breaker._half_open_probes_in_flight == 1
+
+        # Probe A (from epoch 1) finishes late and calls release()
+        probe_a.release()
+
+        # Generational isolation: stale probe_a release MUST NOT decrement epoch 2 probe count!
+        assert breaker._half_open_probes_in_flight == 1
+
+        # Sibling request in epoch 2 remains rejected because probe_b is still in flight
+        probe_c = breaker.acquire_permit()
+        assert probe_c.allowed is False
+
+        # Settle probe_b
+        probe_b.record_backend_reachable()
+        probe_b.release()
+        assert breaker.state == CircuitState.CLOSED
+        assert breaker.generation == 3
+
+
+def test_circuit_permit_generation_isolation_sibling_probe_stale_success() -> None:
+    breaker = CircuitBreaker(
+        CircuitBreakerConfig(
+            failure_threshold=1,
+            recovery_timeout=10.0,
+            jitter=0.0,
+            half_open_max_probes=2,
+        )
+    )
+    # Trip to OPEN (epoch 1)
+    breaker.record_failure(redis.exceptions.ConnectionError("trip1"))
+    assert breaker.generation == 1
+
+    # Transition to HALF_OPEN (epoch 1)
+    with patch("time.monotonic", return_value=time.monotonic() + 15.0):
+        assert breaker.state == CircuitState.HALF_OPEN
+        probe_a = breaker.acquire_permit()
+        probe_b = breaker.acquire_permit()
+        assert probe_a.allowed and probe_a.is_probe
+        assert probe_b.allowed and probe_b.is_probe
+        assert probe_a.generation == 1
+        assert probe_b.generation == 1
+        assert breaker._half_open_probes_in_flight == 2
+
+        # Probe A fails with transient error -> trips breaker back to OPEN (epoch 2)
+        probe_a.record_failure(redis.exceptions.ConnectionError("probe_a failed"))
+        probe_a.release()
+        assert breaker.state == CircuitState.OPEN
+        assert breaker.generation == 2
+
+        # Probe B finishes late and reports backend reachable
+        # Must be dropped due to stale generation!
+        probe_b.record_backend_reachable()
+        probe_b.release()
+
+        # Breaker MUST remain OPEN in epoch 2, not falsely healed to CLOSED!
+        assert breaker.state == CircuitState.OPEN
+        assert breaker.generation == 2
+
+
+def test_circuit_permit_generation_isolation_sibling_probe_stale_failure() -> None:
+    breaker = CircuitBreaker(
+        CircuitBreakerConfig(
+            failure_threshold=1,
+            recovery_timeout=10.0,
+            jitter=0.0,
+            half_open_max_probes=2,
+        )
+    )
+    # Trip to OPEN (epoch 1)
+    breaker.record_failure(redis.exceptions.ConnectionError("trip1"))
+    assert breaker.generation == 1
+
+    # Transition to HALF_OPEN (epoch 1)
+    with patch("time.monotonic", return_value=time.monotonic() + 15.0):
+        assert breaker.state == CircuitState.HALF_OPEN
+        probe_a = breaker.acquire_permit()
+        probe_b = breaker.acquire_permit()
+        assert probe_a.allowed and probe_a.is_probe
+        assert probe_b.allowed and probe_b.is_probe
+        assert probe_a.generation == 1
+        assert probe_b.generation == 1
+
+        # Probe A succeeds -> heals breaker to CLOSED (epoch 2)
+        probe_a.record_backend_reachable()
+        probe_a.release()
+        assert breaker.state == CircuitState.CLOSED
+        assert breaker.generation == 2
+        assert breaker.consecutive_failures == 0
+
+        # Probe B reports transient error late
+        # Must be dropped due to stale generation!
+        probe_b.record_failure(redis.exceptions.ConnectionError("probe_b late failure"))
+        probe_b.release()
+
+        # Breaker MUST remain CLOSED in epoch 2 with 0 failures!
+        assert breaker.state == CircuitState.CLOSED
+        assert breaker.generation == 2
+        assert breaker.consecutive_failures == 0
 
 
 @pytest.mark.asyncio

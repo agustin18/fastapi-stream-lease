@@ -204,12 +204,12 @@ Acquisition (`acquire()`) and renewal (`renew()`) have asymmetric failure costs:
 - **`acquire()`** creates new concurrency. Fast-failing an acquire protects the backend from additional load during an outage.
 - **`renew()`** protects existing, active streams. If an active stream misses renewals for `lease_seconds`, it is terminated.
 
-Therefore, **an `OPEN` circuit breaker never blocks renewal attempts**. Active streams continue attempting renewals during their remaining TTL (Adaptive Grace Period). If Redis recovers before lease TTL expires, the first successful renewal immediately heals the circuit breaker back to `CLOSED`, allowing subsequent acquisitions to resume seamlessly across the worker.
+Therefore, **an `OPEN` circuit breaker never blocks renewal attempts**. Active streams continue attempting renewals during their remaining TTL (Adaptive Grace Period). If Redis recovers before lease TTL expires, the first successful renewal immediately heals the circuit breaker back to `CLOSED`, allowing subsequent acquisitions to resume seamlessly for that manager instance.
 
 ### Architecture & Anti-Herd Mitigations
 
 - **Worker-Local Semantics:** State is maintained in-memory per `StreamLeaseManager` instance. There is zero distributed coordination in Redis to manage circuit breaker state, eliminating circular dependencies (we never ask Redis whether Redis is alive).
-- **Probabilistic Herd Mitigation:** `half_open_max_probes` limits probe concurrency per worker process. Random recovery jitter (`recovery_timeout + uniform(0, jitter)`) statistically desynchronizes probe attempts across multi-worker clusters, preventing thundering herd spikes when Redis recovers.
+- **Probabilistic Herd Mitigation:** `half_open_max_probes` limits probe concurrency per `StreamLeaseManager` instance. Random recovery jitter (`recovery_timeout + uniform(0, jitter)`) statistically desynchronizes probe attempts across multi-worker clusters, preventing thundering herd spikes when Redis recovers.
 - **Cluster Fingerprint Compatibility:** Circuit breaker settings are worker-local operational tuning parameters. They are not part of the shared Redis canonical configuration fingerprint (`{prefix}:config`), allowing rolling tuning changes across workers without configuration mismatch errors.
 
 ## Production and Operational Guide

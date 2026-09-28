@@ -56,12 +56,12 @@ class StreamLeaseManager:
         self.redis = redis
         self.config: LeaseConfig = config or LeaseConfig()
         self.telemetry: TelemetryAdapter | None = telemetry if telemetry is not None else metrics
-        self.circuit_breaker: CircuitBreaker | None = None
+        self._circuit_breaker: CircuitBreaker | None = None
         if (
             self.config.failure_policy is not None
             and self.config.failure_policy.circuit_breaker is not None
         ):
-            self.circuit_breaker = CircuitBreaker(self.config.failure_policy.circuit_breaker)
+            self._circuit_breaker = CircuitBreaker(self.config.failure_policy.circuit_breaker)
         self.dispatcher = HookDispatcher(
             max_queue_size=self.config.hook_queue_size,
             sync_inline=False,
@@ -69,6 +69,11 @@ class StreamLeaseManager:
             on_error=self._on_hook_error,
             on_queue_change=self._on_hook_queue_change,
         )
+
+    @property
+    def circuit_breaker(self) -> CircuitBreaker | None:
+        """Internal worker-local circuit breaker state machine, or None if disabled."""
+        return self._circuit_breaker
 
     def _on_hook_drop(self) -> None:
         if self.telemetry is not None:
@@ -209,8 +214,8 @@ class StreamLeaseManager:
 
         # Circuit breaker fast-path check
         permit: CircuitPermit | None = None
-        if self.circuit_breaker is not None:
-            permit = self.circuit_breaker.acquire_permit()
+        if self._circuit_breaker is not None:
+            permit = self._circuit_breaker.acquire_permit()
             if not permit.allowed:
                 duration = 0.0
                 if (
@@ -221,7 +226,7 @@ class StreamLeaseManager:
                     self._safe_record_operation(Operation.ACQUIRE, Outcome.FALLBACK, duration)
                     logger.warning(
                         "Circuit breaker is %s; fallback_mode=FAIL_OPEN allows fallback lease %s",
-                        self.circuit_breaker.state.value,
+                        self._circuit_breaker.state.value,
                         lease_id,
                     )
                     lease = StreamLease(
@@ -240,12 +245,12 @@ class StreamLeaseManager:
                 self._safe_record_operation(Operation.ACQUIRE, Outcome.BACKEND_ERROR, duration)
                 logger.warning(
                     "Circuit breaker is %s; fast-failing acquire for user %s",
-                    self.circuit_breaker.state.value,
+                    self._circuit_breaker.state.value,
                     user_id,
                 )
                 raise StreamLeaseUnavailable(
                     detail=(
-                        f"Circuit breaker is {self.circuit_breaker.state.value.upper()}: "
+                        f"Circuit breaker is {self._circuit_breaker.state.value.upper()}: "
                         "Redis backend unavailable"
                     ),
                     retry_after=self.config.retry_after_seconds,
@@ -372,8 +377,8 @@ class StreamLeaseManager:
                 check_global,
             )
             # Backend call succeeded: Redis is reachable and executed the renewal script.
-            if self.circuit_breaker is not None:
-                self.circuit_breaker.record_success()
+            if self._circuit_breaker is not None:
+                self._circuit_breaker.record_success()
 
             duration = time.monotonic() - start_monotonic
             success = int(result) == 1
@@ -383,8 +388,8 @@ class StreamLeaseManager:
         except Exception as exc:
             duration = time.monotonic() - start_monotonic
             if is_network_error(exc):
-                if self.circuit_breaker is not None:
-                    self.circuit_breaker.record_failure(exc)
+                if self._circuit_breaker is not None:
+                    self._circuit_breaker.record_failure(exc)
                 self._safe_record_backend_error(exc)
                 self._safe_record_operation(Operation.RENEW, Outcome.BACKEND_ERROR, duration)
                 self.dispatcher.dispatch(self.config.on_backend_error, exc)
@@ -444,12 +449,12 @@ class StreamLeaseManager:
         Return the current number of active (non-expired) streams for a user or globally.
         """
         permit: CircuitPermit | None = None
-        if self.circuit_breaker is not None:
-            permit = self.circuit_breaker.acquire_permit()
+        if self._circuit_breaker is not None:
+            permit = self._circuit_breaker.acquire_permit()
             if not permit.allowed:
                 raise StreamLeaseUnavailable(
                     detail=(
-                        f"Circuit breaker is {self.circuit_breaker.state.value.upper()}: "
+                        f"Circuit breaker is {self._circuit_breaker.state.value.upper()}: "
                         "Redis backend unavailable"
                     ),
                     retry_after=self.config.retry_after_seconds,
