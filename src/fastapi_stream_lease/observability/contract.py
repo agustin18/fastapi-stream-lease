@@ -9,6 +9,8 @@ from contextlib import AbstractContextManager
 from enum import Enum
 from typing import Any, Protocol, runtime_checkable
 
+from ..circuit_breaker import CircuitState as CircuitState
+
 DEFAULT_DURATION_BUCKETS: tuple[float, ...] = (
     0.001,
     0.0025,
@@ -125,6 +127,26 @@ def classify_backend_error(exc: BaseException) -> BackendErrorKind:
     return BackendErrorKind.UNKNOWN
 
 
+CIRCUIT_STATE_NUMERIC: dict[CircuitState, int] = {
+    CircuitState.CLOSED: 0,
+    CircuitState.HALF_OPEN: 1,
+    CircuitState.OPEN: 2,
+}
+
+
+def coerce_circuit_state(state: CircuitState | str) -> CircuitState:
+    """Coerce input to CircuitState enum, raising ValueError on unknown values."""
+    if isinstance(state, CircuitState):
+        return state
+    try:
+        return CircuitState(str(state))
+    except ValueError as exc:
+        allowed = [e.value for e in CircuitState]
+        raise ValueError(
+            f"Invalid circuit state '{state}'. Must be strictly one of {allowed}"
+        ) from exc
+
+
 @runtime_checkable
 class TelemetryAdapter(Protocol):
     """
@@ -164,6 +186,14 @@ class TelemetryAdapter(Protocol):
 
     def record_hook_queue_change(self, delta: int) -> None:
         """Record an incremental adjustment to the pending lifecycle hook queue depth."""
+        ...
+
+    def record_circuit_state(self, state: CircuitState | str) -> None:
+        """Record the current circuit breaker state (0=closed, 1=half_open, 2=open)."""
+        ...
+
+    def record_short_circuit(self) -> None:
+        """Record an acquire request rejected because the circuit breaker is OPEN."""
         ...
 
     def trace_operation(self, operation: Operation | str) -> AbstractContextManager[Any]:

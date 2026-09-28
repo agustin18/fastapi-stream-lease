@@ -220,3 +220,28 @@ async def test_as_streaming_response_and_manager_stream(lease_manager, monkeypat
     with pytest.raises(RuntimeError, match="Starlette or FastAPI must be installed"):
         lease_no_starlette.as_streaming_response(token_gen())
     await lease_no_starlette.release()
+
+
+@pytest.mark.asyncio
+async def test_manager_stream_close_source_forwarding(lease_manager) -> None:
+    """Verifies manager.stream forwards close_source to StreamingResponse body iterator."""
+    import contextlib
+
+    closed = False
+
+    async def token_gen():
+        nonlocal closed
+        try:
+            yield "token1"
+            yield "token2"
+        finally:
+            closed = True
+
+    resp = await lease_manager.stream("forward_user", token_gen(), close_source=True)
+    async with contextlib.aclosing(resp.body_iterator):
+        async for chunk in resp.body_iterator:
+            if chunk == "token1":
+                break
+
+    assert closed is True
+    assert await lease_manager.get_active_count("forward_user") == 0

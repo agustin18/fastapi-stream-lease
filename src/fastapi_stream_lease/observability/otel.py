@@ -9,12 +9,15 @@ from contextlib import AbstractContextManager, nullcontext
 from typing import Any, cast
 
 from fastapi_stream_lease.observability.contract import (
+    CIRCUIT_STATE_NUMERIC,
     DEFAULT_DURATION_BUCKETS,
     BackendErrorKind,
+    CircuitState,
     LostReason,
     Operation,
     Outcome,
     coerce_backend_error_kind,
+    coerce_circuit_state,
     coerce_lost_reason,
     coerce_operation,
     coerce_outcome,
@@ -112,6 +115,22 @@ class OpenTelemetryMetrics:
             unit="1",
         )
 
+        self.circuit_state_gauge = self.meter.create_gauge(
+            "fastapi_stream_lease.circuit_state",
+            description=(
+                "Current state of the worker-local circuit breaker (0=closed, 1=half_open, 2=open)."
+            ),
+            unit="1",
+        )
+
+        self.short_circuited_counter = self.meter.create_counter(
+            "fastapi_stream_lease.short_circuited",
+            description=(
+                "Total stream lease acquire requests rejected because the circuit breaker is OPEN."
+            ),
+            unit="1",
+        )
+
     def record_operation(
         self,
         operation: Operation | str,
@@ -152,6 +171,15 @@ class OpenTelemetryMetrics:
     def record_hook_queue_change(self, delta: int) -> None:
         """Record an incremental adjustment to the pending lifecycle hook queue depth."""
         self.hook_queue_depth_counter.add(delta)
+
+    def record_circuit_state(self, state: CircuitState | str) -> None:
+        """Record current circuit breaker state in OpenTelemetry with strict enum validation."""
+        c_state = coerce_circuit_state(state)
+        self.circuit_state_gauge.set(CIRCUIT_STATE_NUMERIC[c_state])
+
+    def record_short_circuit(self) -> None:
+        """Record a short-circuited acquire request in OpenTelemetry."""
+        self.short_circuited_counter.add(1)
 
     def trace_operation(self, operation: Operation | str) -> AbstractContextManager[Any]:
         """

@@ -202,13 +202,15 @@ class StreamLease:
         stream: AsyncIterable[T],
         auto_renew: bool = True,
         renew_interval: float | None = None,
+        close_source: bool = True,
     ) -> AsyncIterator[T]:
         """
         Wrap an async stream (e.g. SSE event generator or LLM token stream).
 
         Renew during long pauses and release when the iterator closes. If renewal
-        fails, interrupt the stream with StreamLeaseLost. Consumers that stop early
-        must close the iterator (for example, with contextlib.aclosing).
+        fails, interrupt the stream with StreamLeaseLost. When close_source=True,
+        deterministically invokes aclose() (or close()) on the underlying stream
+        upon completion, early termination, cancellation, or error.
         """
         renew_task: asyncio.Task[None] | None = None
         lease_lost = asyncio.Event()
@@ -232,7 +234,19 @@ class StreamLease:
         finally:
             if renew_task is not None:
                 await self._stop_auto_renew(renew_task)
-            await self.release(reason=reason)
+            try:
+                if close_source:
+                    aclose = getattr(stream, "aclose", None)
+                    if callable(aclose):
+                        with suppress(Exception):
+                            await aclose()
+                    else:
+                        close = getattr(stream, "close", None)
+                        if callable(close):
+                            with suppress(Exception):
+                                close()
+            finally:
+                await self.release(reason=reason)
 
     def as_streaming_response(
         self,
@@ -242,6 +256,7 @@ class StreamLease:
         headers: dict[str, str] | None = None,
         auto_renew: bool = True,
         renew_interval: float | None = None,
+        close_source: bool = True,
         **kwargs: Any,
     ) -> Any:
         """
@@ -258,7 +273,12 @@ class StreamLease:
             ) from None
 
         return StreamingResponse(
-            self.wrap(stream, auto_renew=auto_renew, renew_interval=renew_interval),
+            self.wrap(
+                stream,
+                auto_renew=auto_renew,
+                renew_interval=renew_interval,
+                close_source=close_source,
+            ),
             media_type=media_type,
             status_code=status_code,
             headers=headers,

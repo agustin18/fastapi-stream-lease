@@ -27,12 +27,14 @@ from fastapi_stream_lease.manager import StreamLeaseManager
 from fastapi_stream_lease.observability.contract import (
     DEFAULT_DURATION_BUCKETS,
     BackendErrorKind,
+    CircuitState,
     LostReason,
     Operation,
     Outcome,
     TelemetryAdapter,
     classify_backend_error,
     coerce_backend_error_kind,
+    coerce_circuit_state,
     coerce_lost_reason,
     coerce_operation,
     coerce_outcome,
@@ -62,6 +64,13 @@ def test_strict_cardinality_coercion() -> None:
     assert coerce_backend_error_kind(BackendErrorKind.TIMEOUT) == BackendErrorKind.TIMEOUT
     with pytest.raises(ValueError, match="Invalid backend error kind 'bad_kind'"):
         coerce_backend_error_kind("bad_kind")
+
+    assert coerce_circuit_state("closed") == CircuitState.CLOSED
+    assert coerce_circuit_state("half_open") == CircuitState.HALF_OPEN
+    assert coerce_circuit_state("open") == CircuitState.OPEN
+    assert coerce_circuit_state(CircuitState.OPEN) == CircuitState.OPEN
+    with pytest.raises(ValueError, match="Invalid circuit state 'bad_state'"):
+        coerce_circuit_state("bad_state")
 
 
 @pytest.mark.parametrize(
@@ -525,6 +534,12 @@ async def test_broken_telemetry_failure_isolation(fake_redis) -> None:
         def record_hook_queue_change(self, delta: int) -> None:
             raise RuntimeError("record_hook_queue_change simulated failure")
 
+        def record_circuit_state(self, state: Any) -> None:
+            raise RuntimeError("record_circuit_state simulated failure")
+
+        def record_short_circuit(self) -> None:
+            raise RuntimeError("record_short_circuit simulated failure")
+
         def trace_operation(self, operation: Any) -> Any:
             raise RuntimeError("trace_operation simulated failure")
 
@@ -562,6 +577,8 @@ async def test_broken_telemetry_failure_isolation(fake_redis) -> None:
     manager._safe_record_lost("redis_revoked")
     manager._safe_record_backend_error(ConnectionError("fail"))
     manager._safe_record_fallback()
+    manager._safe_record_circuit_state(CircuitState.OPEN)
+    manager._safe_record_short_circuit()
 
     # 7. Verify property alias works
     assert manager.metrics is broken
@@ -758,3 +775,71 @@ async def test_manager_dispatcher_hook_error_telemetry(fake_redis) -> None:
 
     val = registry.get_sample_value("fastapi_stream_lease_hook_errors_total")
     assert val == 1.0
+
+
+@pytest.mark.asyncio
+async def test_prometheus_circuit_breaker_metrics() -> None:
+    """Verifies Prometheus gauge and counter for circuit breaker states and short circuits."""
+    registry = CollectorRegistry()
+    metrics = PrometheusMetrics(registry=registry)
+
+    # Initial state gauge value
+    metrics.record_circuit_state(CircuitState.CLOSED)
+    assert registry.get_sample_value("fastapi_stream_lease_circuit_state") == 0.0
+
+    metrics.record_circuit_state(CircuitState.HALF_OPEN)
+    assert registry.get_sample_value("fastapi_stream_lease_circuit_state") == 1.0
+
+    metrics.record_circuit_state("open")
+    assert registry.get_sample_value("fastapi_stream_lease_circuit_state") == 2.0
+
+    # Short circuited counter
+    metrics.record_short_circuit()
+    metrics.record_short_circuit()
+    assert registry.get_sample_value("fastapi_stream_lease_short_circuited_total") == 2.0
+
+
+def test_otel_circuit_breaker_metrics() -> None:
+    """Verifies OpenTelemetry gauge and counter for circuit breaker states and short circuits."""
+    metric_reader = InMemoryMetricReader()
+    meter_provider = MeterProvider(metric_readers=[metric_reader])
+    otel = OpenTelemetryMetrics(meter_provider=meter_provider)
+
+    otel.record_circuit_state(CircuitState.CLOSED)
+    otel.record_circuit_state("open")
+    otel.record_short_circuit()
+
+
+@pytest.mark.asyncio
+async def test_manager_circuit_breaker_metrics_integration(fake_redis) -> None:
+    """Verifies end-to-end integration between manager circuit breaker and Prometheus metrics."""
+    registry = CollectorRegistry()
+    metrics = PrometheusMetrics(registry=registry)
+    config = LeaseConfig(
+        failure_policy={"circuit_breaker": {"failure_threshold": 1, "recovery_timeout": 60.0}}
+    )
+    manager = StreamLeaseManager(fake_redis, config, telemetry=metrics)
+
+    # Initially CLOSED
+    assert registry.get_sample_value("fastapi_stream_lease_circuit_state") == 0.0
+
+    # Trigger failure to trip breaker to OPEN
+    with patch.object(fake_redis, "eval", side_effect=ConnectionError("backend failure")):
+        with pytest.raises(StreamLeaseUnavailable):
+            await manager.acquire("user_cb_metric")
+
+    # Circuit breaker tripped to OPEN: gauge must be 2.0
+    assert registry.get_sample_value("fastapi_stream_lease_circuit_state") == 2.0
+
+    # Next acquire is short-circuited: increments short_circuited_total
+    with pytest.raises(StreamLeaseUnavailable, match="Circuit breaker is OPEN"):
+        await manager.acquire("user_cb_metric")
+
+    assert registry.get_sample_value("fastapi_stream_lease_short_circuited_total") == 1.0
+
+    # get_active_count also short-circuits and increments
+    with pytest.raises(StreamLeaseUnavailable, match="Circuit breaker is OPEN"):
+        await manager.get_active_count("user_cb_metric")
+
+    assert registry.get_sample_value("fastapi_stream_lease_short_circuited_total") == 2.0
+    await manager.close()

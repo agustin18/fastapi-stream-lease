@@ -1144,3 +1144,139 @@ async def test_verify_cluster_config_with_bytes_and_string_payloads(fake_redis):
     manager.redis.get = AsyncMock(return_value=json.dumps(payload))
     assert await manager.verify_cluster_config(strict=True) is True
     await manager.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "exit_mode,close_source,expected_cleaned",
+    [
+        ("early_break", True, True),
+        ("early_break", False, False),
+        ("error_break", True, True),
+        ("error_break", False, False),
+    ],
+)
+async def test_wrap_stream_close_source_lifecycle(
+    lease_manager, exit_mode: str, close_source: bool, expected_cleaned: bool
+) -> None:
+    """Verifies deterministic execution of upstream generator cleanup via aclose()."""
+    import contextlib
+
+    cleaned = False
+
+    async def sample_generator():
+        nonlocal cleaned
+        try:
+            yield "token1"
+            yield "token2"
+        finally:
+            cleaned = True
+
+    lease = await lease_manager.acquire("user_cleanup")
+    wrapped = lease.wrap(sample_generator(), auto_renew=False, close_source=close_source)
+
+    if exit_mode == "early_break":
+        async with contextlib.aclosing(wrapped):
+            async for chunk in wrapped:
+                if chunk == "token1":
+                    break
+    elif exit_mode == "error_break":
+        with pytest.raises(RuntimeError, match="downstream consumer exploded"):
+            async with contextlib.aclosing(wrapped):
+                async for chunk in wrapped:
+                    if chunk == "token1":
+                        raise RuntimeError("downstream consumer exploded")
+
+    assert cleaned is expected_cleaned
+    assert await lease_manager.get_active_count("user_cleanup") == 0
+
+
+@pytest.mark.asyncio
+async def test_wrap_stream_close_source_suppresses_aclose_error_and_releases(
+    lease_manager,
+) -> None:
+    """Verifies that an exception in stream aclose() is safely suppressed
+    and the lease is released.
+    """
+
+    class FaultyStream:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise StopAsyncIteration
+
+        async def aclose(self):
+            raise RuntimeError("upstream closing exploded")
+
+    lease = await lease_manager.acquire("user_faulty")
+    wrapped = lease.wrap(FaultyStream(), auto_renew=False, close_source=True)
+    async for _ in wrapped:
+        pass
+    assert await lease_manager.get_active_count("user_faulty") == 0
+
+
+@pytest.mark.asyncio
+async def test_wrap_stream_close_source_handles_synchronous_close(
+    lease_manager,
+) -> None:
+    """Verifies that streams providing synchronous close() are deterministically closed."""
+    sync_closed = False
+
+    class SyncCloseStream:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise StopAsyncIteration
+
+        def close(self):
+            nonlocal sync_closed
+            sync_closed = True
+
+    lease = await lease_manager.acquire("user_sync_close")
+    wrapped = lease.wrap(SyncCloseStream(), auto_renew=False, close_source=True)
+    async for _ in wrapped:
+        pass
+    assert sync_closed is True
+    assert await lease_manager.get_active_count("user_sync_close") == 0
+
+
+@pytest.mark.asyncio
+async def test_wrap_stream_close_source_handles_bare_and_faulty_sync_stream(
+    lease_manager,
+) -> None:
+    """Verifies that bare streams (no close/aclose) and streams whose close() raises
+    an exception are safely handled without failing lease release.
+    """
+
+    class BareStream:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise StopAsyncIteration
+
+    class FaultySyncStream:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise StopAsyncIteration
+
+        def close(self):
+            raise ValueError("sync close failed")
+
+    # Bare stream
+    lease_bare = await lease_manager.acquire("user_bare")
+    wrapped_bare = lease_bare.wrap(BareStream(), auto_renew=False, close_source=True)
+    async for _ in wrapped_bare:
+        pass
+    assert await lease_manager.get_active_count("user_bare") == 0
+
+    # Faulty sync stream
+    lease_faulty = await lease_manager.acquire("user_faulty_sync")
+    wrapped_faulty = lease_faulty.wrap(FaultySyncStream(), auto_renew=False, close_source=True)
+    async for _ in wrapped_faulty:
+        pass
+    assert await lease_manager.get_active_count("user_faulty_sync") == 0

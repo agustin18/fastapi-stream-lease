@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- **Deterministic Upstream Iterator Cancellation & Cleanup (`close_source`)**: Added `close_source: bool = True` to `lease.wrap()`, `lease.as_streaming_response()`, and `manager.stream()`. When client disconnects or an error occurs during stream iteration, the underlying upstream generator or iterator is deterministically closed via `await stream.aclose()` (or synchronous `stream.close()`). Upstream cleanup errors are safely suppressed, guaranteeing that the Redis lease is always released without leaking active lease slots or hanging background LLM generations.
+- **Circuit Breaker Observability Telemetry**: Extended telemetry adapters (Prometheus and OpenTelemetry) with dedicated circuit breaker metrics:
+  - `circuit_state` (Gauge): Exports current worker-local circuit breaker state (`CLOSED = 0`, `HALF_OPEN = 1`, `OPEN = 2`).
+  - `short_circuited_total` / `fastapi_stream_lease.short_circuited` (Counter): Measures total acquire requests rejected because the circuit breaker is in `OPEN` state.
+  - Automatically wired into `StreamLeaseManager` lifecycle (`__init__`, `acquire()`, `renew()`, `release()`, and `get_active_count()`).
+
 ## 0.3.0 — 2026-09-28
 
 - **Adaptive Circuit Breaker & Thundering Herd Protection**: Added production-grade circuit breaker (`CircuitBreakerConfig`, `CircuitState`, `BackendFailurePolicy`) safeguarding Redis backends during outages, Sentinel failovers, and network partitions. Features state transitions (`CLOSED`, `OPEN`, `HALF_OPEN`), bounded probe concurrency (`half_open_max_probes`), jittered recovery cooldown, and fast-failing with `StreamLeaseUnavailable` or graceful fallback under `FallbackMode.FAIL_OPEN`.

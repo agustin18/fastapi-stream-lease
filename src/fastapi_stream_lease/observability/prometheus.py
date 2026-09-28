@@ -9,12 +9,15 @@ from contextlib import AbstractContextManager, nullcontext
 from typing import Any
 
 from fastapi_stream_lease.observability.contract import (
+    CIRCUIT_STATE_NUMERIC,
     DEFAULT_DURATION_BUCKETS,
     BackendErrorKind,
+    CircuitState,
     LostReason,
     Operation,
     Outcome,
     coerce_backend_error_kind,
+    coerce_circuit_state,
     coerce_lost_reason,
     coerce_operation,
     coerce_outcome,
@@ -102,6 +105,18 @@ class PrometheusMetrics:
             registry=self.registry,
         )
 
+        self.circuit_state = prom.Gauge(
+            "fastapi_stream_lease_circuit_state",
+            "Current state of the worker-local circuit breaker (0=closed, 1=half_open, 2=open).",
+            registry=self.registry,
+        )
+
+        self.short_circuited_total = prom.Counter(
+            "fastapi_stream_lease_short_circuited_total",
+            "Total stream lease acquire requests rejected because the circuit breaker is OPEN.",
+            registry=self.registry,
+        )
+
     def record_operation(
         self,
         operation: Operation | str,
@@ -144,6 +159,15 @@ class PrometheusMetrics:
             self.hook_queue_depth.inc(float(delta))
         elif delta < 0:
             self.hook_queue_depth.dec(float(-delta))
+
+    def record_circuit_state(self, state: CircuitState | str) -> None:
+        """Record the current circuit breaker state on the Prometheus gauge."""
+        c_state = coerce_circuit_state(state)
+        self.circuit_state.set(float(CIRCUIT_STATE_NUMERIC[c_state]))
+
+    def record_short_circuit(self) -> None:
+        """Increment the short-circuited acquire requests counter."""
+        self.short_circuited_total.inc()
 
     def trace_operation(self, operation: Operation | str) -> AbstractContextManager[Any]:
         """No-op context manager for metrics-only Prometheus adapter."""
