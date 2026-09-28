@@ -641,19 +641,25 @@ async def test_cluster_verify_cluster_config_across_failover(cluster_client):
 
 
 @pytest.mark.asyncio
-async def test_cluster_circuit_breaker_failover_and_recovery(cluster_client):
+async def test_cluster_circuit_breaker_failover_and_recovery():
     """
-    Verify circuit breaker integration under real Redis Cluster failover:
+    Verify circuit breaker integration under real Redis Cluster outage/failover:
     1. Acquire a lease using manager with circuit breaker enabled (failure_threshold=2).
     2. Flush replication with WAIT.
-    3. Induce master pause on the slot primary node to trigger transient errors.
+    3. Induce master pause on the slot primary node to trigger transient socket timeouts.
     4. Consecutive acquire failures record transient errors and trip breaker to OPEN.
     5. Breaker fast-fails new requests while OPEN without contacting Redis.
     6. Once node recovers / failover settles, renewing existing lease succeeds and
        heals breaker to CLOSED.
     7. Subsequent acquire succeeds against the cluster.
     """
-    await wait_for_cluster_ready(cluster_client)
+    nodes_env = os.environ.get(
+        "REDIS_CLUSTER_NODES", "redis-cluster-1:7000,redis-cluster-2:7001,redis-cluster-3:7002"
+    )
+    first_node = nodes_env.split(",")[0].strip()
+    client = RedisCluster.from_url(f"redis://{first_node}", socket_timeout=0.5)
+    await wait_for_cluster_ready(client)
+
     cb_cfg = CircuitBreakerConfig(failure_threshold=2, recovery_timeout=5.0, jitter=0.0)
     policy = BackendFailurePolicy(fallback_mode=FallbackMode.FAIL_CLOSED, circuit_breaker=cb_cfg)
     prefix = f"cluster_cb_{uuid4().hex[:8]}"
@@ -664,55 +670,67 @@ async def test_cluster_circuit_breaker_failover_and_recovery(cluster_client):
         key_prefix=prefix,
         failure_policy=policy,
     )
-    manager = StreamLeaseManager(redis=cluster_client, config=config)
+    manager = StreamLeaseManager(redis=client, config=config)
 
-    # 1. Acquire initial active lease
-    lease = await manager.acquire("user_cluster_cb")
-    assert manager.circuit_breaker is not None
-    assert manager.circuit_breaker.state == CircuitState.CLOSED
-
-    # Discover slot nodes
-    slot = await cluster_client.cluster_keyslot(config.global_key)
-    (master_host, master_port), _ = await discover_slot_nodes(cluster_client, slot)
-
-    # Flush replication to replica so lease survives
-    raw_master = aioredis.from_url(f"redis://{master_host}:{master_port}")
     try:
-        with suppress(Exception):
-            await raw_master.execute_command("WAIT", 1, 1000)
+        # 1. Acquire initial active lease
+        lease = await manager.acquire("user_cluster_cb")
+        assert manager.circuit_breaker is not None
+        assert manager.circuit_breaker.state == CircuitState.CLOSED
+
+        # Discover slot nodes
+        slot = await client.cluster_keyslot(config.global_key)
+        (master_host, master_port), _ = await discover_slot_nodes(client, slot)
+
+        # Flush replication to replica so lease survives
+        raw_master = aioredis.from_url(f"redis://{master_host}:{master_port}")
+        try:
+            with suppress(Exception):
+                await raw_master.execute_command("WAIT", 1, 1000)
+        finally:
+            await safe_close_client(raw_master)
+
+        # 2. Pause master node for slot in background to induce cluster disruption
+        conn_pause = aioredis.from_url(f"redis://{master_host}:{master_port}", socket_timeout=0.5)
+
+        async def pause_node() -> None:
+            try:
+                await conn_pause.execute_command("DEBUG", "SLEEP", 3.0)
+            except Exception:
+                pass
+            finally:
+                await safe_close_client(conn_pause)
+
+        pause_task = asyncio.create_task(pause_node())
+        await asyncio.sleep(0.1)
+
+        # 3. Consecutive acquires fail during outage and trip the breaker to OPEN
+        for i in range(3):
+            with suppress(StreamLeaseUnavailable):
+                await manager.acquire(f"user_cluster_probe_{i}")
+
+        assert manager.circuit_breaker.state == CircuitState.OPEN
+
+        # 4. Next acquire fast-fails because breaker is OPEN
+        with pytest.raises(StreamLeaseUnavailable, match="Circuit breaker is OPEN"):
+            await manager.acquire("user_cluster_fast_fail")
+
+        # 5. Wait for paused node to wake up and cluster to stabilize
+        await pause_task
+        await asyncio.sleep(1.0)
+        await wait_for_cluster_ready(client)
+
+        # 6. Existing lease renewal attempts Redis (golden asymmetry) and heals breaker
+        renewed = await manager.renew(lease)
+        assert renewed is True
+        assert manager.circuit_breaker.state == CircuitState.CLOSED
+        assert manager.circuit_breaker.consecutive_failures == 0
+
+        # 7. Subsequent acquire succeeds
+        lease2 = await manager.acquire("user_cluster_recovered")
+        assert lease2.lease_id is not None
+        await lease.release()
+        await lease2.release()
     finally:
-        await safe_close_client(raw_master)
-
-    # 2. Pause master node for slot to induce cluster disruption
-    conn_pause = aioredis.from_url(f"redis://{master_host}:{master_port}", socket_timeout=0.5)
-    try:
-        with suppress(Exception):
-            await conn_pause.execute_command("DEBUG", "SLEEP", 2.0)
-    finally:
-        await safe_close_client(conn_pause)
-
-    # 3. Consecutive acquires fail during outage and trip the breaker to OPEN
-    for _ in range(3):
-        with suppress(StreamLeaseUnavailable):
-            await manager.acquire("user_cluster_probe")
-
-    assert manager.circuit_breaker.state == CircuitState.OPEN
-
-    # 4. Next acquire fast-fails because breaker is OPEN
-    with pytest.raises(StreamLeaseUnavailable, match="Circuit breaker is OPEN"):
-        await manager.acquire("user_cluster_fast_fail")
-
-    # 5. Wait for paused node to wake up and cluster to stabilize
-    await asyncio.sleep(2.5)
-    await wait_for_cluster_ready(cluster_client)
-
-    # 6. Existing lease renewal attempts Redis (golden asymmetry) and heals breaker
-    renewed = await manager.renew(lease)
-    assert renewed is True
-    assert manager.circuit_breaker.state == CircuitState.CLOSED
-    assert manager.circuit_breaker.consecutive_failures == 0
-
-    # 7. Subsequent acquire succeeds
-    lease2 = await manager.acquire("user_cluster_recovered")
-    assert lease2.lease_id is not None
-    await manager.close()
+        await manager.close()
+        await safe_close_client(client)

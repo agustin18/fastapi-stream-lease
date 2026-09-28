@@ -171,9 +171,9 @@ from fastapi_stream_lease import (
 policy = BackendFailurePolicy(
     fallback_mode=FallbackMode.FAIL_CLOSED,  # Or FallbackMode.FAIL_OPEN
     circuit_breaker=CircuitBreakerConfig(
-        failure_threshold=5,     # Consecutive transient errors before tripping OPEN
-        recovery_timeout=10.0,   # Base cooldown seconds before HALF_OPEN testing
-        jitter=1.0,              # Random uniform jitter added to recovery window
+        failure_threshold=5,  # Consecutive transient errors before tripping OPEN
+        recovery_timeout=10.0,  # Base cooldown seconds before HALF_OPEN testing
+        jitter=1.0,  # Random uniform jitter added to recovery window
         half_open_max_probes=1,  # Max concurrent probe requests allowed in HALF_OPEN
     ),
 )

@@ -35,6 +35,7 @@ _TRANSIENT_REDIS_ERRORS: tuple[type[BaseException], ...] = tuple(
         "SlotNotCoveredError",
         "TryAgainError",
         "ClusterError",
+        "RedisClusterException",
     )
     if (cls := getattr(redis.exceptions, name, None)) is not None
 )
