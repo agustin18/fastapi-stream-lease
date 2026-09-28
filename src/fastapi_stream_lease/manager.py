@@ -9,8 +9,11 @@ from contextlib import asynccontextmanager, contextmanager
 from typing import Any
 from uuid import uuid4
 
-import redis.exceptions
-
+from fastapi_stream_lease.circuit_breaker import (
+    CircuitBreaker,
+    FallbackMode,
+    is_network_error,
+)
 from fastapi_stream_lease.config import LeaseConfig
 from fastapi_stream_lease.dispatcher import HookDispatcher
 from fastapi_stream_lease.exceptions import (
@@ -37,46 +40,6 @@ from fastapi_stream_lease.observability.contract import (
 logger = logging.getLogger(__name__)
 
 
-_NON_TRANSIENT_REDIS_ERRORS: tuple[type[BaseException], ...] = tuple(
-    cls
-    for name in ("AuthenticationError", "AuthorizationError", "ClusterCrossSlotError")
-    if (cls := getattr(redis.exceptions, name, None)) is not None
-)
-
-_TRANSIENT_REDIS_ERRORS: tuple[type[BaseException], ...] = tuple(
-    cls
-    for name in (
-        "ConnectionError",
-        "TimeoutError",
-        "ReadOnlyError",
-        "ClusterDownError",
-        "MasterDownError",
-        "SlotNotCoveredError",
-        "TryAgainError",
-        "ClusterError",
-    )
-    if (cls := getattr(redis.exceptions, name, None)) is not None
-)
-
-_TRANSIENT_BUILTIN_ERRORS: tuple[type[BaseException], ...] = (
-    ConnectionError,
-    TimeoutError,
-    asyncio.TimeoutError,
-    OSError,
-)
-
-_ALL_TRANSIENT_ERRORS: tuple[type[BaseException], ...] = (
-    _TRANSIENT_REDIS_ERRORS + _TRANSIENT_BUILTIN_ERRORS
-)
-
-
-def is_network_error(exc: BaseException) -> bool:
-    """Return True for transient network, timeout, failover, or cluster state conditions."""
-    if isinstance(exc, _NON_TRANSIENT_REDIS_ERRORS):
-        return False
-    return isinstance(exc, _ALL_TRANSIENT_ERRORS)
-
-
 class StreamLeaseManager:
     """
     Coordinates distributed stream concurrency leases backed by atomic Redis Lua scripts.
@@ -92,6 +55,12 @@ class StreamLeaseManager:
         self.redis = redis
         self.config: LeaseConfig = config or LeaseConfig()
         self.telemetry: TelemetryAdapter | None = telemetry if telemetry is not None else metrics
+        self.circuit_breaker: CircuitBreaker | None = None
+        if (
+            self.config.failure_policy is not None
+            and self.config.failure_policy.circuit_breaker is not None
+        ):
+            self.circuit_breaker = CircuitBreaker(self.config.failure_policy.circuit_breaker)
         self.dispatcher = HookDispatcher(
             max_queue_size=self.config.hook_queue_size,
             sync_inline=False,
@@ -236,6 +205,48 @@ class StreamLeaseManager:
         user_key = self.config.user_key(user_id)
         global_key = self.config.global_key
         start_monotonic = time.monotonic()
+
+        # Circuit breaker fast-path check
+        if self.circuit_breaker is not None and not self.circuit_breaker.allow_request():
+            duration = 0.0
+            if (
+                self.config.failure_policy is not None
+                and self.config.failure_policy.fallback_mode == FallbackMode.FAIL_OPEN
+            ):
+                self._safe_record_fallback()
+                self._safe_record_operation(Operation.ACQUIRE, Outcome.FALLBACK, duration)
+                logger.warning(
+                    "Circuit breaker is %s; fallback_mode=FAIL_OPEN allows fallback lease %s",
+                    self.circuit_breaker.state.value,
+                    lease_id,
+                )
+                lease = StreamLease(
+                    lease_id=lease_id,
+                    user_id=user_id,
+                    user_key=user_key,
+                    global_key=global_key,
+                    manager=self,
+                    created_at=time.time(),
+                    created_monotonic=start_monotonic,
+                )
+                lease._is_fallback = True
+                self.dispatcher.dispatch(self.config.on_acquired, lease)
+                return lease
+
+            self._safe_record_operation(Operation.ACQUIRE, Outcome.BACKEND_ERROR, duration)
+            logger.warning(
+                "Circuit breaker is %s; fast-failing acquire for user %s",
+                self.circuit_breaker.state.value,
+                user_id,
+            )
+            raise StreamLeaseUnavailable(
+                detail=(
+                    f"Circuit breaker is {self.circuit_breaker.state.value.upper()}: "
+                    "Redis backend unavailable"
+                ),
+                retry_after=self.config.retry_after_seconds,
+            )
+
         with self._safe_trace_operation(Operation.ACQUIRE):
             try:
                 result = await self.redis.eval(
@@ -252,6 +263,8 @@ class StreamLeaseManager:
             except Exception as exc:
                 duration = time.monotonic() - start_monotonic
                 if is_network_error(exc):
+                    if self.circuit_breaker is not None:
+                        self.circuit_breaker.record_failure(exc)
                     self._safe_record_backend_error(exc)
                     self.dispatcher.dispatch(self.config.on_backend_error, exc)
                     if self.config.fail_open:
@@ -306,6 +319,8 @@ class StreamLeaseManager:
             if code != 1:
                 raise RuntimeError(f"Unexpected stream lease acquisition return code: {code}")
 
+            if self.circuit_breaker is not None:
+                self.circuit_breaker.record_success()
             self._safe_record_operation(Operation.ACQUIRE, Outcome.SUCCESS, duration)
 
             lease = StreamLease(
@@ -344,12 +359,16 @@ class StreamLeaseManager:
             )
             duration = time.monotonic() - start_monotonic
             success = int(result) == 1
+            if success and self.circuit_breaker is not None:
+                self.circuit_breaker.record_success()
             outcome = Outcome.SUCCESS if success else Outcome.REVOKED
             self._safe_record_operation(Operation.RENEW, outcome, duration)
             return success
         except Exception as exc:
             duration = time.monotonic() - start_monotonic
             if is_network_error(exc):
+                if self.circuit_breaker is not None:
+                    self.circuit_breaker.record_failure(exc)
                 self._safe_record_backend_error(exc)
                 self._safe_record_operation(Operation.RENEW, Outcome.BACKEND_ERROR, duration)
                 self.dispatcher.dispatch(self.config.on_backend_error, exc)
@@ -383,11 +402,15 @@ class StreamLeaseManager:
                 lease.global_key,
                 lease.lease_id,
             )
+            if self.circuit_breaker is not None:
+                self.circuit_breaker.record_success()
             duration = time.monotonic() - start_monotonic
             self._safe_record_operation(Operation.RELEASE, Outcome.SUCCESS, duration)
         except Exception as exc:
             duration = time.monotonic() - start_monotonic
             if is_network_error(exc):
+                if self.circuit_breaker is not None:
+                    self.circuit_breaker.record_failure(exc)
                 self._safe_record_backend_error(exc)
                 self._safe_record_operation(Operation.RELEASE, Outcome.BACKEND_ERROR, duration)
                 self.dispatcher.dispatch(self.config.on_backend_error, exc)
@@ -404,14 +427,26 @@ class StreamLeaseManager:
         """
         Return the current number of active (non-expired) streams for a user or globally.
         """
+        if self.circuit_breaker is not None and not self.circuit_breaker.allow_request():
+            raise StreamLeaseUnavailable(
+                detail=(
+                    f"Circuit breaker is {self.circuit_breaker.state.value.upper()}: "
+                    "Redis backend unavailable"
+                ),
+                retry_after=self.config.retry_after_seconds,
+            )
         target_key = (
             self.config.user_key(user_id) if user_id is not None else self.config.global_key
         )
         try:
             count = await self.redis.eval(COUNT_SCRIPT, 1, target_key)
+            if self.circuit_breaker is not None:
+                self.circuit_breaker.record_success()
             return int(count)
         except Exception as exc:
             if is_network_error(exc):
+                if self.circuit_breaker is not None:
+                    self.circuit_breaker.record_failure(exc)
                 self._safe_record_backend_error(exc)
                 self.dispatcher.dispatch(self.config.on_backend_error, exc)
                 logger.warning(
