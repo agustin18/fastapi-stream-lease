@@ -9,7 +9,6 @@ from contextlib import asynccontextmanager
 
 import redis.asyncio as redis
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import StreamingResponse
 from fastapi.security import APIKeyHeader
 
 from fastapi_stream_lease import (
@@ -60,11 +59,9 @@ async def unavailable(request: Request, exc: StreamLeaseUnavailable):
 
 @app.get("/stream")
 async def stream(user_id: str = Depends(authenticated_user)):
-    lease = await manager.acquire(user_id)
-
     async def events():
         for index in range(5):
             yield f"data: event {index}\n\n"
             await asyncio.sleep(2)
 
-    return StreamingResponse(lease.wrap(events()), media_type="text/event-stream")
+    return await manager.stream(user_id, events(), media_type="text/event-stream")

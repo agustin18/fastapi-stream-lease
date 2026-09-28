@@ -129,8 +129,12 @@ def metrics():
     return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
-@app.get("/stream/{user_id}")
-async def stream(user_id: str):
+# Note on identity security: In production, derive user_id from an authenticated principal
+# (e.g. Depends(get_current_user)). NEVER pass an unverified client parameter directly as user_id.
+@app.get("/stream")
+async def stream():
+    user_id = "authenticated_demo_user"
+
     async def sample_gen():
         for i in range(5):
             yield f"data: metric_event_{i}\n\n"
