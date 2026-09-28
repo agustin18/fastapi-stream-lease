@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from math import isfinite
 from typing import Any
 
@@ -57,8 +57,29 @@ class LeaseConfig:
     def __post_init__(self) -> None:
         if self.failure_policy is not None:
             if isinstance(self.failure_policy, dict):
+                allowed_policy_keys = {"circuit_breaker", "fallback_mode"}
+                unknown_policy_keys = set(self.failure_policy.keys()) - allowed_policy_keys
+                if unknown_policy_keys:
+                    raise ValueError(
+                        f"Unknown keys in failure_policy dict: {sorted(unknown_policy_keys)}"
+                    )
                 cb_raw = self.failure_policy.get("circuit_breaker")
-                cb_obj = CircuitBreakerConfig(**cb_raw) if isinstance(cb_raw, dict) else cb_raw
+                cb_obj: CircuitBreakerConfig | None
+                if isinstance(cb_raw, dict):
+                    allowed_cb_keys = {f.name for f in fields(CircuitBreakerConfig)}
+                    unknown_cb_keys = set(cb_raw.keys()) - allowed_cb_keys
+                    if unknown_cb_keys:
+                        raise ValueError(
+                            f"Unknown keys in circuit_breaker dict: {sorted(unknown_cb_keys)}"
+                        )
+                    cb_obj = CircuitBreakerConfig(**cb_raw)
+                elif cb_raw is None or isinstance(cb_raw, CircuitBreakerConfig):
+                    cb_obj = cb_raw
+                else:
+                    raise TypeError(
+                        "circuit_breaker in failure_policy dict must be a dict, "
+                        f"CircuitBreakerConfig, or None, got {type(cb_raw).__name__}"
+                    )
                 mode_raw = self.failure_policy.get("fallback_mode", FallbackMode.FAIL_CLOSED)
                 object.__setattr__(
                     self,

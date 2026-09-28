@@ -276,6 +276,11 @@ class CircuitBreaker:
         """Current recovery epoch generation."""
         return self._generation
 
+    @property
+    def half_open_probes_in_flight(self) -> int:
+        """Current count of active probe requests in HALF_OPEN state."""
+        return self._half_open_probes_in_flight
+
     def acquire_permit(self) -> CircuitPermit:
         """
         Acquire a permit to execute an outbound backend request.
@@ -311,8 +316,8 @@ class CircuitBreaker:
 
     def _release_probe(self, permit: CircuitPermit | None = None) -> None:
         """Release an in-flight probe slot back to the breaker in HALF_OPEN state."""
-        if permit is not None and permit.generation != self._generation:
-            # Stale permit from older epoch; ignore
+        if permit is None or permit.generation != self._generation or not permit.is_probe:
+            # Stale permit from older epoch, not a probe, or unpermitted call: ignore
             return
         if self._state == CircuitState.HALF_OPEN and self._half_open_probes_in_flight > 0:
             self._half_open_probes_in_flight -= 1
@@ -331,6 +336,10 @@ class CircuitBreaker:
         if permit.generation != self._generation:
             # Stale permit from a previous generation; drop
             return
+        if exc is not None and not is_transient_error(exc):
+            if self._state == CircuitState.HALF_OPEN and permit.is_probe:
+                self._release_probe(permit)
+            return
         self.record_failure(exc)
 
     def record_success(self) -> None:
@@ -345,20 +354,17 @@ class CircuitBreaker:
 
     def record_failure(self, exc: BaseException | None = None) -> None:
         """
-        Record a failed backend operation.
+        Record a failed backend operation without a permit.
 
-        Non-transient exceptions are ignored for failure counts, but if in HALF_OPEN,
-        the probe slot is freed so subsequent requests can probe.
-        Transient errors increment failure count and trigger state transitions.
+        Non-transient exceptions are ignored for failure counts and state transitions.
+        Only permit-bound failures can release probe slots.
         """
-        current_state = self.state
         if exc is not None and not is_transient_error(exc):
-            if current_state == CircuitState.HALF_OPEN:
-                self._release_probe()
             return
 
+        current_state = self.state
         if current_state == CircuitState.HALF_OPEN:
-            # Probe failed; immediately trip back to OPEN with fresh timeout
+            # Transient probe failure; immediately trip back to OPEN with fresh timeout
             self._trip_open()
             return
 

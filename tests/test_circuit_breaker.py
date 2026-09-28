@@ -25,6 +25,7 @@ from fastapi_stream_lease.exceptions import (
     StreamLeaseRejected,
     StreamLeaseUnavailable,
 )
+from fastapi_stream_lease.lease import StreamLease
 from fastapi_stream_lease.manager import StreamLeaseManager
 from fastapi_stream_lease.observability.contract import Operation, Outcome, TelemetryAdapter
 
@@ -751,6 +752,10 @@ def test_circuit_permit_standalone_and_noop_edges() -> None:
     assert cb._half_open_probes_in_flight == 0
     cb._release_probe()
     assert cb._half_open_probes_in_flight == 0
+    cb._state = CircuitState.HALF_OPEN
+    dummy_probe = CircuitPermit(allowed=True, is_probe=True, generation=cb.generation, breaker=cb)
+    cb._release_probe(dummy_probe)
+    assert cb._half_open_probes_in_flight == 0
 
 
 def test_circuit_permit_generation_isolation_reopen_and_stale_release() -> None:
@@ -975,3 +980,160 @@ async def test_manager_open_renew_zero_heals_breaker() -> None:
     # Redis answered and executed script -> breaker MUST be healed to CLOSED!
     assert manager.circuit_state == CircuitState.CLOSED
     assert manager._circuit_breaker.consecutive_failures == 0
+
+
+def test_half_open_probe_not_released_by_external_non_transient_error() -> None:
+    """
+    Verifies that non-permit calls (CB-29-01) cannot free probe slots owned by other coroutines.
+    """
+    cb = CircuitBreaker(
+        CircuitBreakerConfig(
+            failure_threshold=1, recovery_timeout=0.01, half_open_max_probes=1, jitter=0.0
+        )
+    )
+    cb.record_failure(redis.exceptions.ConnectionError("trip"))
+    time.sleep(0.015)
+    assert cb.state == CircuitState.HALF_OPEN
+
+    permit_a = cb.acquire_permit()
+    assert permit_a.allowed is True
+    assert permit_a.is_probe is True
+    assert cb.half_open_probes_in_flight == 1
+
+    # Second acquire must be denied since half_open_max_probes=1
+    permit_b = cb.acquire_permit()
+    assert permit_b.allowed is False
+
+    # External call (e.g. renew or release without permit) reports MaxConnectionsError
+    cb.record_failure(redis.exceptions.MaxConnectionsError("Too many connections"))
+
+    # Probe slot MUST NOT be decremented!
+    assert cb.half_open_probes_in_flight == 1
+
+    # Another acquire attempt must STILL be denied
+    permit_c = cb.acquire_permit()
+    assert permit_c.allowed is False
+
+    # Only when permit_a finishes is the state transitioned
+    permit_a.record_backend_reachable()
+    assert cb.state == CircuitState.CLOSED
+    assert cb.half_open_probes_in_flight == 0
+
+
+@pytest.mark.asyncio
+async def test_manager_renew_release_max_conn_error_does_not_release_probe() -> None:
+    """Verifies that manager renew/release MaxConnectionsError does not free in-flight probe."""
+    mock_redis = AsyncMock()
+    cb_cfg = CircuitBreakerConfig(
+        failure_threshold=1, recovery_timeout=0.01, half_open_max_probes=1, jitter=0.0
+    )
+    policy = BackendFailurePolicy(fallback_mode=FallbackMode.FAIL_CLOSED, circuit_breaker=cb_cfg)
+    config = LeaseConfig(failure_policy=policy)
+    manager = StreamLeaseManager(redis=mock_redis, config=config)
+
+    # Trip breaker
+    assert manager._circuit_breaker is not None
+    manager._circuit_breaker.record_failure(redis.exceptions.ConnectionError("trip"))
+    await asyncio.sleep(0.015)
+    assert manager.circuit_state == CircuitState.HALF_OPEN
+
+    # In-flight probe acquired by stream A
+    probe_permit = manager._circuit_breaker.acquire_permit()
+    assert probe_permit.allowed is True
+    assert probe_permit.is_probe is True
+    assert manager._circuit_breaker.half_open_probes_in_flight == 1
+
+    # An active stream tries to renew and encounters MaxConnectionsError
+    mock_redis.eval = AsyncMock(
+        side_effect=redis.exceptions.MaxConnectionsError("Too many connections")
+    )
+    dummy_lease = StreamLease(
+        manager=manager,
+        lease_id="l1",
+        user_key="{p}:u1",
+        global_key="{p}:global",
+        user_id="u1",
+    )
+    with pytest.raises(StreamLeaseUnavailable):
+        await manager.renew(dummy_lease)
+
+    # Probe slot MUST still be occupied
+    assert manager._circuit_breaker.half_open_probes_in_flight == 1
+
+    # A subsequent acquire MUST be denied because probe is still in-flight
+    with pytest.raises(StreamLeaseUnavailable) as exc_info:
+        await manager.acquire("u2")
+    assert "Circuit breaker is HALF_OPEN" in str(exc_info.value)
+
+    # Now simulate release encountering MaxConnectionsError
+    await manager.release(dummy_lease)
+    assert manager._circuit_breaker.half_open_probes_in_flight == 1
+
+    # Subsequent acquire must STILL be denied
+    with pytest.raises(StreamLeaseUnavailable) as exc_info2:
+        await manager.acquire("u3")
+    assert "Circuit breaker is HALF_OPEN" in str(exc_info2.value)
+
+    # Finally probe succeeds
+    probe_permit.record_backend_reachable()
+    assert manager.circuit_state == CircuitState.CLOSED
+    assert manager._circuit_breaker.half_open_probes_in_flight == 0
+
+
+def test_lease_config_failure_policy_dict_rejects_unknown_keys() -> None:
+    """Verifies that unknown keys in failure_policy dicts are rejected (CFG-29-02)."""
+    match_msg = r"Unknown keys in failure_policy dict: \['fallback_mod'\]"
+    with pytest.raises(ValueError, match=match_msg):
+        LeaseConfig(failure_policy={"fallback_mod": "fail_open"})  # type: ignore[arg-type]
+
+    with pytest.raises(
+        ValueError, match=r"Unknown keys in circuit_breaker dict: \['invalid_field'\]"
+    ):
+        LeaseConfig(
+            failure_policy={"circuit_breaker": {"invalid_field": 123}}  # type: ignore[arg-type]
+        )
+
+    with pytest.raises(TypeError, match="circuit_breaker in failure_policy dict must be a dict"):
+        LeaseConfig(
+            failure_policy={"circuit_breaker": "invalid_type"}  # type: ignore[arg-type]
+        )
+
+    # Valid CircuitBreakerConfig object passed directly in dict
+    cb_obj = CircuitBreakerConfig(failure_threshold=4)
+    cfg_with_obj = LeaseConfig(failure_policy={"circuit_breaker": cb_obj})
+    assert cfg_with_obj.failure_policy is not None
+    assert cfg_with_obj.failure_policy.circuit_breaker == cb_obj
+
+
+def test_probe_permit_failure_with_non_transient_error_releases_probe() -> None:
+    """Verifies that when an in-flight probe encounters a non-transient error,
+
+    its slot is freed.
+    """
+    cb = CircuitBreaker(
+        CircuitBreakerConfig(
+            failure_threshold=1, recovery_timeout=0.01, half_open_max_probes=1, jitter=0.0
+        )
+    )
+    cb.record_failure(redis.exceptions.ConnectionError("trip"))
+    time.sleep(0.015)
+    assert cb.state == CircuitState.HALF_OPEN
+
+    probe_permit = cb.acquire_permit()
+    assert probe_permit.is_probe is True
+    assert cb.half_open_probes_in_flight == 1
+
+    # Probe records non-transient error (e.g. MaxConnectionsError)
+    probe_permit.record_failure(redis.exceptions.MaxConnectionsError("pool saturated"))
+
+    # Probe slot must be released back to 0, but breaker stays HALF_OPEN
+    assert cb.state == CircuitState.HALF_OPEN
+    assert cb.half_open_probes_in_flight == 0
+
+    # Non-probe permit in CLOSED records non-transient error
+    cb.record_success()
+    assert cb.state == CircuitState.CLOSED
+    closed_permit = cb.acquire_permit()
+    assert closed_permit.is_probe is False
+    closed_permit.record_failure(redis.exceptions.MaxConnectionsError("pool saturated"))
+    assert cb.consecutive_failures == 0

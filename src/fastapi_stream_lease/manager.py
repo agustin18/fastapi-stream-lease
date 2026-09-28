@@ -389,7 +389,7 @@ class StreamLeaseManager:
         except Exception as exc:
             duration = time.monotonic() - start_monotonic
             if is_network_error(exc):
-                if self._circuit_breaker is not None:
+                if is_transient_error(exc) and self._circuit_breaker is not None:
                     self._circuit_breaker.record_failure(exc)
                 self._safe_record_backend_error(exc)
                 self._safe_record_operation(Operation.RENEW, Outcome.BACKEND_ERROR, duration)
@@ -431,7 +431,7 @@ class StreamLeaseManager:
         except Exception as exc:
             duration = time.monotonic() - start_monotonic
             if is_network_error(exc):
-                if self._circuit_breaker is not None:
+                if is_transient_error(exc) and self._circuit_breaker is not None:
                     self._circuit_breaker.record_failure(exc)
                 self._safe_record_backend_error(exc)
                 self._safe_record_operation(Operation.RELEASE, Outcome.BACKEND_ERROR, duration)
