@@ -306,6 +306,10 @@ jobs:
           uv run python - <<'PY'
           import fastapi_stream_lease
           from fastapi_stream_lease import (
+              BackendFailurePolicy,
+              CircuitBreakerConfig,
+              CircuitState,
+              FallbackMode,
               LeaseConfig,
               StreamLeaseManager,
               StreamLease,
@@ -317,6 +321,10 @@ jobs:
 
           config = LeaseConfig(max_per_user=1, max_global=10)
           assert config.max_per_user == 1
+
+          policy = BackendFailurePolicy(circuit_breaker=CircuitBreakerConfig())
+          assert policy.fallback_mode == FallbackMode.FAIL_CLOSED
+          assert CircuitState.CLOSED.value == "closed"
 
           # Verify Starlette/FastAPI integration works with installed extra
           err = StreamLeaseRejected("user_limit")
