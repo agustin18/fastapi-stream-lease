@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+- **Deterministic Upstream Iterator Cancellation & ASGI Disconnect Determinism (`close_source`)**:
+  - Added `close_source: bool = True` to `lease.wrap()`, `lease.as_streaming_response()`, and `manager.stream()`. **Ownership semantic note**: When `close_source=True`, `fastapi-stream-lease` takes ownership of closing the underlying upstream stream upon completion, early cancellation, or error; pass `close_source=False` to retain exact v0.3.0 non-closing semantics.
+  - Introduced `ProtectedStreamingResponse(StreamingResponse)` guaranteeing that real ASGI client disconnect events in Starlette/FastAPI deterministically invoke `await body_iterator.aclose()` in outer teardown blocks, releasing active Redis leases immediately without manual `contextlib.aclosing()` wrappers.
+  - Level cancellation resilience: shielded cleanup and Redis release using AnyIO cancel scopes (`anyio.CancelScope(shield=True)`) and persistent release task references on `StreamLease`, ensuring that nested task cancellation does not abort the Redis Lua release script or produce ghost leases.
+  - Dual-target traversal: ensures both outer async iterable/generator sources and inner iterators returned by `aiter(stream)` are closed cleanly without redundant double-close invocations.
+  - Asynchronous & synchronous close safety: awaits both native `aclose()` and coroutines returned by `async def close()`. Synchronous `close()` calls are safely offloaded to worker threads via `asyncio.to_thread`, preventing event-loop starvation.
+  - Bounded global cleanup timeout budget: added `upstream_cleanup_timeout: float = 2.0` (configurable and strictly validated in `LeaseConfig`) enforced globally across all targets via `asyncio.wait_for`, preventing misbehaving or stalled upstreams from delaying lease releases.
+  - Safe error suppression: upstream teardown exceptions are logged defensively and suppressed, guaranteeing that the Redis lease is unconditionally released.
+- **Circuit Breaker Observability Telemetry & Multi-Manager Scoping**:
+  - Added `telemetry_scope: str | None = None` to `LeaseConfig` (defaulting to `key_prefix`), allowing multiple managers sharing the same `key_prefix` to report isolated circuit breaker metrics without gauge/counter label collisions on shared registries.
+  - Standardized `short_circuited_total` labels with `operation` (`acquire` or `count`), `state` (`open` or `half_open`), and `prefix`, accurately measuring load-shedding rejections.
+  - Maintained 100% backward compatibility with v0.3.0 `TelemetryAdapter` protocol via modular `CircuitBreakerTelemetry` and composite `StreamLeaseTelemetry` protocols.
+- **Test Infrastructure Hardening**:
+  - Synchronized sorted set expiration assertions in unit and integration tests with Redis server `TIME` clock, eliminating flakiness from host wall-clock stepping (NTP / virtualization drift).
+
 ## 0.3.0 — 2026-09-28
 
 - **Adaptive Circuit Breaker & Thundering Herd Protection**: Added production-grade circuit breaker (`CircuitBreakerConfig`, `CircuitState`, `BackendFailurePolicy`) safeguarding Redis backends during outages, Sentinel failovers, and network partitions. Features state transitions (`CLOSED`, `OPEN`, `HALF_OPEN`), bounded probe concurrency (`half_open_max_probes`), jittered recovery cooldown, and fast-failing with `StreamLeaseUnavailable` or graceful fallback under `FallbackMode.FAIL_OPEN`.

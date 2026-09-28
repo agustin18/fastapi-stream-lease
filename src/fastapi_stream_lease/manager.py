@@ -64,6 +64,7 @@ class StreamLeaseManager:
             and self.config.failure_policy.circuit_breaker is not None
         ):
             self._circuit_breaker = CircuitBreaker(self.config.failure_policy.circuit_breaker)
+            self._safe_record_circuit_state(self._circuit_breaker.state)
         self.dispatcher = HookDispatcher(
             max_queue_size=self.config.hook_queue_size,
             sync_inline=False,
@@ -143,6 +144,34 @@ class StreamLeaseManager:
                     "Telemetry record_fallback failed; continuing without altering lease semantics"
                 )
 
+    def _safe_record_circuit_state(self, state: CircuitState | str) -> None:
+        if self.telemetry is not None and hasattr(self.telemetry, "record_circuit_state"):
+            scope = self.config.telemetry_scope or self.config.key_prefix
+            try:
+                try:
+                    self.telemetry.record_circuit_state(state, scope=scope)
+                except TypeError:
+                    self.telemetry.record_circuit_state(state)
+            except Exception:
+                logger.exception("Telemetry record_circuit_state failed")
+
+    def _safe_record_short_circuit(
+        self,
+        operation: Operation | str = Operation.ACQUIRE,
+        state: CircuitState | str = CircuitState.OPEN,
+    ) -> None:
+        if self.telemetry is not None and hasattr(self.telemetry, "record_short_circuit"):
+            scope = self.config.telemetry_scope or self.config.key_prefix
+            try:
+                try:
+                    self.telemetry.record_short_circuit(
+                        operation=operation, state=state, scope=scope
+                    )
+                except TypeError:
+                    self.telemetry.record_short_circuit()
+            except Exception:
+                logger.exception("Telemetry record_short_circuit failed")
+
     @contextmanager
     def _safe_trace_operation(self, operation: Operation | str) -> Iterator[Any]:
         span_cm: Any = None
@@ -220,7 +249,9 @@ class StreamLeaseManager:
         permit: CircuitPermit | None = None
         if self._circuit_breaker is not None:
             permit = self._circuit_breaker.acquire_permit()
+            self._safe_record_circuit_state(self._circuit_breaker.state)
             if not permit.allowed:
+                self._safe_record_short_circuit(Operation.ACQUIRE, self._circuit_breaker.state)
                 duration = 0.0
                 if self.config.effective_failure_policy.fallback_mode == FallbackMode.FAIL_OPEN:
                     self._safe_record_fallback()
@@ -274,6 +305,8 @@ class StreamLeaseManager:
                 except Exception as exc:
                     if permit is not None:
                         permit.record_failure(exc)
+                        assert self._circuit_breaker is not None
+                        self._safe_record_circuit_state(self._circuit_breaker.state)
                     duration = time.monotonic() - start_monotonic
                     if is_network_error(exc):
                         self._safe_record_backend_error(exc)
@@ -324,6 +357,8 @@ class StreamLeaseManager:
                 # Backend call succeeded: Redis is reachable and executed the script.
                 if permit is not None:
                     permit.record_backend_reachable()
+                    assert self._circuit_breaker is not None
+                    self._safe_record_circuit_state(self._circuit_breaker.state)
 
                 code = int(result)
                 duration = time.monotonic() - start_monotonic
@@ -380,6 +415,7 @@ class StreamLeaseManager:
             # Backend call succeeded: Redis is reachable and executed the renewal script.
             if self._circuit_breaker is not None:
                 self._circuit_breaker.record_success()
+                self._safe_record_circuit_state(self._circuit_breaker.state)
 
             duration = time.monotonic() - start_monotonic
             success = int(result) == 1
@@ -391,6 +427,7 @@ class StreamLeaseManager:
             if is_network_error(exc):
                 if is_transient_error(exc) and self._circuit_breaker is not None:
                     self._circuit_breaker.record_failure(exc)
+                    self._safe_record_circuit_state(self._circuit_breaker.state)
                 self._safe_record_backend_error(exc)
                 self._safe_record_operation(Operation.RENEW, Outcome.BACKEND_ERROR, duration)
                 self.dispatcher.dispatch(self.config.on_backend_error, exc)
@@ -426,6 +463,7 @@ class StreamLeaseManager:
             )
             if self._circuit_breaker is not None:
                 self._circuit_breaker.record_success()
+                self._safe_record_circuit_state(self._circuit_breaker.state)
             duration = time.monotonic() - start_monotonic
             self._safe_record_operation(Operation.RELEASE, Outcome.SUCCESS, duration)
         except Exception as exc:
@@ -433,6 +471,7 @@ class StreamLeaseManager:
             if is_network_error(exc):
                 if is_transient_error(exc) and self._circuit_breaker is not None:
                     self._circuit_breaker.record_failure(exc)
+                    self._safe_record_circuit_state(self._circuit_breaker.state)
                 self._safe_record_backend_error(exc)
                 self._safe_record_operation(Operation.RELEASE, Outcome.BACKEND_ERROR, duration)
                 self.dispatcher.dispatch(self.config.on_backend_error, exc)
@@ -452,7 +491,9 @@ class StreamLeaseManager:
         permit: CircuitPermit | None = None
         if self._circuit_breaker is not None:
             permit = self._circuit_breaker.acquire_permit()
+            self._safe_record_circuit_state(self._circuit_breaker.state)
             if not permit.allowed:
+                self._safe_record_short_circuit(Operation.COUNT, self._circuit_breaker.state)
                 raise StreamLeaseUnavailable(
                     detail=(
                         f"Circuit breaker is {self._circuit_breaker.state.value.upper()}: "
@@ -469,6 +510,8 @@ class StreamLeaseManager:
             except Exception as exc:
                 if permit is not None:
                     permit.record_failure(exc)
+                    assert self._circuit_breaker is not None
+                    self._safe_record_circuit_state(self._circuit_breaker.state)
                 if is_network_error(exc):
                     self._safe_record_backend_error(exc)
                     self.dispatcher.dispatch(self.config.on_backend_error, exc)
@@ -490,6 +533,8 @@ class StreamLeaseManager:
                 raise
             if permit is not None:
                 permit.record_backend_reachable()
+                assert self._circuit_breaker is not None
+                self._safe_record_circuit_state(self._circuit_breaker.state)
             return int(count)
         finally:
             if permit is not None:
@@ -543,6 +588,7 @@ class StreamLeaseManager:
         headers: dict[str, str] | None = None,
         auto_renew: bool = True,
         renew_interval: float | None = None,
+        close_source: bool = True,
         **kwargs: Any,
     ) -> Any:
         """
@@ -566,6 +612,7 @@ class StreamLeaseManager:
                 headers=headers,
                 auto_renew=auto_renew,
                 renew_interval=renew_interval,
+                close_source=close_source,
                 **kwargs,
             )
         except Exception:

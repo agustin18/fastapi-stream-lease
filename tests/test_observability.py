@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from contextlib import nullcontext
 from typing import Any
 from unittest.mock import patch
 
@@ -27,12 +28,14 @@ from fastapi_stream_lease.manager import StreamLeaseManager
 from fastapi_stream_lease.observability.contract import (
     DEFAULT_DURATION_BUCKETS,
     BackendErrorKind,
+    CircuitState,
     LostReason,
     Operation,
     Outcome,
     TelemetryAdapter,
     classify_backend_error,
     coerce_backend_error_kind,
+    coerce_circuit_state,
     coerce_lost_reason,
     coerce_operation,
     coerce_outcome,
@@ -62,6 +65,13 @@ def test_strict_cardinality_coercion() -> None:
     assert coerce_backend_error_kind(BackendErrorKind.TIMEOUT) == BackendErrorKind.TIMEOUT
     with pytest.raises(ValueError, match="Invalid backend error kind 'bad_kind'"):
         coerce_backend_error_kind("bad_kind")
+
+    assert coerce_circuit_state("closed") == CircuitState.CLOSED
+    assert coerce_circuit_state("half_open") == CircuitState.HALF_OPEN
+    assert coerce_circuit_state("open") == CircuitState.OPEN
+    assert coerce_circuit_state(CircuitState.OPEN) == CircuitState.OPEN
+    with pytest.raises(ValueError, match="Invalid circuit state 'bad_state'"):
+        coerce_circuit_state("bad_state")
 
 
 @pytest.mark.parametrize(
@@ -525,6 +535,12 @@ async def test_broken_telemetry_failure_isolation(fake_redis) -> None:
         def record_hook_queue_change(self, delta: int) -> None:
             raise RuntimeError("record_hook_queue_change simulated failure")
 
+        def record_circuit_state(self, state: Any) -> None:
+            raise RuntimeError("record_circuit_state simulated failure")
+
+        def record_short_circuit(self) -> None:
+            raise RuntimeError("record_short_circuit simulated failure")
+
         def trace_operation(self, operation: Any) -> Any:
             raise RuntimeError("trace_operation simulated failure")
 
@@ -562,6 +578,8 @@ async def test_broken_telemetry_failure_isolation(fake_redis) -> None:
     manager._safe_record_lost("redis_revoked")
     manager._safe_record_backend_error(ConnectionError("fail"))
     manager._safe_record_fallback()
+    manager._safe_record_circuit_state(CircuitState.OPEN)
+    manager._safe_record_short_circuit()
 
     # 7. Verify property alias works
     assert manager.metrics is broken
@@ -758,3 +776,268 @@ async def test_manager_dispatcher_hook_error_telemetry(fake_redis) -> None:
 
     val = registry.get_sample_value("fastapi_stream_lease_hook_errors_total")
     assert val == 1.0
+
+
+@pytest.mark.asyncio
+async def test_prometheus_circuit_breaker_metrics() -> None:
+    """Verifies Prometheus gauge and counter for circuit breaker states and short circuits."""
+    registry = CollectorRegistry()
+    metrics = PrometheusMetrics(registry=registry)
+
+    # Initial state gauge value with default scope
+    metrics.record_circuit_state(CircuitState.CLOSED)
+    assert (
+        registry.get_sample_value("fastapi_stream_lease_circuit_state", {"prefix": "default"})
+        == 0.0
+    )
+
+    metrics.record_circuit_state(CircuitState.HALF_OPEN, scope="custom_prefix")
+    assert (
+        registry.get_sample_value("fastapi_stream_lease_circuit_state", {"prefix": "custom_prefix"})
+        == 1.0
+    )
+
+    metrics.record_circuit_state("open", scope="custom_prefix")
+    assert (
+        registry.get_sample_value("fastapi_stream_lease_circuit_state", {"prefix": "custom_prefix"})
+        == 2.0
+    )
+
+    # Short circuited counter
+    metrics.record_short_circuit(Operation.ACQUIRE, CircuitState.OPEN, scope="custom_prefix")
+    metrics.record_short_circuit(Operation.COUNT, CircuitState.HALF_OPEN, scope="custom_prefix")
+    assert (
+        registry.get_sample_value(
+            "fastapi_stream_lease_short_circuited_total",
+            {"operation": "acquire", "state": "open", "prefix": "custom_prefix"},
+        )
+        == 1.0
+    )
+    assert (
+        registry.get_sample_value(
+            "fastapi_stream_lease_short_circuited_total",
+            {"operation": "count", "state": "half_open", "prefix": "custom_prefix"},
+        )
+        == 1.0
+    )
+
+
+def test_otel_circuit_breaker_metrics() -> None:
+    """Verifies OpenTelemetry gauge and counter for circuit breaker states and short circuits."""
+    metric_reader = InMemoryMetricReader()
+    meter_provider = MeterProvider(metric_readers=[metric_reader])
+    otel = OpenTelemetryMetrics(meter_provider=meter_provider)
+
+    otel.record_circuit_state(CircuitState.CLOSED, scope="otel_prefix")
+    otel.record_circuit_state("open", scope="otel_prefix")
+    otel.record_short_circuit(Operation.ACQUIRE, CircuitState.OPEN, scope="otel_prefix")
+    otel.record_short_circuit(Operation.COUNT, "half_open", scope="otel_prefix")
+
+
+@pytest.mark.asyncio
+async def test_manager_circuit_breaker_metrics_integration(fake_redis) -> None:
+    """Verifies end-to-end integration between manager circuit breaker and Prometheus metrics."""
+    registry = CollectorRegistry()
+    metrics = PrometheusMetrics(registry=registry)
+    config = LeaseConfig(
+        failure_policy={"circuit_breaker": {"failure_threshold": 1, "recovery_timeout": 60.0}}
+    )
+    manager = StreamLeaseManager(fake_redis, config, telemetry=metrics)
+
+    # Initially CLOSED
+    assert (
+        registry.get_sample_value("fastapi_stream_lease_circuit_state", {"prefix": "stream_lease"})
+        == 0.0
+    )
+
+    # Trigger failure to trip breaker to OPEN
+    with patch.object(fake_redis, "eval", side_effect=ConnectionError("backend failure")):
+        with pytest.raises(StreamLeaseUnavailable):
+            await manager.acquire("user_cb_metric")
+
+    # Circuit breaker tripped to OPEN: gauge must be 2.0
+    assert (
+        registry.get_sample_value("fastapi_stream_lease_circuit_state", {"prefix": "stream_lease"})
+        == 2.0
+    )
+
+    # Next acquire is short-circuited: increments short_circuited_total for acquire/open
+    with pytest.raises(StreamLeaseUnavailable, match="Circuit breaker is OPEN"):
+        await manager.acquire("user_cb_metric")
+
+    assert (
+        registry.get_sample_value(
+            "fastapi_stream_lease_short_circuited_total",
+            {"operation": "acquire", "state": "open", "prefix": "stream_lease"},
+        )
+        == 1.0
+    )
+
+    # get_active_count also short-circuits and increments for count/open
+    with pytest.raises(StreamLeaseUnavailable, match="Circuit breaker is OPEN"):
+        await manager.get_active_count("user_cb_metric")
+
+    assert (
+        registry.get_sample_value(
+            "fastapi_stream_lease_short_circuited_total",
+            {"operation": "count", "state": "open", "prefix": "stream_lease"},
+        )
+        == 1.0
+    )
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_multi_manager_shared_metrics_scoping_no_collision(fake_redis) -> None:
+    """CRITICAL P2 AUDIT TEST (OBS-02):
+    Verifies that multiple StreamLeaseManager instances sharing a single telemetry
+    adapter maintain isolated, non-colliding circuit breaker states and counters.
+    """
+    registry = CollectorRegistry()
+    metrics = PrometheusMetrics(registry=registry)
+
+    config_heavy = LeaseConfig(
+        key_prefix="llm_heavy",
+        failure_policy={"circuit_breaker": {"failure_threshold": 1, "recovery_timeout": 60.0}},
+    )
+    config_light = LeaseConfig(
+        key_prefix="llm_light",
+        failure_policy={"circuit_breaker": {"failure_threshold": 5, "recovery_timeout": 60.0}},
+    )
+
+    manager_heavy = StreamLeaseManager(fake_redis, config=config_heavy, telemetry=metrics)
+    manager_light = StreamLeaseManager(fake_redis, config=config_light, telemetry=metrics)
+
+    # Trip manager_heavy to OPEN
+    with patch.object(fake_redis, "eval", side_effect=ConnectionError("heavy failure")):
+        with pytest.raises(StreamLeaseUnavailable):
+            await manager_heavy.acquire("user_h")
+
+    # Manager heavy is OPEN (2.0)
+    assert (
+        registry.get_sample_value("fastapi_stream_lease_circuit_state", {"prefix": "llm_heavy"})
+        == 2.0
+    )
+
+    # Manager light remains CLOSED (0.0) without collision!
+    assert (
+        registry.get_sample_value("fastapi_stream_lease_circuit_state", {"prefix": "llm_light"})
+        == 0.0
+    )
+
+    # Acquire on light succeeds and reinforces CLOSED state
+    lease_l = await manager_light.acquire("user_l")
+    assert (
+        registry.get_sample_value("fastapi_stream_lease_circuit_state", {"prefix": "llm_light"})
+        == 0.0
+    )
+    # Heavy still remains OPEN (2.0)
+    assert (
+        registry.get_sample_value("fastapi_stream_lease_circuit_state", {"prefix": "llm_heavy"})
+        == 2.0
+    )
+
+    await lease_l.release()
+    await manager_heavy.close()
+    await manager_light.close()
+
+
+def test_legacy_v03_telemetry_adapter_protocol_conformance() -> None:
+    """CRITICAL P2 AUDIT TEST (API-01):
+    Verifies that legacy custom TelemetryAdapter implementations conforming to v0.3.0
+    (without circuit breaker methods) continue to pass isinstance() conformance.
+    """
+    from fastapi_stream_lease.observability.contract import (
+        CircuitBreakerTelemetry,
+        StreamLeaseTelemetry,
+        TelemetryAdapter,
+    )
+
+    class LegacyV03Adapter:
+        def record_operation(self, operation: Any, outcome: Any, duration: float) -> None:
+            pass
+
+        def record_lost(self, reason: Any) -> None:
+            pass
+
+        def record_backend_error(self, kind: Any) -> None:
+            pass
+
+        def record_fallback(self) -> None:
+            pass
+
+        def record_hook_drop(self) -> None:
+            pass
+
+        def record_hook_error(self) -> None:
+            pass
+
+        def record_hook_queue_change(self, delta: int) -> None:
+            pass
+
+        def trace_operation(self, operation: Any) -> Any:
+            return nullcontext()
+
+    legacy = LegacyV03Adapter()
+    assert isinstance(legacy, TelemetryAdapter)
+    assert not isinstance(legacy, CircuitBreakerTelemetry)
+    assert not isinstance(legacy, StreamLeaseTelemetry)
+
+    # Builtin adapter implements all protocols
+    prom = PrometheusMetrics()
+    assert isinstance(prom, TelemetryAdapter)
+    assert isinstance(prom, CircuitBreakerTelemetry)
+    assert isinstance(prom, StreamLeaseTelemetry)
+
+
+@pytest.mark.asyncio
+async def test_multi_manager_shared_prefix_isolated_by_telemetry_scope(fake_redis) -> None:
+    """CRITICAL P2 AUDIT TEST (OBS-02):
+    Verifies that multiple managers sharing the same key_prefix can use distinct
+    telemetry_scope identifiers to avoid metric collisions in a shared Prometheus registry.
+    """
+    from prometheus_client import CollectorRegistry
+
+    from fastapi_stream_lease.circuit_breaker import BackendFailurePolicy, CircuitBreakerConfig
+
+    reg = CollectorRegistry()
+    prom = PrometheusMetrics(registry=reg)
+
+    policy_a = BackendFailurePolicy(circuit_breaker=CircuitBreakerConfig(failure_threshold=1))
+    policy_b = BackendFailurePolicy(circuit_breaker=CircuitBreakerConfig(failure_threshold=1))
+
+    cfg_a = LeaseConfig(
+        key_prefix="shared_llm",
+        telemetry_scope="worker_alpha",
+        failure_policy=policy_a,
+    )
+    cfg_b = LeaseConfig(
+        key_prefix="shared_llm",
+        telemetry_scope="worker_beta",
+        failure_policy=policy_b,
+    )
+
+    mgr_a = StreamLeaseManager(fake_redis, config=cfg_a, telemetry=prom)
+    mgr_b = StreamLeaseManager(fake_redis, config=cfg_b, telemetry=prom)
+
+    # Trip breaker on mgr_a only
+    assert mgr_a._circuit_breaker is not None
+    mgr_a._circuit_breaker.record_failure(ConnectionError("connection reset"))
+    mgr_a._safe_record_circuit_state(mgr_a.circuit_state)
+
+    # Verify state for worker_alpha is OPEN (2)
+    val_alpha = reg.get_sample_value(
+        "fastapi_stream_lease_circuit_state",
+        {"prefix": "worker_alpha"},
+    )
+    assert val_alpha == 2
+
+    # Verify state for worker_beta remains CLOSED (0)
+    val_beta = reg.get_sample_value(
+        "fastapi_stream_lease_circuit_state",
+        {"prefix": "worker_beta"},
+    )
+    assert val_beta == 0
+
+    await mgr_a.close()
+    await mgr_b.close()

@@ -69,6 +69,44 @@ def compute_linear_slope(times: list[float], values: list[float]) -> float:
     return numerator / denominator
 
 
+def evaluate_plateau_stability(
+    samples: list[dict[str, Any]],
+    assert_plateau: bool = True,
+) -> tuple[bool, float, float, float]:
+    """
+    Evaluate memory stability across sampled VmRSS measurements.
+
+    Returns:
+        tuple of (plateau_stable, rss_slope_mb_per_sec, abs_growth_mb, rss_growth_pct)
+    """
+    if len(samples) < 2:
+        return (not assert_plateau, 0.0, 0.0, 0.0)
+
+    has_steady_state = len(samples) >= 6
+    steady_samples = samples[len(samples) // 2 :] if has_steady_state else samples
+    times = [s["time_s"] for s in steady_samples]
+    rss_mbs = [s["rss_kb"] / 1024.0 for s in steady_samples]
+
+    rss_slope_mb_per_sec = compute_linear_slope(times, rss_mbs)
+    abs_growth_mb = rss_mbs[-1] - rss_mbs[0]
+    delta_rss = rss_mbs[-1] - rss_mbs[0]
+    rss_growth_pct = (delta_rss / rss_mbs[0]) * 100.0 if rss_mbs[0] > 0 else 0.0
+
+    # Memory plateau criteria:
+    # 1. Slope of linear regression in steady state must be near zero (<= 0.15 MB/sec).
+    #    Evaluated only when >= 6 samples allow isolating post-warmup steady state.
+    # 2. Relative growth must be bounded (<= 15% in steady state, <= 30% in transient smoke).
+    # 3. Absolute growth must be <= 15 MB.
+    max_rel_growth = 15.0 if has_steady_state else 30.0
+    plateau_stable = not (
+        (has_steady_state and rss_slope_mb_per_sec > 0.15)
+        or rss_growth_pct > max_rel_growth
+        or abs_growth_mb > 15.0
+    )
+
+    return (plateau_stable, rss_slope_mb_per_sec, abs_growth_mb, rss_growth_pct)
+
+
 async def run_soak(
     redis_url: str,
     duration_seconds: float,
@@ -325,30 +363,9 @@ async def run_soak(
     zero_residual_keys = len(remaining_keys) == 0
 
     # M02: Robust linear regression slope & plateau calculation
-    plateau_stable = True
-    rss_growth_pct = 0.0
-    rss_slope_mb_per_sec = 0.0
-    abs_growth_mb = 0.0
-
-    if len(samples) >= 2:
-        # Evaluate steady-state phase (second half if >= 6 samples, otherwise all samples)
-        steady_samples = samples[len(samples) // 2 :] if len(samples) >= 6 else samples
-        times = [s["time_s"] for s in steady_samples]
-        rss_mbs = [s["rss_kb"] / 1024.0 for s in steady_samples]
-
-        rss_slope_mb_per_sec = compute_linear_slope(times, rss_mbs)
-        abs_growth_mb = rss_mbs[-1] - rss_mbs[0]
-        delta_rss = rss_mbs[-1] - rss_mbs[0]
-        rss_growth_pct = (delta_rss / rss_mbs[0]) * 100.0 if rss_mbs[0] > 0 else 0.0
-
-        # Memory plateau criteria:
-        # 1. Slope of linear regression in steady state must be near zero (<= 0.15 MB/sec)
-        # 2. Relative growth in steady state must be <= 15%
-        # 3. Absolute growth in steady state must be <= 15 MB
-        if rss_slope_mb_per_sec > 0.15 or rss_growth_pct > 15.0 or abs_growth_mb > 15.0:
-            plateau_stable = False
-    elif assert_plateau and len(samples) < 2:
-        plateau_stable = False
+    plateau_stable, rss_slope_mb_per_sec, abs_growth_mb, rss_growth_pct = (
+        evaluate_plateau_stability(samples, assert_plateau=assert_plateau)
+    )
 
     # S04 & S07: unexpected_rejections must be 0, zero ghost leases AND zero residual keys
     passed = (

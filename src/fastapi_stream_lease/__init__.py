@@ -14,7 +14,7 @@ from fastapi_stream_lease.exceptions import (
     StreamLeaseRejected,
     StreamLeaseUnavailable,
 )
-from fastapi_stream_lease.lease import StreamLease
+from fastapi_stream_lease.lease import ProtectedStreamingResponse, StreamLease
 from fastapi_stream_lease.manager import StreamLeaseManager
 
 __version__ = "0.3.0"
@@ -26,6 +26,7 @@ __all__ = [
     "ConfigurationMismatchError",
     "FallbackMode",
     "LeaseConfig",
+    "ProtectedStreamingResponse",
     "StreamLease",
     "StreamLeaseError",
     "StreamLeaseLost",

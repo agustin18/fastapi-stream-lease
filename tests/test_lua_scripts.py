@@ -85,8 +85,14 @@ async def test_lease_expiration_and_self_cleanup(lease_manager):
     _ = await lease_manager.acquire("user_1")
     assert await lease_manager.get_active_count("user_1") == 2
 
-    # Wait for lease to expire (2.2s > 2.0s lease_seconds)
-    await asyncio.sleep(2.2)
+    # Wait until Redis clock strictly exceeds lease expiration (handling host clock steps)
+    t_start = await lease_manager.redis.time()
+    deadline = (int(t_start[0]) + int(t_start[1]) / 1e6) + lease_manager.config.lease_seconds + 0.1
+    while True:
+        t_cur = await lease_manager.redis.time()
+        if (int(t_cur[0]) + int(t_cur[1]) / 1e6) >= deadline:
+            break
+        await asyncio.sleep(0.1)
 
     # Next acquire should auto-purge expired leases and succeed
     lease3 = await lease_manager.acquire("user_1")
@@ -121,7 +127,16 @@ async def test_expired_lease_cannot_be_revived(lease_manager):
     )
     mgr = StreamLeaseManager(redis=lease_manager.redis, config=config)
     lease = await mgr.acquire("user_1")
-    await asyncio.sleep(0.7)
+
+    # Wait until Redis clock strictly exceeds lease expiration
+    t_start = await lease_manager.redis.time()
+    deadline = (int(t_start[0]) + int(t_start[1]) / 1e6) + config.lease_seconds + 0.1
+    while True:
+        t_cur = await lease_manager.redis.time()
+        if (int(t_cur[0]) + int(t_cur[1]) / 1e6) >= deadline:
+            break
+        await asyncio.sleep(0.05)
+
     replacement = await mgr.acquire("user_1")
 
     assert await lease.renew() is False

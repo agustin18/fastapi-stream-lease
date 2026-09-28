@@ -9,6 +9,8 @@ from contextlib import AbstractContextManager
 from enum import Enum
 from typing import Any, Protocol, runtime_checkable
 
+from ..circuit_breaker import CircuitState as CircuitState
+
 DEFAULT_DURATION_BUCKETS: tuple[float, ...] = (
     0.001,
     0.0025,
@@ -28,6 +30,7 @@ class Operation(str, Enum):
     """Operation types supported in stream lease telemetry."""
 
     ACQUIRE = "acquire"
+    COUNT = "count"
     RENEW = "renew"
     RELEASE = "release"
     VERIFY_CONFIG = "verify_config"
@@ -125,10 +128,30 @@ def classify_backend_error(exc: BaseException) -> BackendErrorKind:
     return BackendErrorKind.UNKNOWN
 
 
+CIRCUIT_STATE_NUMERIC: dict[CircuitState, int] = {
+    CircuitState.CLOSED: 0,
+    CircuitState.HALF_OPEN: 1,
+    CircuitState.OPEN: 2,
+}
+
+
+def coerce_circuit_state(state: CircuitState | str) -> CircuitState:
+    """Coerce input to CircuitState enum, raising ValueError on unknown values."""
+    if isinstance(state, CircuitState):
+        return state
+    try:
+        return CircuitState(str(state))
+    except ValueError as exc:
+        allowed = [e.value for e in CircuitState]
+        raise ValueError(
+            f"Invalid circuit state '{state}'. Must be strictly one of {allowed}"
+        ) from exc
+
+
 @runtime_checkable
 class TelemetryAdapter(Protocol):
     """
-    Formal protocol defining the contract for stream lease telemetry and metrics adapters.
+    Formal protocol defining the base contract for stream lease telemetry and metrics adapters.
     Adapters must be failure-isolated by the manager and should perform low-latency,
     non-blocking work.
     """
@@ -169,3 +192,34 @@ class TelemetryAdapter(Protocol):
     def trace_operation(self, operation: Operation | str) -> AbstractContextManager[Any]:
         """Optionally emit an open distributed tracing span for an operation."""
         ...
+
+
+@runtime_checkable
+class CircuitBreakerTelemetry(Protocol):
+    """Protocol for telemetry adapters supporting circuit breaker metrics and scoping."""
+
+    def record_circuit_state(
+        self,
+        state: CircuitState | str,
+        scope: str = "default",
+    ) -> None:
+        """Record the current circuit breaker state (0=closed, 1=half_open, 2=open)."""
+        ...
+
+    def record_short_circuit(
+        self,
+        operation: Operation | str = Operation.ACQUIRE,
+        state: CircuitState | str = CircuitState.OPEN,
+        scope: str = "default",
+    ) -> None:
+        """Record an operation prevented from reaching Redis because the circuit
+        breaker denied a permit.
+        """
+        ...
+
+
+@runtime_checkable
+class StreamLeaseTelemetry(TelemetryAdapter, CircuitBreakerTelemetry, Protocol):
+    """Unified telemetry protocol supporting core lease metrics and circuit breaker telemetry."""
+
+    ...
