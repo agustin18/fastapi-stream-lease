@@ -245,3 +245,110 @@ async def test_manager_stream_close_source_forwarding(lease_manager) -> None:
 
     assert closed is True
     assert await lease_manager.get_active_count("forward_user") == 0
+
+
+@pytest.mark.asyncio
+async def test_fastapi_real_asgi_client_disconnect_determinism(fastapi_app, lease_manager) -> None:
+    """CRITICAL P1 AUDIT TEST (UP-03):
+    Verifies that a real ASGI client disconnect triggers deterministic upstream cleanup
+    and releases the Redis lease immediately without requiring manual aclosing()
+    or waiting for garbage collection.
+    """
+    upstream_cleaned = False
+    first_token_sent = asyncio.Event()
+
+    class UpstreamLLMStream:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            first_token_sent.set()
+            await asyncio.sleep(2.0)
+            return "token_data\n"
+
+        async def aclose(self):
+            nonlocal upstream_cleaned
+            upstream_cleaned = True
+
+    @fastapi_app.get("/stream_real_disconnect")
+    async def stream_disconnect_endpoint():
+        return await lease_manager.stream("user_asgi_disc", UpstreamLLMStream(), close_source=True)
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "GET",
+        "path": "/stream_real_disconnect",
+        "raw_path": b"/stream_real_disconnect",
+        "query_string": b"",
+        "headers": [],
+    }
+
+    client_disconnected = asyncio.Event()
+    req_sent = False
+
+    async def receive():
+        nonlocal req_sent
+        if not req_sent:
+            req_sent = True
+            return {"type": "http.request", "body": b"", "more_body": False}
+        await client_disconnected.wait()
+        return {"type": "http.disconnect"}
+
+    async def send(message):
+        pass
+
+    app_task = asyncio.create_task(fastapi_app(scope, receive, send))
+    await first_token_sent.wait()
+    client_disconnected.set()
+
+    from contextlib import suppress
+
+    with suppress(Exception):
+        await asyncio.wait_for(app_task, timeout=2.0)
+
+    assert upstream_cleaned is True
+    assert await lease_manager.get_active_count("user_asgi_disc") == 0
+
+
+@pytest.mark.asyncio
+async def test_protected_streaming_response_handles_body_without_aclose() -> None:
+    """Verifies ProtectedStreamingResponse safely completes when body_iterator lacks aclose."""
+    from fastapi_stream_lease import ProtectedStreamingResponse
+
+    async def dummy_gen():
+        yield b"chunk1"
+
+    resp = ProtectedStreamingResponse(dummy_gen())
+
+    # Delete aclose if present or replace body_iterator with plain iterator
+    class PlainIter:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise StopAsyncIteration
+
+    resp.body_iterator = PlainIter()
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "method": "GET",
+        "headers": [],
+    }
+
+    req_sent = False
+
+    async def receive():
+        nonlocal req_sent
+        if not req_sent:
+            req_sent = True
+            return {"type": "http.request", "more_body": False}
+        return {"type": "http.disconnect"}
+
+    async def send(message):
+        pass
+
+    await resp(scope, receive, send)

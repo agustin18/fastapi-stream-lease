@@ -147,14 +147,26 @@ class StreamLeaseManager:
     def _safe_record_circuit_state(self, state: CircuitState | str) -> None:
         if self.telemetry is not None and hasattr(self.telemetry, "record_circuit_state"):
             try:
-                self.telemetry.record_circuit_state(state)
+                try:
+                    self.telemetry.record_circuit_state(state, scope=self.config.key_prefix)
+                except TypeError:
+                    self.telemetry.record_circuit_state(state)
             except Exception:
                 logger.exception("Telemetry record_circuit_state failed")
 
-    def _safe_record_short_circuit(self) -> None:
+    def _safe_record_short_circuit(
+        self,
+        operation: Operation | str = Operation.ACQUIRE,
+        state: CircuitState | str = CircuitState.OPEN,
+    ) -> None:
         if self.telemetry is not None and hasattr(self.telemetry, "record_short_circuit"):
             try:
-                self.telemetry.record_short_circuit()
+                try:
+                    self.telemetry.record_short_circuit(
+                        operation=operation, state=state, scope=self.config.key_prefix
+                    )
+                except TypeError:
+                    self.telemetry.record_short_circuit()
             except Exception:
                 logger.exception("Telemetry record_short_circuit failed")
 
@@ -237,7 +249,7 @@ class StreamLeaseManager:
             permit = self._circuit_breaker.acquire_permit()
             self._safe_record_circuit_state(self._circuit_breaker.state)
             if not permit.allowed:
-                self._safe_record_short_circuit()
+                self._safe_record_short_circuit(Operation.ACQUIRE, self._circuit_breaker.state)
                 duration = 0.0
                 if self.config.effective_failure_policy.fallback_mode == FallbackMode.FAIL_OPEN:
                     self._safe_record_fallback()
@@ -479,7 +491,7 @@ class StreamLeaseManager:
             permit = self._circuit_breaker.acquire_permit()
             self._safe_record_circuit_state(self._circuit_breaker.state)
             if not permit.allowed:
-                self._safe_record_short_circuit()
+                self._safe_record_short_circuit(Operation.COUNT, self._circuit_breaker.state)
                 raise StreamLeaseUnavailable(
                     detail=(
                         f"Circuit breaker is {self._circuit_breaker.state.value.upper()}: "

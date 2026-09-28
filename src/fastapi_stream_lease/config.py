@@ -54,6 +54,9 @@ class LeaseConfig:
     failure_policy: BackendFailurePolicy | None = None
     """Encapsulated failure degradation policy and circuit breaker configuration."""
 
+    upstream_cleanup_timeout: float = 2.0
+    """Maximum duration (in seconds) to wait for upstream stream aclose() before releasing lease."""
+
     def __post_init__(self) -> None:
         if self.failure_policy is not None:
             if isinstance(self.failure_policy, dict):
@@ -106,6 +109,13 @@ class LeaseConfig:
             raise ValueError("retry_after_seconds cannot be negative")
         if self.hook_queue_size <= 0:
             raise ValueError("hook_queue_size must be greater than 0")
+        if (
+            isinstance(self.upstream_cleanup_timeout, bool)
+            or not isinstance(self.upstream_cleanup_timeout, (int, float))
+            or not isfinite(self.upstream_cleanup_timeout)
+            or self.upstream_cleanup_timeout < 0
+        ):
+            raise ValueError("upstream_cleanup_timeout must be a finite number >= 0")
         for hook_name in (
             "on_acquired",
             "on_rejected",

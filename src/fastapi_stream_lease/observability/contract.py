@@ -30,6 +30,7 @@ class Operation(str, Enum):
     """Operation types supported in stream lease telemetry."""
 
     ACQUIRE = "acquire"
+    COUNT = "count"
     RENEW = "renew"
     RELEASE = "release"
     VERIFY_CONFIG = "verify_config"
@@ -150,7 +151,7 @@ def coerce_circuit_state(state: CircuitState | str) -> CircuitState:
 @runtime_checkable
 class TelemetryAdapter(Protocol):
     """
-    Formal protocol defining the contract for stream lease telemetry and metrics adapters.
+    Formal protocol defining the base contract for stream lease telemetry and metrics adapters.
     Adapters must be failure-isolated by the manager and should perform low-latency,
     non-blocking work.
     """
@@ -188,14 +189,37 @@ class TelemetryAdapter(Protocol):
         """Record an incremental adjustment to the pending lifecycle hook queue depth."""
         ...
 
-    def record_circuit_state(self, state: CircuitState | str) -> None:
-        """Record the current circuit breaker state (0=closed, 1=half_open, 2=open)."""
-        ...
-
-    def record_short_circuit(self) -> None:
-        """Record an acquire request rejected because the circuit breaker is OPEN."""
-        ...
-
     def trace_operation(self, operation: Operation | str) -> AbstractContextManager[Any]:
         """Optionally emit an open distributed tracing span for an operation."""
         ...
+
+
+@runtime_checkable
+class CircuitBreakerTelemetry(Protocol):
+    """Protocol for telemetry adapters supporting circuit breaker metrics and scoping."""
+
+    def record_circuit_state(
+        self,
+        state: CircuitState | str,
+        scope: str = "default",
+    ) -> None:
+        """Record the current circuit breaker state (0=closed, 1=half_open, 2=open)."""
+        ...
+
+    def record_short_circuit(
+        self,
+        operation: Operation | str = Operation.ACQUIRE,
+        state: CircuitState | str = CircuitState.OPEN,
+        scope: str = "default",
+    ) -> None:
+        """Record an operation prevented from reaching Redis because the circuit
+        breaker denied a permit.
+        """
+        ...
+
+
+@runtime_checkable
+class StreamLeaseTelemetry(TelemetryAdapter, CircuitBreakerTelemetry, Protocol):
+    """Unified telemetry protocol supporting core lease metrics and circuit breaker telemetry."""
+
+    ...

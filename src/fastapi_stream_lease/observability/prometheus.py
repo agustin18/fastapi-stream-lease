@@ -107,15 +107,24 @@ class PrometheusMetrics:
 
         self.circuit_state = prom.Gauge(
             "fastapi_stream_lease_circuit_state",
-            "Current state of the worker-local circuit breaker (0=closed, 1=half_open, 2=open).",
+            (
+                "Last observed state of the worker-local circuit breaker during manager "
+                "activity (0=closed, 1=half_open, 2=open)."
+            ),
+            ["prefix"],
             registry=self.registry,
         )
 
         self.short_circuited_total = prom.Counter(
             "fastapi_stream_lease_short_circuited_total",
-            "Total stream lease acquire requests rejected because the circuit breaker is OPEN.",
+            (
+                "Total backend calls prevented from reaching Redis because the circuit "
+                "breaker denied a permit."
+            ),
+            ["operation", "state", "prefix"],
             registry=self.registry,
         )
+        self.circuit_short_circuited_total = self.short_circuited_total
 
     def record_operation(
         self,
@@ -160,14 +169,29 @@ class PrometheusMetrics:
         elif delta < 0:
             self.hook_queue_depth.dec(float(-delta))
 
-    def record_circuit_state(self, state: CircuitState | str) -> None:
+    def record_circuit_state(
+        self,
+        state: CircuitState | str,
+        scope: str = "default",
+    ) -> None:
         """Record the current circuit breaker state on the Prometheus gauge."""
         c_state = coerce_circuit_state(state)
-        self.circuit_state.set(float(CIRCUIT_STATE_NUMERIC[c_state]))
+        self.circuit_state.labels(prefix=str(scope)).set(float(CIRCUIT_STATE_NUMERIC[c_state]))
 
-    def record_short_circuit(self) -> None:
-        """Increment the short-circuited acquire requests counter."""
-        self.short_circuited_total.inc()
+    def record_short_circuit(
+        self,
+        operation: Operation | str = Operation.ACQUIRE,
+        state: CircuitState | str = CircuitState.OPEN,
+        scope: str = "default",
+    ) -> None:
+        """Increment the short-circuited backend operations counter."""
+        op_enum = coerce_operation(operation)
+        st_enum = coerce_circuit_state(state)
+        self.short_circuited_total.labels(
+            operation=op_enum.value,
+            state=st_enum.value,
+            prefix=str(scope),
+        ).inc()
 
     def trace_operation(self, operation: Operation | str) -> AbstractContextManager[Any]:
         """No-op context manager for metrics-only Prometheus adapter."""

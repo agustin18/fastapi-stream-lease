@@ -118,7 +118,8 @@ class OpenTelemetryMetrics:
         self.circuit_state_gauge = self.meter.create_gauge(
             "fastapi_stream_lease.circuit_state",
             description=(
-                "Current state of the worker-local circuit breaker (0=closed, 1=half_open, 2=open)."
+                "Last observed state of the worker-local circuit breaker during manager "
+                "activity (0=closed, 1=half_open, 2=open)."
             ),
             unit="1",
         )
@@ -126,7 +127,8 @@ class OpenTelemetryMetrics:
         self.short_circuited_counter = self.meter.create_counter(
             "fastapi_stream_lease.short_circuited",
             description=(
-                "Total stream lease acquire requests rejected because the circuit breaker is OPEN."
+                "Total backend calls prevented from reaching Redis because the circuit "
+                "breaker denied a permit."
             ),
             unit="1",
         )
@@ -172,14 +174,35 @@ class OpenTelemetryMetrics:
         """Record an incremental adjustment to the pending lifecycle hook queue depth."""
         self.hook_queue_depth_counter.add(delta)
 
-    def record_circuit_state(self, state: CircuitState | str) -> None:
+    def record_circuit_state(
+        self,
+        state: CircuitState | str,
+        scope: str = "default",
+    ) -> None:
         """Record current circuit breaker state in OpenTelemetry with strict enum validation."""
         c_state = coerce_circuit_state(state)
-        self.circuit_state_gauge.set(CIRCUIT_STATE_NUMERIC[c_state])
+        self.circuit_state_gauge.set(
+            CIRCUIT_STATE_NUMERIC[c_state],
+            {"prefix": str(scope)},
+        )
 
-    def record_short_circuit(self) -> None:
-        """Record a short-circuited acquire request in OpenTelemetry."""
-        self.short_circuited_counter.add(1)
+    def record_short_circuit(
+        self,
+        operation: Operation | str = Operation.ACQUIRE,
+        state: CircuitState | str = CircuitState.OPEN,
+        scope: str = "default",
+    ) -> None:
+        """Record a short-circuited backend call in OpenTelemetry."""
+        op_enum = coerce_operation(operation)
+        st_enum = coerce_circuit_state(state)
+        self.short_circuited_counter.add(
+            1,
+            {
+                "operation": op_enum.value,
+                "state": st_enum.value,
+                "prefix": str(scope),
+            },
+        )
 
     def trace_operation(self, operation: Operation | str) -> AbstractContextManager[Any]:
         """

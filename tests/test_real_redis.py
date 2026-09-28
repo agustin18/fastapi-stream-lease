@@ -70,7 +70,16 @@ async def test_real_redis_atomic_limits_across_managers(real_manager):
 @pytest.mark.asyncio
 async def test_real_redis_expired_lease_stays_expired(real_manager):
     expired = await real_manager.acquire("user_1")
-    await asyncio.sleep(0.7)
+
+    # Wait until Redis clock strictly exceeds lease expiration (handling host clock steps)
+    t_start = await real_manager.redis.time()
+    deadline = (int(t_start[0]) + int(t_start[1]) / 1e6) + real_manager.config.lease_seconds + 0.1
+    while True:
+        t_cur = await real_manager.redis.time()
+        if (int(t_cur[0]) + int(t_cur[1]) / 1e6) >= deadline:
+            break
+        await asyncio.sleep(0.05)
+
     replacement = await real_manager.acquire("user_1")
     try:
         assert await expired.renew() is False

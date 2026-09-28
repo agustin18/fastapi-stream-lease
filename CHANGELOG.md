@@ -2,11 +2,19 @@
 
 ## Unreleased
 
-- **Deterministic Upstream Iterator Cancellation & Cleanup (`close_source`)**: Added `close_source: bool = True` to `lease.wrap()`, `lease.as_streaming_response()`, and `manager.stream()`. When client disconnects or an error occurs during stream iteration, the underlying upstream generator or iterator is deterministically closed via `await stream.aclose()` (or synchronous `stream.close()`). Upstream cleanup errors are safely suppressed, guaranteeing that the Redis lease is always released without leaking active lease slots or hanging background LLM generations.
-- **Circuit Breaker Observability Telemetry**: Extended telemetry adapters (Prometheus and OpenTelemetry) with dedicated circuit breaker metrics:
-  - `circuit_state` (Gauge): Exports current worker-local circuit breaker state (`CLOSED = 0`, `HALF_OPEN = 1`, `OPEN = 2`).
-  - `short_circuited_total` / `fastapi_stream_lease.short_circuited` (Counter): Measures total acquire requests rejected because the circuit breaker is in `OPEN` state.
-  - Automatically wired into `StreamLeaseManager` lifecycle (`__init__`, `acquire()`, `renew()`, `release()`, and `get_active_count()`).
+- **Deterministic Upstream Iterator Cancellation & ASGI Disconnect Determinism (`close_source`)**:
+  - Added `close_source: bool = True` to `lease.wrap()`, `lease.as_streaming_response()`, and `manager.stream()`.
+  - Introduced `ProtectedStreamingResponse(StreamingResponse)` guaranteeing that real ASGI client disconnect events in Starlette/FastAPI deterministically invoke `await body_iterator.aclose()` in outer teardown blocks, releasing active Redis leases immediately without manual `contextlib.aclosing()` wrappers.
+  - Dual-target traversal: ensures both outer async iterable/generator sources and inner iterators returned by `aiter(stream)` are closed cleanly without redundant double-close invocations.
+  - Asynchronous & synchronous close safety: awaits both native `aclose()` and coroutines returned by `async def close()`, safely executing synchronous `close()` directly.
+  - Bounded cleanup timeout: added `upstream_cleanup_timeout: float = 2.0` (configurable and strictly validated in `LeaseConfig`) via `asyncio.wait_for`, preventing misbehaving or stalled upstreams from delaying lease releases.
+  - Safe error suppression: upstream teardown exceptions are logged defensively and suppressed, guaranteeing that the Redis lease is unconditionally released.
+- **Circuit Breaker Observability Telemetry & Multi-Manager Scoping**:
+  - Added `scope` / `prefix` labels (defaulting to `manager.config.key_prefix`) to `circuit_state` gauge and `short_circuited_total` counters in both Prometheus and OpenTelemetry adapters, eliminating metric collisions when multiple managers share a registry.
+  - Standardized `short_circuited_total` labels with `operation` (`acquire` or `count`), `state` (`open` or `half_open`), and `prefix`, accurately measuring load-shedding rejections.
+  - Maintained 100% backward compatibility with v0.3.0 `TelemetryAdapter` protocol via modular `CircuitBreakerTelemetry` and composite `StreamLeaseTelemetry` protocols.
+- **Test Infrastructure Hardening**:
+  - Synchronized sorted set expiration assertions in unit and integration tests with Redis server `TIME` clock, eliminating flakiness from host wall-clock stepping (NTP / virtualization drift).
 
 ## 0.3.0 — 2026-09-28
 

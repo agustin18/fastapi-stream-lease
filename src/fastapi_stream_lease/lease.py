@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import time
 from collections.abc import AsyncIterable, AsyncIterator
@@ -16,6 +17,65 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
+
+
+try:
+    from starlette.responses import StreamingResponse as _StarletteStreamingResponse
+except ImportError:  # pragma: no cover
+    _StarletteStreamingResponse = object  # type: ignore[misc,assignment]
+
+
+class ProtectedStreamingResponse(_StarletteStreamingResponse):
+    """
+    FastAPI/Starlette StreamingResponse subclass ensuring deterministic body_iterator
+    aclose() cleanup on ASGI client disconnect, cancellation, or error.
+    """
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            aclose = getattr(self.body_iterator, "aclose", None)
+            if callable(aclose):
+                with suppress(Exception):
+                    await aclose()
+
+
+async def _close_single_target(target: Any, timeout: float) -> None:
+    # 1. Look for aclose
+    aclose = getattr(target, "aclose", None)
+    if callable(aclose):
+        try:
+            res = aclose()
+            if inspect.isawaitable(res):
+                await asyncio.wait_for(res, timeout=timeout)
+            return
+        except (Exception, asyncio.TimeoutError):
+            return
+
+    # 2. Look for close (async or sync)
+    close = getattr(target, "close", None)
+    if callable(close):
+        try:
+            res = close()
+            if inspect.isawaitable(res):
+                await asyncio.wait_for(res, timeout=timeout)
+        except (Exception, asyncio.TimeoutError):
+            return
+
+
+async def _close_stream_source(
+    source: Any,
+    iterator: Any,
+    timeout: float = 2.0,
+) -> None:
+    """Deterministically close upstream stream iterator and source objects."""
+    targets: list[Any] = [iterator]
+    if source is not iterator:
+        targets.append(source)
+
+    for target in targets:
+        await _close_single_target(target, timeout=timeout)
 
 
 def _safe_uncancel() -> None:
@@ -215,14 +275,15 @@ class StreamLease:
         renew_task: asyncio.Task[None] | None = None
         lease_lost = asyncio.Event()
         reason = "completed"
+        iterator = aiter(stream)
 
         try:
             if auto_renew:
                 renew_task, lease_lost = self._start_auto_renew(renew_interval)
-            async for chunk in stream:
+            async for chunk in iterator:
                 yield chunk
         except asyncio.CancelledError:
-            if lease_lost.is_set():
+            if auto_renew and lease_lost.is_set():
                 reason = "lost"
                 _safe_uncancel()
                 raise StreamLeaseLost(self.lease_id) from None
@@ -236,15 +297,8 @@ class StreamLease:
                 await self._stop_auto_renew(renew_task)
             try:
                 if close_source:
-                    aclose = getattr(stream, "aclose", None)
-                    if callable(aclose):
-                        with suppress(Exception):
-                            await aclose()
-                    else:
-                        close = getattr(stream, "close", None)
-                        if callable(close):
-                            with suppress(Exception):
-                                close()
+                    timeout = self.manager.config.upstream_cleanup_timeout
+                    await _close_stream_source(source=stream, iterator=iterator, timeout=timeout)
             finally:
                 await self.release(reason=reason)
 
@@ -266,13 +320,13 @@ class StreamLease:
         resources when the stream closes or client disconnects.
         """
         try:
-            from starlette.responses import StreamingResponse
+            from starlette.responses import StreamingResponse  # noqa: F401
         except ImportError:
             raise RuntimeError(
                 "Starlette or FastAPI must be installed to use as_streaming_response()."
             ) from None
 
-        return StreamingResponse(
+        return ProtectedStreamingResponse(
             self.wrap(
                 stream,
                 auto_renew=auto_renew,
