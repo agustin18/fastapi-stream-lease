@@ -528,7 +528,7 @@ async def test_manager_non_network_errors_in_renew_release_and_count(lease_manag
         ("ClusterCrossSlotError", False),
         ("CrossSlotTransactionError", False),
         ("InvalidPipelineStack", False),
-        ("MaxConnectionsError", False),
+        ("MaxConnectionsError", True),
         ("ExternalAuthProviderError", False),
         ("RedisClusterException", False),
         (redis.exceptions.AuthenticationError, False),

@@ -58,10 +58,7 @@ class LeaseConfig:
         if self.failure_policy is not None:
             if isinstance(self.failure_policy, dict):
                 cb_raw = self.failure_policy.get("circuit_breaker")
-                if isinstance(cb_raw, dict):
-                    cb_obj = CircuitBreakerConfig(**cb_raw)
-                else:
-                    cb_obj = cb_raw
+                cb_obj = CircuitBreakerConfig(**cb_raw) if isinstance(cb_raw, dict) else cb_raw
                 mode_raw = self.failure_policy.get("fallback_mode", FallbackMode.FAIL_CLOSED)
                 object.__setattr__(
                     self,
@@ -154,4 +151,3 @@ class LeaseConfig:
             return self.failure_policy
         mode = FallbackMode.FAIL_OPEN if self.fail_open else FallbackMode.FAIL_CLOSED
         return BackendFailurePolicy(fallback_mode=mode)
-

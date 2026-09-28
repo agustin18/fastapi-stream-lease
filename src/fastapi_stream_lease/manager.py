@@ -14,7 +14,6 @@ from fastapi_stream_lease.circuit_breaker import (
     CircuitPermit,
     CircuitState,
     FallbackMode,
-    is_availability_error,
     is_network_error,
     is_transient_error,
 )
@@ -223,9 +222,7 @@ class StreamLeaseManager:
             permit = self._circuit_breaker.acquire_permit()
             if not permit.allowed:
                 duration = 0.0
-                if (
-                    self.config.effective_failure_policy.fallback_mode == FallbackMode.FAIL_OPEN
-                ):
+                if self.config.effective_failure_policy.fallback_mode == FallbackMode.FAIL_OPEN:
                     self._safe_record_fallback()
                     self._safe_record_operation(Operation.ACQUIRE, Outcome.FALLBACK, duration)
                     logger.warning(

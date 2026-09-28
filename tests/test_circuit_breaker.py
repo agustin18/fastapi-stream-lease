@@ -303,7 +303,7 @@ def test_lease_config_failure_policy_defaults() -> None:
 
 
 def test_lease_config_dataclass_replace_fail_open() -> None:
-    """Verifies that dataclasses.replace correctly flips fail_open without being overridden by failure_policy."""
+    """Verifies that dataclasses.replace flips fail_open without policy override."""
     cfg = LeaseConfig()
     assert cfg.fail_open is False
     assert cfg.failure_policy is None
@@ -342,7 +342,8 @@ def test_lease_config_asdict_roundtrip() -> None:
 
 
 def test_lease_config_invalid_failure_policy_type() -> None:
-    with pytest.raises(TypeError, match="failure_policy must be an instance of BackendFailurePolicy or None"):
+    err_msg = "failure_policy must be an instance of BackendFailurePolicy or None"
+    with pytest.raises(TypeError, match=err_msg):
         LeaseConfig(failure_policy="invalid_string")  # type: ignore[arg-type]
 
 
@@ -428,7 +429,8 @@ async def test_manager_acquire_max_connections_error_fail_closed_normalizes_to_5
     mock_redis.eval.side_effect = max_conn_cls("Pool exhausted")
 
     manager = StreamLeaseManager(redis=mock_redis, config=LeaseConfig(fail_open=False))
-    with pytest.raises(StreamLeaseUnavailable, match="Stream lease coordination backend is temporarily unavailable"):
+    err_pattern = "Stream lease coordination backend is temporarily unavailable"
+    with pytest.raises(StreamLeaseUnavailable, match=err_pattern):
         await manager.acquire("u1")
 
 
@@ -443,7 +445,8 @@ async def test_manager_acquire_max_connections_error_fail_open_does_not_create_f
 
     # Even with fail_open=True, MaxConnectionsError must NOT bypass limits by creating fallback
     manager = StreamLeaseManager(redis=mock_redis, config=LeaseConfig(fail_open=True))
-    with pytest.raises(StreamLeaseUnavailable, match="Stream lease coordination backend is temporarily unavailable"):
+    err_pattern = "Stream lease coordination backend is temporarily unavailable"
+    with pytest.raises(StreamLeaseUnavailable, match=err_pattern):
         await manager.acquire("u1")
 
 
@@ -458,9 +461,10 @@ async def test_manager_renew_max_connections_error_raises_stream_lease_unavailab
     manager = StreamLeaseManager(redis=mock_redis)
     lease = await manager.acquire("u1")
 
-    # Renew throws MaxConnectionsError -> must raise StreamLeaseUnavailable so worker enters grace period
+    # Renew throws MaxConnectionsError -> must raise StreamLeaseUnavailable for grace period
     mock_redis.eval.side_effect = max_conn_cls("Pool exhausted")
-    with pytest.raises(StreamLeaseUnavailable, match="Stream lease coordination backend is temporarily unavailable"):
+    err_pattern = "Stream lease coordination backend is temporarily unavailable"
+    with pytest.raises(StreamLeaseUnavailable, match=err_pattern):
         await manager.renew(lease)
 
 
