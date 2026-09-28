@@ -1093,9 +1093,7 @@ def test_lease_config_failure_policy_dict_rejects_unknown_keys() -> None:
             failure_policy={"circuit_breaker": {"invalid_field": 123}}  # type: ignore[arg-type]
         )
 
-    with pytest.raises(
-        TypeError, match="circuit_breaker in failure_policy dict must be a dict"
-    ):
+    with pytest.raises(TypeError, match="circuit_breaker in failure_policy dict must be a dict"):
         LeaseConfig(
             failure_policy={"circuit_breaker": "invalid_type"}  # type: ignore[arg-type]
         )
@@ -1108,7 +1106,10 @@ def test_lease_config_failure_policy_dict_rejects_unknown_keys() -> None:
 
 
 def test_probe_permit_failure_with_non_transient_error_releases_probe() -> None:
-    """Verifies that when an in-flight probe permit encounters a non-transient error, its slot is freed."""
+    """Verifies that when an in-flight probe encounters a non-transient error,
+
+    its slot is freed.
+    """
     cb = CircuitBreaker(
         CircuitBreakerConfig(
             failure_threshold=1, recovery_timeout=0.01, half_open_max_probes=1, jitter=0.0
