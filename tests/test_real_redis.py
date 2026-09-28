@@ -350,3 +350,70 @@ async def test_real_redis_wrapper_overhead_budget(real_manager):
     assert median_overhead_ms <= 1.0, (
         f"Wrapper overhead exceeded budget: {median_overhead_ms:.3f}ms"
     )
+
+
+@pytest.mark.asyncio
+async def test_real_redis_circuit_breaker_half_open_probe_recovery(real_manager):
+    """
+    Verify complete circuit breaker lifecycle against live Redis:
+    1. Breaker is enabled with short recovery_timeout.
+    2. Simulated transient connection failure trips breaker to OPEN.
+    3. During OPEN cooldown, acquire fails fast without touching Redis.
+    4. After cooldown, state transitions to HALF_OPEN.
+    5. Acquire probe executes against live Redis, successfully acquiring lease
+       and healing breaker to CLOSED.
+    """
+    import redis.exceptions
+
+    from fastapi_stream_lease.circuit_breaker import (
+        BackendFailurePolicy,
+        CircuitBreakerConfig,
+        CircuitState,
+    )
+
+    client = real_manager.redis
+    prefix = f"cb_live_{uuid4().hex[:8]}"
+    cb_cfg = CircuitBreakerConfig(
+        failure_threshold=1,
+        recovery_timeout=0.05,
+        jitter=0.0,
+        half_open_max_probes=1,
+    )
+    policy = BackendFailurePolicy(circuit_breaker=cb_cfg)
+    config = LeaseConfig(lease_seconds=30.0, key_prefix=prefix, failure_policy=policy)
+    manager = StreamLeaseManager(redis=client, config=config)
+
+    try:
+        assert manager.circuit_state == CircuitState.CLOSED
+
+        # 1. Trip breaker to OPEN via transient error
+        assert manager._circuit_breaker is not None
+        manager._circuit_breaker.record_failure(redis.exceptions.ConnectionError("simulated"))
+        assert manager.circuit_state == CircuitState.OPEN
+
+        # 2. Acquire fast-fails during OPEN without hitting Redis
+        with pytest.raises(StreamLeaseUnavailable, match="Circuit breaker is OPEN"):
+            await manager.acquire("user_during_open")
+
+        # 3. Wait for recovery timeout to transition to HALF_OPEN
+        await asyncio.sleep(0.06)
+        assert manager.circuit_state == CircuitState.HALF_OPEN
+
+        # 4. Probe request executes against REAL Redis
+        lease = await manager.acquire("user_probe_recovery")
+        assert lease.lease_id is not None
+        assert not lease._is_fallback
+
+        # Real Redis answered and executed script -> breaker healed back to CLOSED!
+        assert manager.circuit_state == CircuitState.CLOSED
+        assert manager._circuit_breaker.consecutive_failures == 0
+
+        # 5. Subsequent acquire proceeds normally
+        lease2 = await manager.acquire("user_post_recovery")
+        assert lease2.lease_id is not None
+        assert not lease2._is_fallback
+
+        await lease.release()
+        await lease2.release()
+    finally:
+        await manager.close(drain=True)
