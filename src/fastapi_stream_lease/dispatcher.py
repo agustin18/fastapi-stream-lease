@@ -201,6 +201,9 @@ class HookDispatcher:
                 self._queue.task_done()
                 purged += 1
             if purged > 0:
+                self._dropped_count += purged
+                for _ in range(purged):
+                    self._notify_drop()
                 self._notify_queue_change(-purged)
 
         has_active_worker = (

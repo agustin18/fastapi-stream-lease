@@ -272,6 +272,41 @@ async def test_auto_renew_grace_period_recovers_from_transient_redis_outage(
 
 
 @pytest.mark.asyncio
+async def test_auto_renew_grace_period_recovers_from_max_connections_error(
+    lease_manager, fake_redis
+):
+    max_conn_cls = getattr(redis.exceptions, "MaxConnectionsError", None)
+    if max_conn_cls is None:
+        pytest.skip("MaxConnectionsError not available in redis-py version")
+
+    async def long_stream():
+        yield "chunk_1"
+        await asyncio.sleep(0.3)
+        yield "chunk_2"
+
+    lease = await lease_manager.acquire("pool_exhausted_user")
+    original_eval = lease_manager.redis.eval
+    eval_call_count = 0
+
+    async def flaky_eval(*args, **kwargs):
+        nonlocal eval_call_count
+        eval_call_count += 1
+        if eval_call_count == 1:
+            raise max_conn_cls("Too many connections in pool")
+        return await original_eval(*args, **kwargs)
+
+    lease_manager.redis.eval = flaky_eval
+
+    chunks = []
+    async for chunk in lease.wrap(long_stream(), auto_renew=True, renew_interval=0.1):
+        chunks.append(chunk)
+
+    assert chunks == ["chunk_1", "chunk_2"]
+    assert eval_call_count >= 2
+    assert await lease_manager.get_active_count("pool_exhausted_user") == 0
+
+
+@pytest.mark.asyncio
 async def test_acquire_fail_open_and_closed(fake_redis):
     from unittest.mock import AsyncMock
 
@@ -493,7 +528,7 @@ async def test_manager_non_network_errors_in_renew_release_and_count(lease_manag
         ("ClusterCrossSlotError", False),
         ("CrossSlotTransactionError", False),
         ("InvalidPipelineStack", False),
-        ("MaxConnectionsError", False),
+        ("MaxConnectionsError", True),
         ("ExternalAuthProviderError", False),
         ("RedisClusterException", False),
         (redis.exceptions.AuthenticationError, False),

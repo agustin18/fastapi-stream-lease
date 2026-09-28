@@ -46,6 +46,7 @@ _TRANSIENT_BUILTIN_ERRORS: tuple[type[BaseException], ...] = (
 )
 
 _REDIS_CLUSTER_EXCEPTION_CLS = getattr(redis.exceptions, "RedisClusterException", None)
+_MAX_CONNECTIONS_ERROR_CLS = getattr(redis.exceptions, "MaxConnectionsError", None)
 
 
 def is_transient_error(exc: BaseException) -> bool:
@@ -67,8 +68,22 @@ def is_transient_error(exc: BaseException) -> bool:
     return False
 
 
-# Backwards compatibility alias for manager module
-is_network_error = is_transient_error
+def is_availability_error(exc: BaseException) -> bool:
+    """
+    Return True if an exception represents a backend availability or connectivity condition.
+
+    Covers both remote transient network/timeout conditions (is_transient_error) and
+    client-side connection pool exhaustion (MaxConnectionsError). These conditions
+    normalize to StreamLeaseUnavailable (HTTP 503) and are retryable during renewal grace periods,
+    without tripping the circuit breaker or enabling fail-open fallbacks.
+    """
+    if _MAX_CONNECTIONS_ERROR_CLS is not None and isinstance(exc, _MAX_CONNECTIONS_ERROR_CLS):
+        return True
+    return is_transient_error(exc)
+
+
+# Backwards compatibility alias for availability errors
+is_network_error = is_availability_error
 
 
 class CircuitState(str, Enum):

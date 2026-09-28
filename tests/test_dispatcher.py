@@ -439,12 +439,18 @@ async def test_dispatcher_on_queue_change_close_without_drain():
     """Verify on_queue_change purges remaining queue items with negative delta
     on un-drained close."""
     changes = []
+    drops = []
     blocker = asyncio.Event()
 
     def on_change(delta: int) -> None:
         changes.append(delta)
 
-    dispatcher = HookDispatcher(max_queue_size=10, sync_inline=False, on_queue_change=on_change)
+    def on_drop() -> None:
+        drops.append(1)
+
+    dispatcher = HookDispatcher(
+        max_queue_size=10, sync_inline=False, on_queue_change=on_change, on_drop=on_drop
+    )
 
     async def blocking_hook():
         await blocker.wait()
@@ -468,6 +474,9 @@ async def test_dispatcher_on_queue_change_close_without_drain():
 
     # The sum of all changes must balance out to 0 (no leaked gauge)
     assert sum(changes) == 0
+    # Purged items are recorded as dropped hooks
+    assert dispatcher.dropped_count == 2
+    assert len(drops) == 2
 
 
 @pytest.mark.asyncio

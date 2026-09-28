@@ -211,6 +211,13 @@ Therefore, **an `OPEN` circuit breaker never blocks renewal attempts**. Active s
 - **Worker-Local Semantics:** State is maintained in-memory per `StreamLeaseManager` instance. There is zero distributed coordination in Redis to manage circuit breaker state, eliminating circular dependencies (we never ask Redis whether Redis is alive).
 - **Probabilistic Herd Mitigation:** `half_open_max_probes` limits probe concurrency per `StreamLeaseManager` instance. Random recovery jitter (`recovery_timeout + uniform(0, jitter)`) statistically desynchronizes probe attempts across multi-worker clusters, preventing thundering herd spikes when Redis recovers.
 - **Cluster Fingerprint Compatibility:** Circuit breaker settings are worker-local operational tuning parameters. They are not part of the shared Redis canonical configuration fingerprint (`{prefix}:config`), allowing rolling tuning changes across workers without configuration mismatch errors.
+- **Operational Health Inspection:** Read `manager.circuit_state` (`CircuitState.CLOSED`, `CircuitState.OPEN`, `CircuitState.HALF_OPEN`, or `None` if disabled) to inspect breaker state in health-check endpoints or custom monitors. `CircuitState` is exported from the package root:
+  ```python
+  from fastapi_stream_lease import CircuitState
+
+  if manager.circuit_state == CircuitState.OPEN:
+      logger.warning("Redis coordination breaker is currently OPEN")
+  ```
 
 ## Production and Operational Guide
 
@@ -219,8 +226,31 @@ Therefore, **an `OPEN` circuit breaker never blocks renewal attempts**. Active s
   - `fail_open=False` (Default): Raises `StreamLeaseUnavailable` (HTTP 503) when Redis is unreachable. Enforces limits during transient network partitions at the cost of rejecting requests when the backend is down. (Note: asynchronous Redis replication or master failover can still lose recently acknowledged writes if a master fails before syncing to its replica).
   - `fail_open=True`: Automatically grants in-memory fallback leases when Redis encounters network or timeout errors. Keeps streaming endpoints open during outages, with the operational trade-off that limits are not coordinated across workers until Redis recovers. Authentication, authorization, and script syntax errors never fail open.
 - **Definitive Revocation vs. Network Errors:** If Redis explicitly reports that a lease is missing or expired (`renew()` returning 0) or encounters an unhandled execution error, `wrap()` and `lease()` cancel the stream immediately to prevent exceeding limits. Transient network disconnects trigger rapid retries until the monotonic lease deadline is reached.
-- **Observability and Lifecycle Hooks (Best-Effort Telemetry Contract):**
-  `LeaseConfig` provides zero-dependency callback hooks (supporting both sync and async callables) to plug directly into Prometheus, Datadog, StatsD, or Sentry:
+- **Pluggable Observability Adapters (Prometheus & OpenTelemetry):**
+  Install the optional dependencies:
+  ```bash
+  pip install fastapi-stream-lease[prometheus]  # Prometheus adapter
+  pip install fastapi-stream-lease[otel]        # OpenTelemetry adapter
+  pip install fastapi-stream-lease[all]         # All optional extras
+  ```
+  Wire the adapter into `StreamLeaseManager`:
+  ```python
+  from fastapi_stream_lease.observability.prometheus import PrometheusMetrics
+
+  metrics = PrometheusMetrics()
+  manager = StreamLeaseManager(redis=client, config=config, telemetry=metrics)
+  ```
+  Or for OpenTelemetry:
+  ```python
+  from fastapi_stream_lease.observability.otel import OpenTelemetryMetrics
+
+  metrics = OpenTelemetryMetrics()
+  manager = StreamLeaseManager(redis=client, config=config, telemetry=metrics)
+  ```
+  Exposes standardized metrics (`operations_total`, `operation_duration_seconds`, `lost_total`, `backend_errors_total`, `fallback_total`, `hook_dropped_total`, `hook_queue_depth`) with bounded label cardinality.
+
+- **Zero-Dependency Lifecycle Hooks (Custom Telemetry):**
+  Alternatively, `LeaseConfig` provides zero-dependency callback hooks (supporting both sync and async callables) to plug directly into Datadog, StatsD, or Sentry:
   ```python
   config = LeaseConfig(
       on_acquired=lambda lease: PROMETHEUS_ACTIVE.inc(),

@@ -15,6 +15,7 @@ from fastapi_stream_lease.circuit_breaker import (
     CircuitState,
     FallbackMode,
     is_network_error,
+    is_transient_error,
 )
 from fastapi_stream_lease.config import LeaseConfig
 from fastapi_stream_lease.dispatcher import HookDispatcher
@@ -221,10 +222,7 @@ class StreamLeaseManager:
             permit = self._circuit_breaker.acquire_permit()
             if not permit.allowed:
                 duration = 0.0
-                if (
-                    self.config.failure_policy is not None
-                    and self.config.failure_policy.fallback_mode == FallbackMode.FAIL_OPEN
-                ):
+                if self.config.effective_failure_policy.fallback_mode == FallbackMode.FAIL_OPEN:
                     self._safe_record_fallback()
                     self._safe_record_operation(Operation.ACQUIRE, Outcome.FALLBACK, duration)
                     logger.warning(
@@ -280,7 +278,7 @@ class StreamLeaseManager:
                     if is_network_error(exc):
                         self._safe_record_backend_error(exc)
                         self.dispatcher.dispatch(self.config.on_backend_error, exc)
-                        if self.config.fail_open:
+                        if is_transient_error(exc) and self.config.fail_open:
                             self._safe_record_fallback()
                             self._safe_record_operation(
                                 Operation.ACQUIRE, Outcome.FALLBACK, duration

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from dataclasses import asdict, replace
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
@@ -15,6 +16,8 @@ from fastapi_stream_lease.circuit_breaker import (
     CircuitPermit,
     CircuitState,
     FallbackMode,
+    is_availability_error,
+    is_network_error,
     is_transient_error,
 )
 from fastapi_stream_lease.config import LeaseConfig
@@ -155,6 +158,26 @@ def test_circuit_breaker_ignores_non_transient_errors() -> None:
     permit.release()
 
 
+def test_circuit_breaker_classification_max_connections_error() -> None:
+    max_conn_cls = getattr(redis.exceptions, "MaxConnectionsError", None)
+    if max_conn_cls is None:
+        pytest.skip("MaxConnectionsError not available in redis version")
+    exc = max_conn_cls("Too many connections")
+
+    # BC-02 invariant: MaxConnectionsError is NOT transient for circuit breaker
+    assert is_transient_error(exc) is False
+
+    # But it IS an availability error (and network error) for retry and 503 normalization
+    assert is_availability_error(exc) is True
+    assert is_network_error(exc) is True
+
+    # It does NOT trip the breaker
+    breaker = CircuitBreaker(CircuitBreakerConfig(failure_threshold=1))
+    breaker.record_failure(exc)
+    assert breaker.consecutive_failures == 0
+    assert breaker.state == CircuitState.CLOSED
+
+
 @pytest.mark.parametrize(
     "failures,threshold,expected_state",
     [
@@ -260,12 +283,14 @@ def test_circuit_breaker_reset() -> None:
 
 def test_lease_config_failure_policy_defaults() -> None:
     cfg_closed = LeaseConfig(fail_open=False)
-    assert cfg_closed.failure_policy.fallback_mode == FallbackMode.FAIL_CLOSED
-    assert cfg_closed.failure_policy.circuit_breaker is None
+    assert cfg_closed.failure_policy is None
+    assert cfg_closed.effective_failure_policy.fallback_mode == FallbackMode.FAIL_CLOSED
+    assert cfg_closed.effective_failure_policy.circuit_breaker is None
 
     cfg_open = LeaseConfig(fail_open=True)
-    assert cfg_open.failure_policy.fallback_mode == FallbackMode.FAIL_OPEN
-    assert cfg_open.failure_policy.circuit_breaker is None
+    assert cfg_open.failure_policy is None
+    assert cfg_open.effective_failure_policy.fallback_mode == FallbackMode.FAIL_OPEN
+    assert cfg_open.effective_failure_policy.circuit_breaker is None
 
     explicit_policy = BackendFailurePolicy(
         fallback_mode=FallbackMode.FAIL_OPEN,
@@ -273,7 +298,53 @@ def test_lease_config_failure_policy_defaults() -> None:
     )
     cfg_custom = LeaseConfig(failure_policy=explicit_policy)
     assert cfg_custom.failure_policy == explicit_policy
+    assert cfg_custom.effective_failure_policy == explicit_policy
     assert cfg_custom.fail_open is True
+
+
+def test_lease_config_dataclass_replace_fail_open() -> None:
+    """Verifies that dataclasses.replace flips fail_open without policy override."""
+    cfg = LeaseConfig()
+    assert cfg.fail_open is False
+    assert cfg.failure_policy is None
+
+    cfg2 = replace(cfg, fail_open=True)
+    assert cfg2.fail_open is True
+    assert cfg2.failure_policy is None
+    assert cfg2.effective_failure_policy.fallback_mode == FallbackMode.FAIL_OPEN
+
+    cfg3 = replace(cfg2, fail_open=False)
+    assert cfg3.fail_open is False
+    assert cfg3.failure_policy is None
+    assert cfg3.effective_failure_policy.fallback_mode == FallbackMode.FAIL_CLOSED
+
+
+def test_lease_config_asdict_roundtrip() -> None:
+    """Verifies that LeaseConfig can be round-tripped through dataclasses.asdict."""
+    # 1. Default config
+    cfg_default = LeaseConfig()
+    data_default = asdict(cfg_default)
+    cfg_default_rebuilt = LeaseConfig(**data_default)
+    assert cfg_default_rebuilt == cfg_default
+    assert cfg_default_rebuilt.failure_policy is None
+
+    # 2. Config with custom failure policy and circuit breaker
+    policy = BackendFailurePolicy(
+        fallback_mode=FallbackMode.FAIL_OPEN,
+        circuit_breaker=CircuitBreakerConfig(failure_threshold=7, recovery_timeout=5.0),
+    )
+    cfg_custom = LeaseConfig(failure_policy=policy)
+    data_custom = asdict(cfg_custom)
+    cfg_custom_rebuilt = LeaseConfig(**data_custom)
+    assert cfg_custom_rebuilt.failure_policy == policy
+    assert cfg_custom_rebuilt.fail_open is True
+    assert cfg_custom_rebuilt.effective_failure_policy == policy
+
+
+def test_lease_config_invalid_failure_policy_type() -> None:
+    err_msg = "failure_policy must be an instance of BackendFailurePolicy or None"
+    with pytest.raises(TypeError, match=err_msg):
+        LeaseConfig(failure_policy="invalid_string")  # type: ignore[arg-type]
 
 
 def test_manager_circuit_state_property() -> None:
@@ -346,6 +417,55 @@ async def test_manager_acquire_circuit_breaker_open_fail_open() -> None:
     assert lease3._is_fallback is True
     assert mock_redis.eval.call_count == 2  # Zero network roundtrip!
     assert telemetry.fallbacks == 3
+
+
+@pytest.mark.asyncio
+async def test_manager_acquire_max_connections_error_fail_closed_normalizes_to_503() -> None:
+    max_conn_cls = getattr(redis.exceptions, "MaxConnectionsError", None)
+    if max_conn_cls is None:
+        pytest.skip("MaxConnectionsError not available in redis version")
+
+    mock_redis = AsyncMock()
+    mock_redis.eval.side_effect = max_conn_cls("Pool exhausted")
+
+    manager = StreamLeaseManager(redis=mock_redis, config=LeaseConfig(fail_open=False))
+    err_pattern = "Stream lease coordination backend is temporarily unavailable"
+    with pytest.raises(StreamLeaseUnavailable, match=err_pattern):
+        await manager.acquire("u1")
+
+
+@pytest.mark.asyncio
+async def test_manager_acquire_max_connections_error_fail_open_does_not_create_fallback() -> None:
+    max_conn_cls = getattr(redis.exceptions, "MaxConnectionsError", None)
+    if max_conn_cls is None:
+        pytest.skip("MaxConnectionsError not available in redis version")
+
+    mock_redis = AsyncMock()
+    mock_redis.eval.side_effect = max_conn_cls("Pool exhausted")
+
+    # Even with fail_open=True, MaxConnectionsError must NOT bypass limits by creating fallback
+    manager = StreamLeaseManager(redis=mock_redis, config=LeaseConfig(fail_open=True))
+    err_pattern = "Stream lease coordination backend is temporarily unavailable"
+    with pytest.raises(StreamLeaseUnavailable, match=err_pattern):
+        await manager.acquire("u1")
+
+
+@pytest.mark.asyncio
+async def test_manager_renew_max_connections_error_raises_stream_lease_unavailable() -> None:
+    max_conn_cls = getattr(redis.exceptions, "MaxConnectionsError", None)
+    if max_conn_cls is None:
+        pytest.skip("MaxConnectionsError not available in redis version")
+
+    mock_redis = AsyncMock()
+    mock_redis.eval = AsyncMock(return_value=1)
+    manager = StreamLeaseManager(redis=mock_redis)
+    lease = await manager.acquire("u1")
+
+    # Renew throws MaxConnectionsError -> must raise StreamLeaseUnavailable for grace period
+    mock_redis.eval.side_effect = max_conn_cls("Pool exhausted")
+    err_pattern = "Stream lease coordination backend is temporarily unavailable"
+    with pytest.raises(StreamLeaseUnavailable, match=err_pattern):
+        await manager.renew(lease)
 
 
 @pytest.mark.asyncio
