@@ -221,7 +221,7 @@ jobs:
         run: |
           docker compose -f docker-compose.sentinel.yml down -v
 
-  test-redis-py-min:
+  test-redis-py-compat:
     runs-on: ubuntu-latest
     services:
       redis:
@@ -261,6 +261,17 @@ jobs:
           uv run --no-sync --python ${{ matrix.python-version }} python -c 'import redis; assert redis.__version__ == "${{ matrix.redis-version }}", redis.__version__'
       - name: Run complete suite with compatibility client
         run: uv run --no-sync --python ${{ matrix.python-version }} pytest
+
+  # Keep the existing required check name stable while the compatibility matrix grows.
+  test-redis-py-min:
+    runs-on: ubuntu-latest
+    needs: test-redis-py-compat
+    if: always()
+    steps:
+      - name: Require every client compatibility job to pass
+        env:
+          COMPAT_RESULT: ${{ needs.test-redis-py-compat.result }}
+        run: test "$COMPAT_RESULT" = success
 
   test-fastapi-min:
     runs-on: ubuntu-latest
