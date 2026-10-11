@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import os
 import sys
 from uuid import uuid4
@@ -11,12 +12,21 @@ import pytest
 import redis.asyncio as redis
 
 from fastapi_stream_lease import (
+    BackendFailurePolicy,
+    CircuitBreakerConfig,
+    CircuitState,
+    FallbackMode,
     LeaseConfig,
     StreamLeaseLost,
     StreamLeaseManager,
     StreamLeaseRejected,
     StreamLeaseUnavailable,
 )
+
+
+def _resp2_kwargs() -> dict[str, int]:
+    # redis-py 4.6 uses RESP2 only; 8+ defaults to RESP3, unsupported by Redis 5.
+    return {"protocol": 2} if "protocol" in inspect.signature(redis.Redis).parameters else {}
 
 
 async def _safe_close(client: redis.Redis) -> None:
@@ -33,8 +43,7 @@ async def real_manager():
     url = os.environ.get("REDIS_URL")
     if not url:
         pytest.skip("Set REDIS_URL to run real Redis integration tests")
-    # redis-py 8 defaults to RESP3; Redis 5 only supports RESP2.
-    client = redis.from_url(url, protocol=2)
+    client = redis.from_url(url, **_resp2_kwargs())
     manager = StreamLeaseManager(
         client,
         LeaseConfig(lease_seconds=0.5, max_per_user=2, max_global=3, key_prefix=uuid4().hex),
@@ -65,6 +74,73 @@ async def test_real_redis_atomic_limits_across_managers(real_manager):
         assert await real_manager.get_active_count("user_1") <= 2
     finally:
         await asyncio.gather(*(lease.release() for lease in leases))
+
+
+@pytest.mark.parametrize("blocking", [False, True])
+@pytest.mark.parametrize("fail_open", [False, True])
+@pytest.mark.parametrize("with_breaker", [False, True])
+async def test_real_pool_exhaustion_preserves_limits_and_recovers(
+    blocking: bool, fail_open: bool, with_breaker: bool
+) -> None:
+    url = os.environ.get("REDIS_URL")
+    if not url:
+        pytest.skip("Set REDIS_URL to run real Redis integration tests")
+    pool_type = redis.BlockingConnectionPool if blocking else redis.ConnectionPool
+    kwargs: dict[str, int | float] = _resp2_kwargs()
+    if blocking:
+        kwargs["timeout"] = 0.01
+    pool = pool_type.from_url(url, max_connections=1, **kwargs)
+    client = redis.Redis(connection_pool=pool)
+    policy = BackendFailurePolicy(
+        circuit_breaker=CircuitBreakerConfig(failure_threshold=1) if with_breaker else None,
+        fallback_mode=FallbackMode.FAIL_OPEN if fail_open else FallbackMode.FAIL_CLOSED,
+    )
+    manager = StreamLeaseManager(
+        client,
+        LeaseConfig(
+            key_prefix=uuid4().hex,
+            max_per_user=1,
+            max_global=1,
+            lease_seconds=2,
+            failure_policy=policy,
+        ),
+    )
+    lease = await manager.acquire("pool-user")
+    try:
+        command = inspect.signature(pool.get_connection).parameters.get("command_name")
+        connection = (
+            await pool.get_connection("PING")
+            if command is not None and command.default is inspect.Parameter.empty
+            else await pool.get_connection()
+        )
+        try:
+            with pytest.raises(StreamLeaseUnavailable):
+                await manager.acquire("another-user")
+            with pytest.raises(StreamLeaseUnavailable):
+                await manager.get_active_count()
+            with pytest.raises(StreamLeaseUnavailable):
+                await manager.renew(lease)
+            # Release retains its best-effort contract when the backend is unavailable.
+            await manager.release(lease)
+            assert manager.circuit_state == (CircuitState.CLOSED if with_breaker else None)
+            if manager._circuit_breaker is not None:
+                assert manager._circuit_breaker.consecutive_failures == 0
+                assert manager._circuit_breaker.half_open_probes_in_flight == 0
+        finally:
+            await pool.release(connection)
+        assert await manager.get_active_count() == 1
+        assert await lease.renew() is True
+        with pytest.raises(StreamLeaseRejected):
+            await manager.acquire("another-user")
+        await lease.release()
+        assert await manager.get_active_count() == 0
+        replacement = await manager.acquire("another-user")
+        await replacement.release()
+    finally:
+        await manager.release(lease)
+        await manager.close()
+        await _safe_close(client)
+        await pool.disconnect()
 
 
 @pytest.mark.asyncio
@@ -117,12 +193,14 @@ async def test_real_redis_limit_applies_across_processes(real_manager):
     ]
     child_code = """
 import asyncio
+import inspect
 import sys
 import redis.asyncio as redis
 from fastapi_stream_lease import LeaseConfig, StreamLeaseManager, StreamLeaseRejected
 
 async def main():
-    client = redis.from_url(sys.argv[1], protocol=2)
+    kwargs = {"protocol": 2} if "protocol" in inspect.signature(redis.Redis).parameters else {}
+    client = redis.from_url(sys.argv[1], **kwargs)
     manager = StreamLeaseManager(
         client, LeaseConfig(lease_seconds=0.5, max_per_user=2, max_global=3,
                             key_prefix=sys.argv[2])
@@ -214,7 +292,7 @@ async def test_real_redis_verify_cluster_config_concurrent_race():
     url = os.environ.get("REDIS_URL")
     if not url:
         pytest.skip("Set REDIS_URL to run real Redis integration tests")
-    client = redis.from_url(url, protocol=2)
+    client = redis.from_url(url, **_resp2_kwargs())
     prefix = f"race_real_{uuid4().hex[:8]}"
 
     cfg_a = LeaseConfig(key_prefix=prefix, max_global=10, max_per_user=1, fail_open=False)

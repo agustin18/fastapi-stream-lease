@@ -29,6 +29,12 @@ from fastapi_stream_lease.lease import StreamLease
 from fastapi_stream_lease.manager import StreamLeaseManager
 from fastapi_stream_lease.observability.contract import Operation, Outcome, TelemetryAdapter
 
+_POOL_ERRORS = (
+    redis.exceptions.MaxConnectionsError("Too many connections"),
+    redis.exceptions.ConnectionError("Too many connections"),
+    redis.exceptions.ConnectionError("No connection available."),
+)
+
 
 class DummyTelemetry(TelemetryAdapter):
     def __init__(self) -> None:
@@ -177,6 +183,83 @@ def test_circuit_breaker_classification_max_connections_error() -> None:
     breaker.record_failure(exc)
     assert breaker.consecutive_failures == 0
     assert breaker.state == CircuitState.CLOSED
+
+
+@pytest.mark.parametrize("message", ["Too many connections", "No connection available."])
+def test_legacy_pool_exhaustion_is_availability_without_transient_failure(message: str) -> None:
+    exc = redis.exceptions.ConnectionError(message)
+    assert is_availability_error(exc) is True
+    assert is_transient_error(exc) is False
+    breaker = CircuitBreaker(CircuitBreakerConfig(failure_threshold=1))
+    breaker.record_failure(exc)
+    assert breaker.state == CircuitState.CLOSED
+    assert breaker.consecutive_failures == 0
+
+
+@pytest.mark.parametrize("message", ["Too many connections", "No connection available."])
+@pytest.mark.parametrize("fail_open", [False, True])
+@pytest.mark.parametrize("with_breaker", [False, True])
+async def test_legacy_pool_exhaustion_never_grants_fallback(
+    message: str, fail_open: bool, with_breaker: bool
+) -> None:
+    client = AsyncMock()
+    client.eval.side_effect = redis.exceptions.ConnectionError(message)
+    telemetry = DummyTelemetry()
+    policy = BackendFailurePolicy(
+        circuit_breaker=CircuitBreakerConfig(failure_threshold=1) if with_breaker else None,
+        fallback_mode=FallbackMode.FAIL_OPEN if fail_open else FallbackMode.FAIL_CLOSED,
+    )
+    manager = StreamLeaseManager(client, LeaseConfig(failure_policy=policy), telemetry=telemetry)
+    try:
+        with pytest.raises(StreamLeaseUnavailable) as error:
+            await manager.acquire("any-consumer")
+        assert error.value.__cause__ is client.eval.side_effect
+        assert manager.circuit_state == (CircuitState.CLOSED if with_breaker else None)
+        assert telemetry.fallbacks == 0
+        assert telemetry.operations[-1][1] == Outcome.BACKEND_ERROR
+        assert client.eval.await_count == 1
+    finally:
+        await manager.close()
+
+
+@pytest.mark.parametrize(
+    "exc,transient,availability",
+    [
+        (redis.exceptions.ConnectionError("Too many connections to remote host"), True, True),
+        (redis.exceptions.ConnectionError("No connection available"), True, True),
+        (redis.exceptions.ConnectionError("Too many connections", "remote"), True, True),
+        (redis.exceptions.ConnectionError(), True, True),
+        (redis.exceptions.ConnectionError(None), True, True),
+        (redis.exceptions.AuthenticationError("Too many connections"), False, False),
+        (redis.exceptions.AuthorizationError("No connection available."), False, False),
+        (ConnectionError("Too many connections"), True, True),
+        (redis.exceptions.ResponseError("Too many connections"), False, False),
+    ],
+)
+def test_legacy_pool_matching_does_not_reclassify_other_errors(
+    exc: BaseException, transient: bool, availability: bool
+) -> None:
+    assert is_transient_error(exc) is transient
+    assert is_availability_error(exc) is availability
+
+
+def test_custom_connection_error_is_not_matched_as_legacy_pool_exhaustion() -> None:
+    class CustomConnectionError(redis.exceptions.ConnectionError):
+        pass
+
+    exc = CustomConnectionError("Too many connections")
+    assert is_transient_error(exc) is True
+    assert is_availability_error(exc) is True
+
+
+def test_legacy_pool_matching_does_not_call_custom_argument_equality() -> None:
+    class UnexpectedEquality:
+        def __eq__(self, other: object) -> bool:
+            raise AssertionError("Error classification must not compare custom objects")
+
+    exc = redis.exceptions.ConnectionError(UnexpectedEquality())
+    assert is_transient_error(exc) is True
+    assert is_availability_error(exc) is True
 
 
 @pytest.mark.parametrize(
@@ -982,7 +1065,10 @@ async def test_manager_open_renew_zero_heals_breaker() -> None:
     assert manager._circuit_breaker.consecutive_failures == 0
 
 
-def test_half_open_probe_not_released_by_external_non_transient_error() -> None:
+@pytest.mark.parametrize("pool_error", _POOL_ERRORS)
+def test_half_open_probe_not_released_by_external_non_transient_error(
+    pool_error: BaseException,
+) -> None:
     """
     Verifies that non-permit calls (CB-29-01) cannot free probe slots owned by other coroutines.
     """
@@ -1005,7 +1091,7 @@ def test_half_open_probe_not_released_by_external_non_transient_error() -> None:
     assert permit_b.allowed is False
 
     # External call (e.g. renew or release without permit) reports MaxConnectionsError
-    cb.record_failure(redis.exceptions.MaxConnectionsError("Too many connections"))
+    cb.record_failure(pool_error)
 
     # Probe slot MUST NOT be decremented!
     assert cb.half_open_probes_in_flight == 1
@@ -1021,7 +1107,10 @@ def test_half_open_probe_not_released_by_external_non_transient_error() -> None:
 
 
 @pytest.mark.asyncio
-async def test_manager_renew_release_max_conn_error_does_not_release_probe() -> None:
+@pytest.mark.parametrize("pool_error", _POOL_ERRORS)
+async def test_manager_renew_release_max_conn_error_does_not_release_probe(
+    pool_error: BaseException,
+) -> None:
     """Verifies that manager renew/release MaxConnectionsError does not free in-flight probe."""
     mock_redis = AsyncMock()
     cb_cfg = CircuitBreakerConfig(
@@ -1044,9 +1133,7 @@ async def test_manager_renew_release_max_conn_error_does_not_release_probe() -> 
     assert manager._circuit_breaker.half_open_probes_in_flight == 1
 
     # An active stream tries to renew and encounters MaxConnectionsError
-    mock_redis.eval = AsyncMock(
-        side_effect=redis.exceptions.MaxConnectionsError("Too many connections")
-    )
+    mock_redis.eval = AsyncMock(side_effect=pool_error)
     dummy_lease = StreamLease(
         manager=manager,
         lease_id="l1",
@@ -1105,7 +1192,10 @@ def test_lease_config_failure_policy_dict_rejects_unknown_keys() -> None:
     assert cfg_with_obj.failure_policy.circuit_breaker == cb_obj
 
 
-def test_probe_permit_failure_with_non_transient_error_releases_probe() -> None:
+@pytest.mark.parametrize("pool_error", _POOL_ERRORS)
+def test_probe_permit_failure_with_non_transient_error_releases_probe(
+    pool_error: BaseException,
+) -> None:
     """Verifies that when an in-flight probe encounters a non-transient error,
 
     its slot is freed.
@@ -1124,7 +1214,7 @@ def test_probe_permit_failure_with_non_transient_error_releases_probe() -> None:
     assert cb.half_open_probes_in_flight == 1
 
     # Probe records non-transient error (e.g. MaxConnectionsError)
-    probe_permit.record_failure(redis.exceptions.MaxConnectionsError("pool saturated"))
+    probe_permit.record_failure(pool_error)
 
     # Probe slot must be released back to 0, but breaker stays HALF_OPEN
     assert cb.state == CircuitState.HALF_OPEN
@@ -1135,5 +1225,5 @@ def test_probe_permit_failure_with_non_transient_error_releases_probe() -> None:
     assert cb.state == CircuitState.CLOSED
     closed_permit = cb.acquire_permit()
     assert closed_permit.is_probe is False
-    closed_permit.record_failure(redis.exceptions.MaxConnectionsError("pool saturated"))
+    closed_permit.record_failure(pool_error)
     assert cb.consecutive_failures == 0

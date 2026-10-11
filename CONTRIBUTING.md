@@ -26,7 +26,11 @@ docker compose run --rm backend uv run pytest
 docker compose down
 ```
 
-The default test command requires at least 95% combined line and branch coverage. CI also checks Redis 5, 7, and 8, builds both distributions, and validates package metadata.
+The default test command requires at least 95% combined line and branch coverage. CI also checks Redis servers 5, 7, and 8, the redis-py 4.6.0 client floor and modern clients, including Cluster and Sentinel. It builds both distributions and validates package metadata. Server and Python client versions are independent.
+
+For the client floor, run `uv run --with "redis==4.6.0" pytest`; the overlay resolves dependencies normally. Real integration tests need an isolated `REDIS_URL`. The fixtures select RESP2 for newer clients and omit the unsupported `protocol` argument on 4.6. Use `aclose()` when available, otherwise await `close()`; disconnect caller-owned pools separately.
+
+Pool-exhaustion regression tests must cover actual `ConnectionPool` and `BlockingConnectionPool` errors, both fallback policies, and circuit permit ownership. A capacity error must not enable fail-open or count as a remote outage.
 
 GitHub Actions are pinned to full commit hashes so a changed version tag cannot silently change the release pipeline. The comment beside each hash shows the readable release version, and Dependabot proposes grouped updates.
 

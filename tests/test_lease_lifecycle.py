@@ -302,12 +302,17 @@ async def test_auto_renew_grace_period_recovers_from_transient_redis_outage(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "pool_error",
+    [
+        redis.exceptions.MaxConnectionsError("Too many connections"),
+        redis.exceptions.ConnectionError("Too many connections"),
+        redis.exceptions.ConnectionError("No connection available."),
+    ],
+)
 async def test_auto_renew_grace_period_recovers_from_max_connections_error(
-    lease_manager, fake_redis
+    lease_manager, fake_redis, pool_error
 ):
-    max_conn_cls = getattr(redis.exceptions, "MaxConnectionsError", None)
-    if max_conn_cls is None:
-        pytest.skip("MaxConnectionsError not available in redis-py version")
 
     async def long_stream():
         yield "chunk_1"
@@ -322,7 +327,7 @@ async def test_auto_renew_grace_period_recovers_from_max_connections_error(
         nonlocal eval_call_count
         eval_call_count += 1
         if eval_call_count == 1:
-            raise max_conn_cls("Too many connections in pool")
+            raise pool_error
         return await original_eval(*args, **kwargs)
 
     lease_manager.redis.eval = flaky_eval
@@ -372,7 +377,15 @@ async def test_acquire_fail_open_and_closed(fake_redis):
 
 
 @pytest.mark.asyncio
-async def test_wrap_stream_auto_renew_grace_period_exhausted(lease_manager):
+@pytest.mark.parametrize(
+    "backend_error",
+    [
+        ConnectionError("Redis down"),
+        redis.exceptions.ConnectionError("Too many connections"),
+        redis.exceptions.ConnectionError("No connection available."),
+    ],
+)
+async def test_wrap_stream_auto_renew_grace_period_exhausted(lease_manager, backend_error):
     from unittest.mock import AsyncMock
 
     async def slow_generator():
@@ -383,7 +396,7 @@ async def test_wrap_stream_auto_renew_grace_period_exhausted(lease_manager):
     lease = await lease_manager.acquire("user_gp")
     # Simulate deadline expiring very shortly so grace period retries exhaust remaining window
     lease.expires_at = time.monotonic() + 0.05
-    lease_manager.redis.eval = AsyncMock(side_effect=ConnectionError("Redis down"))
+    lease_manager.redis.eval = AsyncMock(side_effect=backend_error)
 
     chunks = []
     with pytest.raises(StreamLeaseLost):

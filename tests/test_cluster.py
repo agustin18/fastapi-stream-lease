@@ -143,7 +143,7 @@ async def wait_for_slot_primary(
 
 
 async def safe_close_client(client: Any) -> None:
-    """Safely close client across redis-py 5.0.0 (close()) and 5.0.1+ (aclose())."""
+    """Safely close client across redis-py 4.6 / 5.0.0 (close()) and 5.0.1+ (aclose())."""
     if hasattr(client, "aclose"):
         await client.aclose()
     elif hasattr(client, "close"):

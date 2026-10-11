@@ -38,7 +38,10 @@ async def lifespan(app: FastAPI):
     yield
     # Gracefully drain background tasks and close Redis client
     await manager.close(drain=True, timeout=5.0)
-    await redis_client.aclose()
+    if hasattr(redis_client, "aclose"):
+        await redis_client.aclose()
+    else:
+        await redis_client.close()
 
 
 app = FastAPI(lifespan=lifespan)
