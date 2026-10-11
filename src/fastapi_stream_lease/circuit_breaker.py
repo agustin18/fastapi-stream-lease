@@ -49,13 +49,27 @@ _REDIS_CLUSTER_EXCEPTION_CLS = getattr(redis.exceptions, "RedisClusterException"
 _MAX_CONNECTIONS_ERROR_CLS = getattr(redis.exceptions, "MaxConnectionsError", None)
 
 
+def _is_pool_exhaustion(exc: BaseException) -> bool:
+    """Recognize redis-py's local capacity errors without matching remote failures."""
+    if _MAX_CONNECTIONS_ERROR_CLS is not None and isinstance(exc, _MAX_CONNECTIONS_ERROR_CLS):
+        return True
+    # Older clients use plain ConnectionError, also used for genuine network outages.
+    # Exact type and arguments exclude auth errors, custom subclasses and partial matches.
+    return (
+        type(exc) is redis.exceptions.ConnectionError
+        and len(exc.args) == 1
+        and type(exc.args[0]) is str
+        and exc.args[0] in ("Too many connections", "No connection available.")
+    )
+
+
 def is_transient_error(exc: BaseException) -> bool:
     """
     Return True if an exception represents a transient network, timeout, or cluster issue.
     Returns False for non-transient errors such as connection pool exhaustion, authentication,
     invalid Redis commands, cross-slot violations, or local OS errors.
     """
-    if isinstance(exc, _NON_TRANSIENT_CONNECTION_ERRORS):
+    if isinstance(exc, _NON_TRANSIENT_CONNECTION_ERRORS) or _is_pool_exhaustion(exc):
         return False
     if isinstance(exc, _TRANSIENT_REDIS_ERRORS):
         return True
@@ -73,11 +87,12 @@ def is_availability_error(exc: BaseException) -> bool:
     Return True if an exception represents a backend availability or connectivity condition.
 
     Covers both remote transient network/timeout conditions (is_transient_error) and
-    client-side connection pool exhaustion (MaxConnectionsError). These conditions
-    normalize to StreamLeaseUnavailable (HTTP 503) and are retryable during renewal grace periods,
-    without tripping the circuit breaker or enabling fail-open fallbacks.
+    client-side connection pool exhaustion (including legacy ConnectionError messages).
+    Pool exhaustion normalizes to StreamLeaseUnavailable and is retryable during renewal
+    grace periods without tripping the circuit breaker or enabling fail-open fallbacks.
+    Remote transient conditions retain their configured breaker and fallback behavior.
     """
-    if _MAX_CONNECTIONS_ERROR_CLS is not None and isinstance(exc, _MAX_CONNECTIONS_ERROR_CLS):
+    if _is_pool_exhaustion(exc):
         return True
     return is_transient_error(exc)
 

@@ -42,7 +42,7 @@ def parse_sentinel_hosts(hosts_env: str) -> list[tuple[str, int]]:
 
 
 async def safe_close_client(client: Any) -> None:
-    """Safely close client across redis-py 5.0.0 (close()) and 5.0.1+ (aclose())."""
+    """Safely close client across redis-py 4.6 / 5.0.0 (close()) and 5.0.1+ (aclose())."""
     if client is None:
         return
     if hasattr(client, "aclose"):

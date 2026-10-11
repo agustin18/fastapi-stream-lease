@@ -10,7 +10,12 @@ Request rate limiters answer “how many requests arrived this minute?” This p
 
 ## Install
 
-Requires Python 3.10+ and Redis 5.0+.
+Requires Python 3.10+, a Redis server 5.0+, and the Python client `redis-py` 4.6.0+.
+The server and Python client have independent version numbers.
+
+The core accepts a caller-owned async Redis client; it does not configure or replace
+your connection pool. With redis-py 4.6, RESP2 is implicit and `protocol` is not a
+supported constructor argument.
 
 With Redis 5 and redis-py 8+, construct your client with `redis.from_url(url, protocol=2)`: redis-py 8 defaults to RESP3, which Redis 5 does not support. See the [redis-py protocol documentation](https://github.com/redis/redis-py#resp3-support).
 
@@ -76,7 +81,10 @@ async def lifespan(app: FastAPI):
     yield
     # Clean teardown: drain telemetry callbacks and close resources
     await manager.close(drain=True, timeout=5.0)
-    await redis_client.aclose()
+    if hasattr(redis_client, "aclose"):
+        await redis_client.aclose()
+    else:
+        await redis_client.close()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -129,6 +137,7 @@ The manager context and `async with lease` both renew while open. Handle normal 
 - Acquisition, renewal, expiration cleanup, and release use atomic Redis Lua scripts. The keys share a Redis Cluster hash tag, so a user and global limit can be checked in one script.
 - Every lease expires after `lease_seconds` without a successful renewal. `wrap()` and `manager.lease()` renew every half interval by default. Transient Redis connection errors trigger fast retries across the remaining lease TTL (Adaptive Grace Period), preventing temporary hiccups from dropping active streams.
 - If Redis is unavailable on initial acquisition, `StreamLeaseUnavailable` (HTTP 503) is raised by default (`fail_open=False`). Set `fail_open=True` in `LeaseConfig` if your application prefers allowing streams during Redis outages (graceful degradation).
+- Local pool exhaustion rejects acquisition with `StreamLeaseUnavailable`, even with `fail_open=True`, and does not increment circuit failure counters. Older clients signal it with exact `ConnectionError` messages (`Too many connections` or `No connection available.`); newer clients may use `MaxConnectionsError`. Renewal retries remain bounded by the lease TTL. An already-open circuit retains its configured fallback policy.
 - Normal completion or cancellation attempts immediate release. If Redis is unavailable during release, the lease is removed after expiration; cleanup of the key itself uses a longer TTL. An async iterator abandoned without being closed may also hold its slot until expiration. Use `contextlib.aclosing()` if your own consumer stops iteration early.
 - `get_active_count(user_id)` counts active leases for one identity; `get_active_count()` counts globally when `max_global` is enabled. Neither is a historical usage metric.
 - All workers sharing limits must use the same key prefix and compatible limit settings. Lease expiration is measured by Redis, avoiding clock differences among application workers.
@@ -189,7 +198,7 @@ manager = StreamLeaseManager(redis=client, config=config)
 
 ### Circuit Breaker States & Transitions
 
-1. **`CLOSED` (Normal Operation):** All requests proceed to Redis. Transient network/timeout errors increment consecutive failure counters. Non-transient errors (such as authentication or configuration errors) and local connection pool exhaustion (`MaxConnectionsError`) are ignored.
+1. **`CLOSED` (Normal Operation):** All requests proceed to Redis. Transient network/timeout errors increment consecutive failure counters. Non-transient errors (such as authentication or configuration errors) and local connection pool exhaustion (`MaxConnectionsError` or the equivalent legacy `ConnectionError`) are ignored.
 2. **`OPEN` (Fast-Failing):** When consecutive transient errors reach `failure_threshold`, the circuit breaker trips to `OPEN`. For the duration of `recovery_timeout + uniform(0, jitter)`:
    - If `fallback_mode=FAIL_CLOSED`: `acquire()` immediately raises `StreamLeaseUnavailable` (`HTTP 503 Service Unavailable`) without attempting any network I/O.
    - If `fallback_mode=FAIL_OPEN`: `acquire()` immediately grants an in-memory fallback lease without touching Redis.
@@ -287,7 +296,8 @@ Therefore, **an `OPEN` circuit breaker never blocks renewal attempts**. Active s
 
   # Size max_connections to accommodate peak concurrent streams and renewals
   pool = redis.ConnectionPool.from_url("redis://localhost:6379/0", max_connections=500)
-  client = redis.Redis.from_pool(pool)
+  client = redis.Redis(connection_pool=pool)
+  # The caller owns this pool: close the client and disconnect the pool on shutdown.
   ```
 
 ### Changing Cluster Configuration Safely
@@ -307,7 +317,7 @@ Because `{prefix}:config` is persistent (stored with `SET ... NX` without TTL ex
      redis-cli DEL "{my_prefix}:config"
      ```
    - Start the updated worker instances. The first new pod will atomically register the updated configuration fingerprint with `SET ... NX`, and subsequent pods will verify compatibility against it.
-- **Redis Failover & Sentinel Support:** Automatically classifies `ReadOnlyError` (thrown when hitting a replica during master election) and `ConnectionError` as transient conditions, enabling adaptive renewal retries to ride out failovers without dropping active streams. Note that the Sentinel configuration in `docker-compose.sentinel.yml` uses aggressive test timings (`down-after-milliseconds 1000`, `failover-timeout 5000`); production environments should use standard recommended operational timeouts (`down-after-milliseconds` 5000–30000ms, `failover-timeout` 60000–180000ms).
+- **Redis Failover & Sentinel Support:** Automatically classifies `ReadOnlyError` (thrown when hitting a replica during master election) and network `ConnectionError` (excluding local pool exhaustion) as transient conditions, enabling adaptive renewal retries to ride out failovers without dropping active streams. Note that the Sentinel configuration in `docker-compose.sentinel.yml` uses aggressive test timings (`down-after-milliseconds 1000`, `failover-timeout 5000`); production environments should use standard recommended operational timeouts (`down-after-milliseconds` 5000–30000ms, `failover-timeout` 60000–180000ms).
 - **Redis Cluster Support:** All keys use Redis hash tags (`{prefix}:user:...` and `{prefix}:global`), guaranteeing user and global sorted sets reside on the same hash slot for atomic multi-key Lua operations without `CROSSSLOT` errors. Validated under real 6-node sharded topologies (`docker-compose.cluster.yml`) with automated slot failover, `MOVED` redirection recovery, and drift verification (`tests/test_cluster.py`).
 - **Reproducible Concurrency Benchmarks:**
   Run throughput and latency benchmarks against your local Redis instance with pre-warmed connection pool and multi-run statistics:
@@ -343,7 +353,7 @@ Because `{prefix}:config` is persistent (stored with `SET ... NX` without TTL ex
    - **Never pass raw, unverified client input** (such as path parameters or query strings) directly as `user_id`. Doing so allows malicious clients to create arbitrary keys in Redis and bypass concurrency bounds.
    - Avoid using sensitive PII (emails, full names) or raw bearer tokens as `user_id`, as these appear in Redis keys (`{prefix}:user:{user_id}`) and operational debug logs.
 2. **Dependency Floors vs. Production Security:**
-   - The test matrix validates compatibility down to minimum floors (`fastapi>=0.100.0`, `starlette>=0.27.0`, `redis>=5.0.0`).
+   - The test matrix validates compatibility down to minimum floors (`fastapi>=0.100.0`, `starlette>=0.27.0`, `redis>=4.6.0`).
    - These are **compatibility floors**, not security recommendations. Production deployments should always maintain up-to-date versions of FastAPI, Starlette, and Redis to benefit from upstream security patches and CVE remediations.
 3. **Automated Vulnerability Scanning:**
    - All commits and pull requests are audited in CI via `pip-audit` to detect known vulnerabilities across dependencies.

@@ -363,7 +363,10 @@ async def run_comparative_benchmark(
     residual_raw_keys = [k async for k in client.scan_iter(match=f"*{raw_prefix}*")]
     residual_wrap_keys = [k async for k in client.scan_iter(match=f"*{wrap_prefix}*")]
     zero_residual_keys = len(residual_raw_keys) == 0 and len(residual_wrap_keys) == 0
-    await client.aclose()
+    if hasattr(client, "aclose"):
+        await client.aclose()
+    else:
+        await client.close()
 
     # 6. BUDGET AND REGRESSION ANALYSIS
     max_p99_paired_overhead = max(

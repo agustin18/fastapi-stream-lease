@@ -302,12 +302,17 @@ async def test_auto_renew_grace_period_recovers_from_transient_redis_outage(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "pool_error",
+    [
+        redis.exceptions.MaxConnectionsError("Too many connections"),
+        redis.exceptions.ConnectionError("Too many connections"),
+        redis.exceptions.ConnectionError("No connection available."),
+    ],
+)
 async def test_auto_renew_grace_period_recovers_from_max_connections_error(
-    lease_manager, fake_redis
+    lease_manager, fake_redis, pool_error
 ):
-    max_conn_cls = getattr(redis.exceptions, "MaxConnectionsError", None)
-    if max_conn_cls is None:
-        pytest.skip("MaxConnectionsError not available in redis-py version")
 
     async def long_stream():
         yield "chunk_1"
@@ -322,7 +327,7 @@ async def test_auto_renew_grace_period_recovers_from_max_connections_error(
         nonlocal eval_call_count
         eval_call_count += 1
         if eval_call_count == 1:
-            raise max_conn_cls("Too many connections in pool")
+            raise pool_error
         return await original_eval(*args, **kwargs)
 
     lease_manager.redis.eval = flaky_eval
@@ -372,7 +377,15 @@ async def test_acquire_fail_open_and_closed(fake_redis):
 
 
 @pytest.mark.asyncio
-async def test_wrap_stream_auto_renew_grace_period_exhausted(lease_manager):
+@pytest.mark.parametrize(
+    "backend_error",
+    [
+        ConnectionError("Redis down"),
+        redis.exceptions.ConnectionError("Too many connections"),
+        redis.exceptions.ConnectionError("No connection available."),
+    ],
+)
+async def test_wrap_stream_auto_renew_grace_period_exhausted(lease_manager, backend_error):
     from unittest.mock import AsyncMock
 
     async def slow_generator():
@@ -383,7 +396,7 @@ async def test_wrap_stream_auto_renew_grace_period_exhausted(lease_manager):
     lease = await lease_manager.acquire("user_gp")
     # Simulate deadline expiring very shortly so grace period retries exhaust remaining window
     lease.expires_at = time.monotonic() + 0.05
-    lease_manager.redis.eval = AsyncMock(side_effect=ConnectionError("Redis down"))
+    lease_manager.redis.eval = AsyncMock(side_effect=backend_error)
 
     chunks = []
     with pytest.raises(StreamLeaseLost):
@@ -500,15 +513,32 @@ async def test_context_manager_external_cancellation(lease_manager):
 
 
 @pytest.mark.asyncio
-async def test_lease_context_when_start_renew_fails(lease_manager):
+@pytest.mark.parametrize("renew_interval", [None, 0, -1, 2])
+async def test_lease_context_when_start_renew_fails(fake_redis, renew_interval):
+    from contextlib import nullcontext
     from unittest.mock import patch
 
-    with patch.object(StreamLease, "_start_auto_renew", side_effect=RuntimeError("fail start")):
-        with pytest.raises(RuntimeError, match="fail start"):
-            async with lease_manager.lease("fail_user"):
-                pass
+    released = []
+    config = LeaseConfig(lease_seconds=2, on_released=lambda lease, reason: released.append(reason))
+    lease_manager = StreamLeaseManager(fake_redis, config)
+    startup = (
+        patch.object(StreamLease, "_start_auto_renew", side_effect=RuntimeError("fail start"))
+        if renew_interval is None
+        else nullcontext()
+    )
+    error = RuntimeError if renew_interval is None else ValueError
+    message = "fail start" if renew_interval is None else "renew_interval must be positive"
+    try:
+        with startup, pytest.raises(error, match=message):
+            async with lease_manager.lease("fail_user", renew_interval=renew_interval):
+                pytest.fail("Context body must not run after renewal startup fails")
 
-    assert await lease_manager.get_active_count("fail_user") == 0
+        assert await lease_manager.get_active_count("fail_user") == 0
+        assert await lease_manager.get_active_count() == 0
+        await lease_manager.drain()
+        assert released == ["error"]
+    finally:
+        await lease_manager.close()
 
 
 @pytest.mark.asyncio
@@ -1109,6 +1139,40 @@ async def test_verify_cluster_config_registration_and_mismatch(fake_redis):
         await mgr1.verify_cluster_config(retry_attempts=0)
     with pytest.raises(ValueError, match="retry_delay must be non-negative"):
         await mgr1.verify_cluster_config(retry_delay=-0.5)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("strict", [False, True])
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("max_global", 10), ("max_per_user", 1), ("lease_seconds", 10.0), ("fail_open", True)],
+)
+async def test_verify_cluster_config_mismatch_preserves_canonical_config(
+    fake_redis, strict, field, value
+):
+    from dataclasses import replace
+
+    from fastapi_stream_lease.exceptions import ConfigurationMismatchError
+
+    config = LeaseConfig(key_prefix="isolated_config_conflict")
+    canonical = StreamLeaseManager(fake_redis, config)
+    candidate = StreamLeaseManager(fake_redis, replace(config, **{field: value}))
+    try:
+        assert await canonical.verify_cluster_config(strict=True)
+        stored = await fake_redis.get(config.config_key)
+        if strict:
+            with pytest.raises(ConfigurationMismatchError) as exc_info:
+                await candidate.verify_cluster_config(strict=True)
+            assert exc_info.value.existing_config == config.fingerprint_dict()
+            assert exc_info.value.current_config == candidate.config.fingerprint_dict()
+        else:
+            assert await candidate.verify_cluster_config(strict=False) is False
+        assert await fake_redis.get(config.config_key) == stored
+        assert await fake_redis.ttl(config.config_key) == -1
+        assert await canonical.verify_cluster_config(strict=True)
+    finally:
+        await candidate.close()
+        await canonical.close()
 
 
 @pytest.mark.asyncio

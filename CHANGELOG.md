@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.4.1 — Unreleased
+
+- Support redis-py 4.6.0+ without changing the public API, Redis keys, Lua scripts or default policies. The server requirement remains Redis 5.0+.
+- Treat legacy local connection-pool exhaustion as an availability error without tripping the circuit breaker or granting fail-open fallback leases, matching modern `MaxConnectionsError` handling. Genuine backend outages retain their configured behavior.
+- Add real-pool and lifecycle regressions, extend client compatibility CI, and update RESP2 fixtures, cleanup examples and contributor documentation.
+- Enforce 100% combined statement and branch coverage, including real Redis startup failure cleanup and strict configuration conflict regressions.
+
 ## 0.4.0 — 2026-09-28
 
 - **Deterministic Upstream Iterator Cancellation & ASGI Disconnect Determinism (`close_source`)**:

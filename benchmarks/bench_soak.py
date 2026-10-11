@@ -368,8 +368,14 @@ async def run_soak(
     # Wipe any keys after measurement
     if remaining_keys:
         await client.delete(*remaining_keys)
-    await client.aclose()
-    await monitor_client.aclose()
+    if hasattr(client, "aclose"):
+        await client.aclose()
+    else:
+        await client.close()
+    if hasattr(monitor_client, "aclose"):
+        await monitor_client.aclose()
+    else:
+        await monitor_client.close()
 
     zero_ghost_leases = total_ghost_leases == 0
     zero_residual_keys = len(remaining_keys) == 0

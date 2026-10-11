@@ -197,7 +197,10 @@ async def run_benchmark(
     print("=" * 60)
 
     await manager.close(drain=True)
-    await client.aclose()
+    if hasattr(client, "aclose"):
+        await client.aclose()
+    else:
+        await client.close()
 
     return {
         "run_idx": run_idx,
