@@ -83,7 +83,7 @@ packages = ["src/fastapi_stream_lease"]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 pythonpath = ["."]
-addopts = "--cov=fastapi_stream_lease --cov-branch --cov-fail-under=95 --cov-report=term-missing --cov-report=xml"
+addopts = "--cov=fastapi_stream_lease --cov-branch --cov-fail-under=100 --cov-report=term-missing --cov-report=xml"
 
 [tool.ruff]
 line-length = 100

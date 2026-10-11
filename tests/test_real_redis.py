@@ -15,6 +15,7 @@ from fastapi_stream_lease import (
     BackendFailurePolicy,
     CircuitBreakerConfig,
     CircuitState,
+    ConfigurationMismatchError,
     FallbackMode,
     LeaseConfig,
     StreamLeaseLost,
@@ -52,6 +53,7 @@ async def real_manager():
         await client.ping()
         yield manager
     finally:
+        await manager.close()
         await _safe_close(client)
 
 
@@ -185,6 +187,18 @@ async def test_real_redis_cancelled_context_releases_lease(real_manager):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("renew_interval", [0, -1, 0.5])
+async def test_real_redis_invalid_renewal_interval_releases_lease(real_manager, renew_interval):
+    with pytest.raises(ValueError, match="renew_interval must be positive"):
+        async with real_manager.lease("invalid_interval", renew_interval=renew_interval):
+            pytest.fail("Context body must not run after renewal startup fails")
+    assert await real_manager.get_active_count("invalid_interval") == 0
+    assert await real_manager.get_active_count() == 0
+    replacement = await real_manager.acquire("invalid_interval")
+    await replacement.release()
+
+
+@pytest.mark.asyncio
 async def test_real_redis_limit_applies_across_processes(real_manager):
     leases = [
         await real_manager.acquire("parent_1"),
@@ -311,7 +325,18 @@ async def test_real_redis_verify_cluster_config_concurrent_race():
         )
         assert sum(1 for r in results if r is True) == 15
         assert sum(1 for r in results if r is False) == 15
+        canonical = next(w for w, result in zip(all_workers, results, strict=True) if result)
+        conflicting = next(w for w, result in zip(all_workers, results, strict=True) if not result)
+        stored = await client.get(cfg_a.config_key)
+        with pytest.raises(ConfigurationMismatchError) as exc_info:
+            await conflicting.verify_cluster_config(strict=True)
+        assert exc_info.value.existing_config == canonical.config.fingerprint_dict()
+        assert exc_info.value.current_config == conflicting.config.fingerprint_dict()
+        assert await client.get(cfg_a.config_key) == stored
+        assert await client.ttl(cfg_a.config_key) == -1
+        assert await canonical.verify_cluster_config(strict=True)
     finally:
+        await asyncio.gather(*(w.close() for w in all_workers))
         await client.delete(cfg_a.config_key)
         await _safe_close(client)
 
