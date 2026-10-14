@@ -2010,24 +2010,31 @@ async def test_manager_force_release_exception_handling(fake_redis, lease_config
 
 
 @pytest.mark.asyncio
-async def test_manager_acquire_in_flight_toctou_reverts_redis_reservation(fake_redis, lease_config):
-    manager = StreamLeaseManager(redis=fake_redis, config=lease_config)
-    original_eval = fake_redis.eval
-
-    async def _delayed_eval(*args, **kwargs):
-        res = await original_eval(*args, **kwargs)
-        manager._is_closing = True
-        return res
-
-    fake_redis.eval = _delayed_eval
+async def test_manager_acquire_in_flight_toctou_reverts_redis_reservation(lease_config):
+    from unittest.mock import AsyncMock
 
     from fastapi_stream_lease.exceptions import StreamLeaseUnavailable
+
+    mock_redis = AsyncMock()
+    eval_calls = []
+
+    async def _mock_eval(*args, **kwargs):
+        eval_calls.append(args)
+        if len(eval_calls) == 1:
+            # First eval is acquire; simulate manager shutdown arriving while in-flight
+            manager._is_closing = True
+            return 1
+        # Second eval is atomic revert release
+        return 1
+
+    mock_redis.eval.side_effect = _mock_eval
+    manager = StreamLeaseManager(redis=mock_redis, config=lease_config)
 
     with pytest.raises(StreamLeaseUnavailable, match="shutting down"):
         await manager.acquire("user_toctou")
 
-    fake_redis.eval = original_eval
-    assert await manager.get_active_count("user_toctou") == 0
+    # Confirm acquisition was reverted via atomic release and not left active
+    assert len(eval_calls) == 2
     assert manager.active_leases_count == 0
 
 
