@@ -1872,3 +1872,269 @@ async def test_wrap_stream_close_source_composite_sync_awaitable_budget_enforced
     assert lease._is_released is True
     assert await manager.get_active_count("user_composite_budget") == 0
     await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_manager_tracks_active_leases(fake_redis, lease_config):
+    manager = StreamLeaseManager(redis=fake_redis, config=lease_config)
+    assert manager.active_leases_count == 0
+    assert len(manager.active_leases) == 0
+    assert manager.is_closing is False
+
+    lease1 = await manager.acquire("user_track_1")
+    assert manager.active_leases_count == 1
+    assert lease1 in manager.active_leases
+
+    lease2 = await manager.acquire("user_track_2")
+    assert manager.active_leases_count == 2
+    assert lease2 in manager.active_leases
+
+    await lease1.release()
+    assert manager.active_leases_count == 1
+    assert lease1 not in manager.active_leases
+    assert lease2 in manager.active_leases
+
+    await lease2.release()
+    assert manager.active_leases_count == 0
+    assert len(manager.active_leases) == 0
+
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_manager_rejects_acquire_when_closing(fake_redis, lease_config):
+    manager = StreamLeaseManager(redis=fake_redis, config=lease_config)
+    await manager.close(drain=False)
+    assert manager.is_closing is True
+
+    from fastapi_stream_lease.exceptions import StreamLeaseUnavailable
+
+    with pytest.raises(StreamLeaseUnavailable, match="shutting down"):
+        await manager.acquire("user_after_close")
+
+
+@pytest.mark.parametrize("drain_mode", [True, False])
+@pytest.mark.asyncio
+async def test_manager_close_drain_lifecycle(fake_redis, lease_config, drain_mode):
+    manager = StreamLeaseManager(redis=fake_redis, config=lease_config)
+    lease = await manager.acquire("user_drain")
+    assert await manager.get_active_count("user_drain") == 1
+    assert manager.active_leases_count == 1
+
+    if drain_mode:
+        # Simulate worker releasing lease within drain window
+        async def _delayed_release():
+            await asyncio.sleep(0.05)
+            await lease.release()
+
+        asyncio.create_task(_delayed_release())
+        t0 = time.monotonic()
+        await manager.close(drain=True, timeout=1.0)
+        elapsed = time.monotonic() - t0
+        assert elapsed < 0.5  # Returns promptly as soon as active leases empty
+    else:
+        # Without drain, force closes immediately
+        await manager.close(drain=False)
+
+    assert manager.active_leases_count == 0
+    assert await manager.get_active_count("user_drain") == 0
+
+
+@pytest.mark.asyncio
+async def test_manager_close_drain_timeout_force_releases_in_redis(fake_redis, lease_config):
+    manager = StreamLeaseManager(redis=fake_redis, config=lease_config)
+    lease = await manager.acquire("user_stuck")
+    assert await manager.get_active_count("user_stuck") == 1
+
+    # Close with short timeout, stream does NOT finish in time
+    t0 = time.monotonic()
+    await manager.close(drain=True, timeout=0.08)
+    elapsed = time.monotonic() - t0
+    assert elapsed >= 0.07
+
+    # Manager must have force-released the stuck lease in Redis to prevent orphan keys
+    assert await manager.get_active_count("user_stuck") == 0
+    assert manager.active_leases_count == 0
+    assert lease._is_released is True
+
+
+@pytest.mark.asyncio
+async def test_stream_lease_equality_and_hash(fake_redis, lease_config):
+    manager = StreamLeaseManager(redis=fake_redis, config=lease_config)
+    lease1 = await manager.acquire("user_eq_1")
+    lease2 = await manager.acquire("user_eq_2")
+
+    assert lease1 == lease1
+    assert lease1 != lease2
+    assert lease1 != "not_a_lease"
+    assert hash(lease1) == hash(lease1.lease_id)
+    assert len({lease1, lease1}) == 1
+    assert len({lease1, lease2}) == 2
+
+    await manager.close(drain=False)
+
+
+@pytest.mark.parametrize("drain", [True, False])
+@pytest.mark.asyncio
+async def test_manager_close_cancels_active_context_renew_task(fake_redis, lease_config, drain):
+    manager = StreamLeaseManager(redis=fake_redis, config=lease_config)
+    lease = await manager.acquire("user_context_shutdown")
+
+    renew_task, _ = lease._start_auto_renew(interval=0.5)
+    lease._context_renew_task = renew_task
+    assert not renew_task.done()
+
+    if drain:
+        await manager.close(drain=True, timeout=0.05)
+    else:
+        await manager.close(drain=False)
+
+    assert renew_task.done()
+    assert lease._is_released is True
+    assert manager.active_leases_count == 0
+
+
+@pytest.mark.asyncio
+async def test_manager_force_release_exception_handling(fake_redis, lease_config, monkeypatch):
+    manager = StreamLeaseManager(redis=fake_redis, config=lease_config)
+    lease = await manager.acquire("user_fail_release")
+
+    async def _failing_release(*args, **kwargs):
+        raise RuntimeError("simulated release failure")
+
+    monkeypatch.setattr(lease, "release", _failing_release)
+
+    # Must catch and log exception without bubbling up and breaking manager shutdown
+    await manager.close(drain=False)
+    assert manager.active_leases_count == 0
+
+
+@pytest.mark.asyncio
+async def test_manager_acquire_in_flight_toctou_reverts_redis_reservation(lease_config):
+    from unittest.mock import AsyncMock
+
+    from fastapi_stream_lease.exceptions import StreamLeaseUnavailable
+
+    mock_redis = AsyncMock()
+    eval_calls = []
+
+    async def _mock_eval(*args, **kwargs):
+        eval_calls.append(args)
+        if len(eval_calls) == 1:
+            # First eval is acquire; simulate manager shutdown arriving while in-flight
+            manager._is_closing = True
+            return 1
+        # Second eval is atomic revert release
+        return 1
+
+    mock_redis.eval.side_effect = _mock_eval
+    manager = StreamLeaseManager(redis=mock_redis, config=lease_config)
+
+    with pytest.raises(StreamLeaseUnavailable, match="shutting down"):
+        await manager.acquire("user_toctou")
+
+    # Confirm acquisition was reverted via atomic release and not left active
+    assert len(eval_calls) == 2
+    assert manager.active_leases_count == 0
+
+
+@pytest.mark.asyncio
+async def test_manager_acquire_fallback_toctou(fake_redis, lease_config, monkeypatch):
+    import dataclasses
+
+    fallback_cfg = dataclasses.replace(lease_config, fail_open=True)
+    manager = StreamLeaseManager(redis=fake_redis, config=fallback_cfg)
+
+    async def _failing_eval(*args, **kwargs):
+        from redis.exceptions import ConnectionError
+
+        manager._is_closing = True
+        raise ConnectionError("connection lost")
+
+    monkeypatch.setattr(fake_redis, "eval", _failing_eval)
+
+    from fastapi_stream_lease.exceptions import StreamLeaseUnavailable
+
+    with pytest.raises(StreamLeaseUnavailable, match="shutting down"):
+        await manager.acquire("user_fallback_toctou")
+
+    assert manager.active_leases_count == 0
+
+
+@pytest.mark.asyncio
+async def test_lease_wrap_auto_renew_task_cancelled_on_shutdown(fake_redis, lease_config):
+    manager = StreamLeaseManager(redis=fake_redis, config=lease_config)
+    lease = await manager.acquire("user_wrap_shutdown")
+
+    async def _infinite_stream():
+        yield "chunk-1"
+        await asyncio.sleep(10.0)
+        yield "chunk-2"
+
+    stream_it = lease.wrap(_infinite_stream(), auto_renew=True, renew_interval=0.5)
+    first_chunk = await anext(stream_it)
+    assert first_chunk == "chunk-1"
+    assert len(lease._active_renew_tasks) == 1
+
+    renew_task = next(iter(lease._active_renew_tasks))
+    assert not renew_task.done()
+
+    await manager.close(drain=False)
+    assert renew_task.done()
+    assert len(lease._active_renew_tasks) == 0
+
+
+@pytest.mark.asyncio
+async def test_manager_acquire_in_flight_toctou_shielded_against_cancellation(lease_config):
+    from unittest.mock import AsyncMock
+
+    from fastapi_stream_lease.exceptions import StreamLeaseUnavailable
+
+    mock_redis = AsyncMock()
+    eval_calls = []
+    release_started = asyncio.Event()
+
+    async def _mock_eval(*args, **kwargs):
+        eval_calls.append(args)
+        if len(eval_calls) == 1:
+            manager._is_closing = True
+            return 1
+        release_started.set()
+        await asyncio.sleep(0.02)
+        return 1
+
+    mock_redis.eval.side_effect = _mock_eval
+    manager = StreamLeaseManager(redis=mock_redis, config=lease_config)
+
+    task = asyncio.create_task(manager.acquire("user_cancel_shield"))
+    await release_started.wait()
+    task.cancel()
+
+    try:
+        await task
+    except (asyncio.CancelledError, StreamLeaseUnavailable):
+        pass
+
+    assert len(eval_calls) == 2
+    assert manager.active_leases_count == 0
+
+
+@pytest.mark.asyncio
+async def test_lease_manual_release_cancels_renewal_tasks(fake_redis, lease_config):
+    manager = StreamLeaseManager(redis=fake_redis, config=lease_config)
+    lease = await manager.acquire("user_manual_cancel")
+
+    async def _dummy_renew():
+        try:
+            await asyncio.sleep(10.0)
+        except asyncio.CancelledError:
+            pass
+
+    dummy_task = asyncio.create_task(_dummy_renew())
+    lease._active_renew_tasks.add(dummy_task)
+    assert not dummy_task.done()
+
+    await lease.release()
+    assert dummy_task.done()
+    assert len(lease._active_renew_tasks) == 0
+    assert lease._is_released
