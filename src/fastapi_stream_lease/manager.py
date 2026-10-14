@@ -42,6 +42,13 @@ from fastapi_stream_lease.observability.contract import (
 
 logger = logging.getLogger(__name__)
 
+try:
+    import anyio
+
+    _has_anyio = True
+except ImportError:  # pragma: no cover
+    _has_anyio = False
+
 
 class StreamLeaseManager:
     """
@@ -252,11 +259,11 @@ class StreamLeaseManager:
     async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         await self.close()
 
-    async def drain(self, timeout: float = 5.0) -> None:
+    async def drain(self, timeout: float = 5.0) -> None:  # noqa: ASYNC109
         """Wait for all queued lifecycle callbacks to complete execution."""
         await self.dispatcher.drain(timeout=timeout)
 
-    async def close(self, drain: bool = True, timeout: float = 5.0) -> None:
+    async def close(self, drain: bool = True, timeout: float = 5.0) -> None:  # noqa: ASYNC109
         """
         Shut down the stream lease manager, draining active leases and hooks.
 
@@ -393,6 +400,11 @@ class StreamLeaseManager:
                         self._safe_record_backend_error(exc)
                         self.dispatcher.dispatch(self.config.on_backend_error, exc)
                         if is_transient_error(exc) and self.config.fail_open:
+                            if self._is_closing:
+                                raise StreamLeaseUnavailable(
+                                    detail="Stream lease manager is shutting down",
+                                    retry_after=self.config.retry_after_seconds,
+                                ) from exc
                             self._safe_record_fallback()
                             self._safe_record_operation(
                                 Operation.ACQUIRE, Outcome.FALLBACK, duration
@@ -412,11 +424,6 @@ class StreamLeaseManager:
                                 created_at=time.time(),
                                 created_monotonic=start_monotonic,
                             )
-                            if self._is_closing:
-                                raise StreamLeaseUnavailable(
-                                    detail="Stream lease manager is shutting down",
-                                    retry_after=self.config.retry_after_seconds,
-                                ) from exc
                             lease._is_fallback = True
                             self._register_active_lease(lease)
                             self.dispatcher.dispatch(self.config.on_acquired, lease)
@@ -472,7 +479,12 @@ class StreamLeaseManager:
                     created_monotonic=start_monotonic,
                 )
                 if self._is_closing:
-                    await self.release(lease)
+                    if _has_anyio:
+                        with anyio.CancelScope(shield=True):
+                            await self.release(lease)
+                    else:  # pragma: no cover
+                        with suppress(asyncio.CancelledError):
+                            await asyncio.shield(self.release(lease))
                     raise StreamLeaseUnavailable(
                         detail="Stream lease manager is shutting down",
                         retry_after=self.config.retry_after_seconds,

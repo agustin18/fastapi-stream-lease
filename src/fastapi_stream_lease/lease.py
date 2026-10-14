@@ -195,7 +195,7 @@ class StreamLease:
 
     def cancel_renewal(self) -> None:
         """Immediately cancel all active auto-renewal background tasks for this lease."""
-        for task in self._active_renew_tasks:
+        for task in tuple(self._active_renew_tasks):
             task.cancel()
         self._active_renew_tasks.clear()
         if self._context_renew_task is not None:
@@ -255,6 +255,7 @@ class StreamLease:
             return
 
         self._is_released = True
+        self.cancel_renewal()
         if self._is_fallback:
             self.manager._unregister_active_lease(self)
             self.manager.dispatcher.dispatch(self.manager.config.on_released, self, reason)
