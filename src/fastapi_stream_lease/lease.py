@@ -182,6 +182,14 @@ class StreamLease:
     def __post_init__(self) -> None:
         self.expires_at = self.created_monotonic + self.manager.config.lease_seconds
 
+    def __hash__(self) -> int:
+        return hash(self.lease_id)
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, StreamLease):
+            return NotImplemented
+        return self.lease_id == other.lease_id
+
     async def __aenter__(self) -> StreamLease:
         if self._is_released:
             raise StreamLeaseLost(self.lease_id)
@@ -236,6 +244,7 @@ class StreamLease:
 
         self._is_released = True
         if self._is_fallback:
+            self.manager._unregister_active_lease(self)
             self.manager.dispatcher.dispatch(self.manager.config.on_released, self, reason)
             return
 

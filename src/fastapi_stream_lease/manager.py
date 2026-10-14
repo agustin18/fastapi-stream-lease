@@ -5,7 +5,7 @@ import json
 import logging
 import time
 from collections.abc import AsyncIterable, AsyncIterator, Iterator
-from contextlib import asynccontextmanager, contextmanager
+from contextlib import asynccontextmanager, contextmanager, suppress
 from typing import Any
 from uuid import uuid4
 
@@ -72,6 +72,34 @@ class StreamLeaseManager:
             on_error=self._on_hook_error,
             on_queue_change=self._on_hook_queue_change,
         )
+        self._active_leases: set[StreamLease] = set()
+        self._is_closing: bool = False
+        self._drained_event: asyncio.Event = asyncio.Event()
+        self._drained_event.set()
+
+    @property
+    def is_closing(self) -> bool:
+        """Whether the manager is currently in the process of shutting down."""
+        return self._is_closing
+
+    @property
+    def active_leases_count(self) -> int:
+        """Count of active stream leases locally tracked in this manager process."""
+        return len(self._active_leases)
+
+    @property
+    def active_leases(self) -> frozenset[StreamLease]:
+        """Snapshot of active stream leases currently tracked by this manager."""
+        return frozenset(self._active_leases)
+
+    def _register_active_lease(self, lease: StreamLease) -> None:
+        self._active_leases.add(lease)
+        self._drained_event.clear()
+
+    def _unregister_active_lease(self, lease: StreamLease) -> None:
+        self._active_leases.discard(lease)
+        if not self._active_leases:
+            self._drained_event.set()
 
     @property
     def circuit_state(self) -> CircuitState | None:
@@ -229,17 +257,72 @@ class StreamLeaseManager:
         await self.dispatcher.drain(timeout=timeout)
 
     async def close(self, drain: bool = True, timeout: float = 5.0) -> None:
-        """Shut down the background lifecycle hook dispatcher."""
+        """
+        Shut down the stream lease manager, draining active leases and hooks.
+
+        When drain=True, rejects new acquisitions and waits up to `timeout` seconds
+        for active streams to complete naturally. If the timeout expires before all
+        leases finish, any remaining leases are force-released in Redis to avoid
+        leaving orphan reservations.
+        """
+        self._is_closing = True
+        if drain and self._active_leases:
+            start_time = time.monotonic()
+            while self._active_leases:
+                elapsed = time.monotonic() - start_time
+                remaining = timeout - elapsed
+                if remaining <= 0:
+                    break
+                with suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(
+                        self._drained_event.wait(),
+                        timeout=min(remaining, 0.05),
+                    )
+
+            if self._active_leases:
+                logger.warning(
+                    "Graceful shutdown drain timeout reached (%.2fs); "
+                    "force-releasing %d remaining active leases",
+                    timeout,
+                    len(self._active_leases),
+                )
+                await self._force_release_active_leases(reason="shutdown_drain")
+        elif not drain and self._active_leases:
+            await self._force_release_active_leases(reason="shutdown_immediate")
+
         await self.dispatcher.close(drain=drain, timeout=timeout)
+
+    async def _force_release_active_leases(self, reason: str) -> None:
+        remaining_leases = list(self._active_leases)
+        for active_lease in remaining_leases:
+            if active_lease._context_renew_task and not active_lease._context_renew_task.done():
+                active_lease._context_renew_task.cancel()
+            try:
+                await active_lease.release(reason=reason)
+            except Exception:
+                logger.exception(
+                    "Failed to release lease %s during shutdown (%s)",
+                    active_lease.lease_id,
+                    reason,
+                )
+        self._active_leases.clear()
+        self._drained_event.set()
 
     async def acquire(self, user_id: str | int) -> StreamLease:
         """
         Acquire a new stream lease for the given user.
 
         Raises:
+            StreamLeaseUnavailable: If the manager is shutting down.
             StreamLeaseRejected: If user or global concurrency limits are exceeded.
             RuntimeError: If Redis evaluation fails unexpectedly.
         """
+        if self._is_closing:
+            raise StreamLeaseUnavailable(
+                detail="Stream lease manager is shutting down",
+                retry_after=self.config.retry_after_seconds,
+            )
+
         lease_id = uuid4().hex
         user_key = self.config.user_key(user_id)
         global_key = self.config.global_key
@@ -271,6 +354,7 @@ class StreamLeaseManager:
                         created_monotonic=start_monotonic,
                     )
                     lease._is_fallback = True
+                    self._register_active_lease(lease)
                     self.dispatcher.dispatch(self.config.on_acquired, lease)
                     return lease
 
@@ -332,6 +416,7 @@ class StreamLeaseManager:
                                 created_monotonic=start_monotonic,
                             )
                             lease._is_fallback = True
+                            self._register_active_lease(lease)
                             self.dispatcher.dispatch(self.config.on_acquired, lease)
                             return lease
                         self._safe_record_operation(
@@ -384,6 +469,7 @@ class StreamLeaseManager:
                     created_at=time.time(),
                     created_monotonic=start_monotonic,
                 )
+                self._register_active_lease(lease)
                 self.dispatcher.dispatch(self.config.on_acquired, lease)
                 return lease
             finally:
@@ -454,35 +540,40 @@ class StreamLeaseManager:
         """
         start_monotonic = time.monotonic()
         try:
-            await self.redis.eval(
-                RELEASE_SCRIPT,
-                2,
-                lease.user_key,
-                lease.global_key,
-                lease.lease_id,
-            )
-            if self._circuit_breaker is not None:
-                self._circuit_breaker.record_success()
-                self._safe_record_circuit_state(self._circuit_breaker.state)
-            duration = time.monotonic() - start_monotonic
-            self._safe_record_operation(Operation.RELEASE, Outcome.SUCCESS, duration)
-        except Exception as exc:
-            duration = time.monotonic() - start_monotonic
-            if is_network_error(exc):
-                if is_transient_error(exc) and self._circuit_breaker is not None:
-                    self._circuit_breaker.record_failure(exc)
-                    self._safe_record_circuit_state(self._circuit_breaker.state)
-                self._safe_record_backend_error(exc)
-                self._safe_record_operation(Operation.RELEASE, Outcome.BACKEND_ERROR, duration)
-                self.dispatcher.dispatch(self.config.on_backend_error, exc)
-                logger.warning("Network error releasing stream lease %s: %s", lease.lease_id, exc)
-            else:
-                logger.error(
-                    "Execution error releasing stream lease %s: %s",
+            try:
+                await self.redis.eval(
+                    RELEASE_SCRIPT,
+                    2,
+                    lease.user_key,
+                    lease.global_key,
                     lease.lease_id,
-                    exc,
-                    exc_info=True,
                 )
+                if self._circuit_breaker is not None:
+                    self._circuit_breaker.record_success()
+                    self._safe_record_circuit_state(self._circuit_breaker.state)
+                duration = time.monotonic() - start_monotonic
+                self._safe_record_operation(Operation.RELEASE, Outcome.SUCCESS, duration)
+            except Exception as exc:
+                duration = time.monotonic() - start_monotonic
+                if is_network_error(exc):
+                    if is_transient_error(exc) and self._circuit_breaker is not None:
+                        self._circuit_breaker.record_failure(exc)
+                        self._safe_record_circuit_state(self._circuit_breaker.state)
+                    self._safe_record_backend_error(exc)
+                    self._safe_record_operation(Operation.RELEASE, Outcome.BACKEND_ERROR, duration)
+                    self.dispatcher.dispatch(self.config.on_backend_error, exc)
+                    logger.warning(
+                        "Network error releasing stream lease %s: %s", lease.lease_id, exc
+                    )
+                else:
+                    logger.error(
+                        "Execution error releasing stream lease %s: %s",
+                        lease.lease_id,
+                        exc,
+                        exc_info=True,
+                    )
+        finally:
+            self._unregister_active_lease(lease)
 
     async def get_active_count(self, user_id: str | int | None = None) -> int:
         """
