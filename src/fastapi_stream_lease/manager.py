@@ -267,17 +267,11 @@ class StreamLeaseManager:
         """
         self._is_closing = True
         if drain and self._active_leases:
-            start_time = time.monotonic()
-            while self._active_leases:
-                elapsed = time.monotonic() - start_time
-                remaining = timeout - elapsed
-                if remaining <= 0:
-                    break
-                with suppress(asyncio.TimeoutError):
-                    await asyncio.wait_for(
-                        self._drained_event.wait(),
-                        timeout=min(remaining, 0.05),
-                    )
+            with suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(
+                    self._drained_event.wait(),
+                    timeout=max(0.0, timeout),
+                )
 
             if self._active_leases:
                 logger.warning(
@@ -295,16 +289,19 @@ class StreamLeaseManager:
     async def _force_release_active_leases(self, reason: str) -> None:
         remaining_leases = list(self._active_leases)
         for active_lease in remaining_leases:
-            if active_lease._context_renew_task and not active_lease._context_renew_task.done():
-                active_lease._context_renew_task.cancel()
+            active_lease.cancel_renewal()
+
+        async def _safe_release(target_lease: StreamLease) -> None:
             try:
-                await active_lease.release(reason=reason)
+                await target_lease.release(reason=reason)
             except Exception:
                 logger.exception(
                     "Failed to release lease %s during shutdown (%s)",
-                    active_lease.lease_id,
+                    target_lease.lease_id,
                     reason,
                 )
+
+        await asyncio.gather(*(_safe_release(lease) for lease in remaining_leases))
         self._active_leases.clear()
         self._drained_event.set()
 
@@ -415,6 +412,11 @@ class StreamLeaseManager:
                                 created_at=time.time(),
                                 created_monotonic=start_monotonic,
                             )
+                            if self._is_closing:
+                                raise StreamLeaseUnavailable(
+                                    detail="Stream lease manager is shutting down",
+                                    retry_after=self.config.retry_after_seconds,
+                                ) from exc
                             lease._is_fallback = True
                             self._register_active_lease(lease)
                             self.dispatcher.dispatch(self.config.on_acquired, lease)
@@ -469,6 +471,12 @@ class StreamLeaseManager:
                     created_at=time.time(),
                     created_monotonic=start_monotonic,
                 )
+                if self._is_closing:
+                    await self.release(lease)
+                    raise StreamLeaseUnavailable(
+                        detail="Stream lease manager is shutting down",
+                        retry_after=self.config.retry_after_seconds,
+                    )
                 self._register_active_lease(lease)
                 self.dispatcher.dispatch(self.config.on_acquired, lease)
                 return lease

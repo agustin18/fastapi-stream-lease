@@ -2007,3 +2007,71 @@ async def test_manager_force_release_exception_handling(fake_redis, lease_config
     # Must catch and log exception without bubbling up and breaking manager shutdown
     await manager.close(drain=False)
     assert manager.active_leases_count == 0
+
+
+@pytest.mark.asyncio
+async def test_manager_acquire_in_flight_toctou_reverts_redis_reservation(fake_redis, lease_config):
+    manager = StreamLeaseManager(redis=fake_redis, config=lease_config)
+    original_eval = fake_redis.eval
+
+    async def _delayed_eval(*args, **kwargs):
+        res = await original_eval(*args, **kwargs)
+        manager._is_closing = True
+        return res
+
+    fake_redis.eval = _delayed_eval
+
+    from fastapi_stream_lease.exceptions import StreamLeaseUnavailable
+
+    with pytest.raises(StreamLeaseUnavailable, match="shutting down"):
+        await manager.acquire("user_toctou")
+
+    fake_redis.eval = original_eval
+    assert await manager.get_active_count("user_toctou") == 0
+    assert manager.active_leases_count == 0
+
+
+@pytest.mark.asyncio
+async def test_manager_acquire_fallback_toctou(fake_redis, lease_config, monkeypatch):
+    import dataclasses
+
+    fallback_cfg = dataclasses.replace(lease_config, fail_open=True)
+    manager = StreamLeaseManager(redis=fake_redis, config=fallback_cfg)
+
+    async def _failing_eval(*args, **kwargs):
+        from redis.exceptions import ConnectionError
+
+        manager._is_closing = True
+        raise ConnectionError("connection lost")
+
+    monkeypatch.setattr(fake_redis, "eval", _failing_eval)
+
+    from fastapi_stream_lease.exceptions import StreamLeaseUnavailable
+
+    with pytest.raises(StreamLeaseUnavailable, match="shutting down"):
+        await manager.acquire("user_fallback_toctou")
+
+    assert manager.active_leases_count == 0
+
+
+@pytest.mark.asyncio
+async def test_lease_wrap_auto_renew_task_cancelled_on_shutdown(fake_redis, lease_config):
+    manager = StreamLeaseManager(redis=fake_redis, config=lease_config)
+    lease = await manager.acquire("user_wrap_shutdown")
+
+    async def _infinite_stream():
+        yield "chunk-1"
+        await asyncio.sleep(10.0)
+        yield "chunk-2"
+
+    stream_it = lease.wrap(_infinite_stream(), auto_renew=True, renew_interval=0.5)
+    first_chunk = await anext(stream_it)
+    assert first_chunk == "chunk-1"
+    assert len(lease._active_renew_tasks) == 1
+
+    renew_task = next(iter(lease._active_renew_tasks))
+    assert not renew_task.done()
+
+    await manager.close(drain=False)
+    assert renew_task.done()
+    assert len(lease._active_renew_tasks) == 0

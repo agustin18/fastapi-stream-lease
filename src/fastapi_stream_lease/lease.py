@@ -173,6 +173,9 @@ class StreamLease:
     expires_at: float = field(init=False)
     _is_released: bool = field(default=False, init=False)
     _is_fallback: bool = field(default=False, init=False)
+    _active_renew_tasks: set[asyncio.Task[None]] = field(
+        default_factory=set, init=False, repr=False
+    )
     _context_renew_task: asyncio.Task[None] | None = field(default=None, init=False, repr=False)
     _context_lease_lost: asyncio.Event = field(
         default_factory=asyncio.Event, init=False, repr=False
@@ -189,6 +192,15 @@ class StreamLease:
         if not isinstance(other, StreamLease):
             return NotImplemented
         return self.lease_id == other.lease_id
+
+    def cancel_renewal(self) -> None:
+        """Immediately cancel all active auto-renewal background tasks for this lease."""
+        for task in self._active_renew_tasks:
+            task.cancel()
+        self._active_renew_tasks.clear()
+        if self._context_renew_task is not None:
+            self._context_renew_task.cancel()
+            self._context_renew_task = None
 
     async def __aenter__(self) -> StreamLease:
         if self._is_released:
@@ -362,10 +374,13 @@ class StreamLease:
                 self.manager.dispatcher.dispatch(self.manager.config.on_lost, self, "redis_revoked")
                 return
 
-        return asyncio.create_task(worker()), lease_lost
+        task = asyncio.create_task(worker())
+        self._active_renew_tasks.add(task)
+        task.add_done_callback(self._active_renew_tasks.discard)
+        return task, lease_lost
 
-    @staticmethod
-    async def _stop_auto_renew(task: asyncio.Task[None]) -> None:
+    async def _stop_auto_renew(self, task: asyncio.Task[None]) -> None:
+        self._active_renew_tasks.discard(task)
         task.cancel()
         with suppress(asyncio.CancelledError):
             await task
