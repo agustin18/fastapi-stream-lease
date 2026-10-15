@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.5.1 — 2026-10-15
+
+- **Shutdown Timeout Budget & Shared Deadline Enforcement (SE-1)**:
+  - Enforced a shared monotonic deadline (`deadline = time.monotonic() + timeout`) across `StreamLeaseManager.close()` and `HookDispatcher.close()`, eliminating multiplicative timeout compounding (up to $3\times$) during container shutdown and preventing SIGKILL termination in orchestrators like Kubernetes.
+  - Mitigated the hook guillotine edge case by granting a minimal 50ms grace floor (`max(remaining, min(timeout, 0.05))`) when `_force_release_active_leases` runs, allowing in-memory `on_released(reason="shutdown_drain")` lifecycle callbacks to drain completely without being prematurely dropped as backpressure drops.
+- **Reactive Fast Wakeup on Manager Shutdown (M-3)**:
+  - Introduced `_closing_event: asyncio.Event` within `StreamLeaseManager` triggered immediately upon `close()`, awakening pending acquisition loops in near-0ms and raising `StreamLeaseUnavailable` without awaiting idle backoff sleep ticks.
+- **Dynamic Retry-After Adaptation & Anti-Thundering Herd Jitter (M-1)**:
+  - Calibrated the acquisition backoff sleep delay to adapt to Lua-computed `retry_after_ms` when earlier expiration slots are imminent (`min(0.05, retry_after_ms / 1000.0)`).
+  - Applied micro-jitter ($\pm 15\%$, `random.uniform(0.85, 1.15)`) bounded by remaining timeout, preventing synchronized polling waves against Redis under high concurrency saturation while strictly preserving the 50ms polling ceiling for clean socket disconnects.
+- **Fail-Fast Validation on Global Stream Counts (SE-2)**:
+  - Added explicit $O(1)$ fail-fast validation in `manager.get_active_count()`: querying global count (`user_id=None`) when `max_global == 0` raises `ValueError` immediately, preventing silent zero counts when global Redis tracking is disabled.
+- **Transport Release Safety & Renewal Cancellation (SE-4)**:
+  - Ensured `lease.cancel_renewal()` executes deterministically in the `finally:` block of `manager.release(lease)`, stopping active renewal tasks without corrupting `lease._is_released` or emitting spurious lifecycle callbacks during rollback races.
+
 ## 0.5.0 — 2026-10-15
 
 - **Acquisition Timeout Grace Window (`acquire_timeout`) & Dynamic $O(1)$ `Retry-After`**:

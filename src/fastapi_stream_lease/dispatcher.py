@@ -178,7 +178,7 @@ class HookDispatcher:
         """Wait until all currently queued callbacks have finished executing."""
         if self._queue is not None:
             try:
-                await asyncio.wait_for(self._queue.join(), timeout=timeout)
+                await asyncio.wait_for(self._queue.join(), timeout=max(0.0, timeout))
             except (TimeoutError, asyncio.TimeoutError):
                 logger.warning(
                     "Timed out waiting for lifecycle hook queue to drain (%d remaining)",
@@ -191,8 +191,11 @@ class HookDispatcher:
             return
         self._closed = True
 
+        deadline = time.monotonic() + max(0.0, timeout)
+
         if drain and self._queue is not None:
-            await self.drain(timeout=timeout)
+            remaining_drain = max(0.0, deadline - time.monotonic())
+            await self.drain(timeout=remaining_drain)
 
         if self._queue is not None:
             purged = 0
@@ -214,9 +217,10 @@ class HookDispatcher:
         if has_active_worker:
             assert self._queue is not None
             assert self._worker_task is not None
+            remaining_worker = max(0.0, deadline - time.monotonic())
             try:
                 self._queue.put_nowait(None)
-                await asyncio.wait_for(self._worker_task, timeout=timeout)
+                await asyncio.wait_for(self._worker_task, timeout=remaining_worker)
             except (asyncio.QueueFull, TimeoutError, asyncio.TimeoutError):
                 self._worker_task.cancel()
                 with suppress(asyncio.CancelledError):

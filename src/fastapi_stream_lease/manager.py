@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import math
+import random
 import time
 from collections.abc import AsyncIterable, AsyncIterator, Iterator
 from contextlib import asynccontextmanager, contextmanager, suppress
@@ -82,6 +83,7 @@ class StreamLeaseManager:
         )
         self._active_leases: set[StreamLease] = set()
         self._is_closing: bool = False
+        self._closing_event: asyncio.Event = asyncio.Event()
         self._drained_event: asyncio.Event = asyncio.Event()
         self._drained_event.set()
 
@@ -274,11 +276,16 @@ class StreamLeaseManager:
         leaving orphan reservations.
         """
         self._is_closing = True
+        self._closing_event.set()
+        deadline = time.monotonic() + max(0.0, timeout)
+        had_force_released = False
+
         if drain and self._active_leases:
+            remaining_drain = max(0.0, deadline - time.monotonic())
             with suppress(asyncio.TimeoutError):
                 await asyncio.wait_for(
                     self._drained_event.wait(),
-                    timeout=max(0.0, timeout),
+                    timeout=remaining_drain,
                 )
 
             if self._active_leases:
@@ -288,11 +295,21 @@ class StreamLeaseManager:
                     timeout,
                     len(self._active_leases),
                 )
+                had_force_released = True
                 await self._force_release_active_leases(reason="shutdown_drain")
         elif not drain and self._active_leases:
+            had_force_released = True
             await self._force_release_active_leases(reason="shutdown_immediate")
 
-        await self.dispatcher.close(drain=drain, timeout=timeout)
+        remaining_dispatcher = max(0.0, deadline - time.monotonic())
+        if drain and had_force_released and timeout > 0:
+            # Grant a minimal grace floor so dispatcher can execute newly queued
+            # on_released hooks from force_release without dropping them immediately
+            dispatcher_timeout = max(remaining_dispatcher, min(timeout, 0.05))
+        else:
+            dispatcher_timeout = remaining_dispatcher
+
+        await self.dispatcher.close(drain=drain, timeout=dispatcher_timeout)
 
     async def _force_release_active_leases(self, reason: str) -> None:
         remaining_leases = list(self._active_leases)
@@ -519,8 +536,16 @@ class StreamLeaseManager:
                         )
                         remaining = deadline - now_monotonic
                         if remaining > 0:
-                            sleep_delay = min(0.05, remaining)
-                            await asyncio.sleep(sleep_delay)
+                            base_delay = (
+                                min(0.05, retry_after_ms / 1000.0) if retry_after_ms > 0 else 0.05
+                            )
+                            jittered_delay = base_delay * random.uniform(0.85, 1.15)
+                            sleep_delay = min(remaining, max(0.001, jittered_delay))
+                            with suppress(asyncio.TimeoutError):
+                                await asyncio.wait_for(
+                                    self._closing_event.wait(),
+                                    timeout=sleep_delay,
+                                )
                             continue
 
                         self._safe_record_operation(Operation.ACQUIRE, Outcome.REJECTED, duration)
@@ -658,12 +683,18 @@ class StreamLeaseManager:
                         exc_info=True,
                     )
         finally:
+            lease.cancel_renewal()
             self._unregister_active_lease(lease)
 
     async def get_active_count(self, user_id: str | int | None = None) -> int:
         """
         Return the current number of active (non-expired) streams for a user or globally.
         """
+        if user_id is None and self.config.max_global == 0:
+            raise ValueError(
+                "Global active stream count requires max_global > 0; "
+                "global tracking is disabled when max_global=0"
+            )
         permit: CircuitPermit | None = None
         if self._circuit_breaker is not None:
             permit = self._circuit_breaker.acquire_permit()
