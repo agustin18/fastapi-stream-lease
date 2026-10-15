@@ -6,6 +6,7 @@ import asyncio
 import inspect
 import os
 import sys
+import time
 from uuid import uuid4
 
 import pytest
@@ -529,3 +530,24 @@ async def test_real_redis_circuit_breaker_half_open_probe_recovery(real_manager)
         await lease2.release()
     finally:
         await manager.close(drain=True)
+
+
+@pytest.mark.asyncio
+async def test_real_redis_acquire_timeout_grace_window(real_manager):
+    """Verify that acquire_timeout absorbs reconnection races against a live Redis instance."""
+    # Saturated user slots (max_per_user=2)
+    l1 = await real_manager.acquire("real_u1")
+    l2 = await real_manager.acquire("real_u1")
+
+    async def _delayed_release():
+        await asyncio.sleep(0.06)
+        await l1.release()
+
+    rel_task = asyncio.create_task(_delayed_release())
+    l3 = await real_manager.acquire("real_u1", timeout=0.5)
+    await rel_task
+
+    assert l3.lease_id != l1.lease_id
+    assert l3.expires_at - time.monotonic() > real_manager.config.lease_seconds - 0.1
+    await l2.release()
+    await l3.release()

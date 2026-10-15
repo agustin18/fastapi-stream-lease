@@ -2271,3 +2271,47 @@ async def test_acquire_timeout_emits_single_trace_span_and_preserves_ttl(fake_re
     assert len(spans) == 2
     assert l2.expires_at - time.monotonic() > cfg.lease_seconds - 0.1
     await l2.release()
+
+
+@pytest.mark.asyncio
+async def test_acquire_timeout_retry_loop_deterministic(fake_redis):
+    manager = StreamLeaseManager(redis=fake_redis, config=LeaseConfig(acquire_timeout=1.0))
+    calls = 0
+    orig_eval = fake_redis.eval
+
+    async def _mock_eval(*args: Any, **kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return [2, 1000]
+        return [1, 0]
+
+    fake_redis.eval = _mock_eval
+    try:
+        lease = await manager.acquire("u_det", timeout=0.5)
+        assert calls == 2
+        assert lease is not None
+        await lease.release()
+    finally:
+        fake_redis.eval = orig_eval
+
+
+@pytest.mark.asyncio
+async def test_acquire_timeout_exhaustion_deterministic(fake_redis):
+    manager = StreamLeaseManager(redis=fake_redis, config=LeaseConfig(acquire_timeout=0.15))
+    calls = 0
+    orig_eval = fake_redis.eval
+
+    async def _mock_eval(*args: Any, **kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        return [2, 2500]
+
+    fake_redis.eval = _mock_eval
+    try:
+        with pytest.raises(StreamLeaseRejected) as exc_info:
+            await manager.acquire("u_exhaust", timeout=0.15)
+        assert calls >= 2
+        assert exc_info.value.retry_after == 3
+    finally:
+        fake_redis.eval = orig_eval
