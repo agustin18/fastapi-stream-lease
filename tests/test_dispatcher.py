@@ -497,3 +497,26 @@ async def test_dispatcher_on_queue_change_exception_resilience():
     await executed.wait()
     await dispatcher.drain(timeout=1.0)
     await dispatcher.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("timeout", [0.05, 0.1])
+async def test_dispatcher_close_respects_shared_timeout_budget(timeout: float):
+    """Verify that HookDispatcher.close() shares timeout budget across drain and worker."""
+    dispatcher = HookDispatcher(max_queue_size=10, sync_inline=False)
+    blocker = asyncio.Event()
+
+    async def lingering_hook():
+        await blocker.wait()
+
+    dispatcher.dispatch(lingering_hook)
+    # Allow worker to pick up lingering_hook
+    await asyncio.sleep(0.01)
+
+    start = time.monotonic()
+    await dispatcher.close(drain=True, timeout=timeout)
+    elapsed = time.monotonic() - start
+
+    # Elapsed time must not multiply timeout across drain and worker
+    assert elapsed < timeout * 2.0
+    blocker.set()
