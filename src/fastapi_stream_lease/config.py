@@ -33,6 +33,9 @@ class LeaseConfig:
     retry_after_seconds: int = 5
     """Default Retry-After header value (in seconds) for HTTP 503 responses."""
 
+    acquire_timeout: float = 0.0
+    """Duration (in seconds) to wait for an available lease slot before rejecting acquisition."""
+
     on_acquired: Any = None
     """Optional callback hook: on_acquired(lease: StreamLease) -> None | Awaitable[None]"""
 
@@ -124,6 +127,13 @@ class LeaseConfig:
             or self.upstream_cleanup_timeout < 0
         ):
             raise ValueError("upstream_cleanup_timeout must be a finite number >= 0")
+        if (
+            isinstance(self.acquire_timeout, bool)
+            or not isinstance(self.acquire_timeout, (int, float))
+            or not isfinite(self.acquire_timeout)
+            or self.acquire_timeout < 0
+        ):
+            raise ValueError("acquire_timeout must be a finite number >= 0")
         for hook_name in (
             "on_acquired",
             "on_rejected",
