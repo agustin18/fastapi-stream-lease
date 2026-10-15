@@ -1,11 +1,27 @@
 # Changelog
 
-## 0.4.1 — Unreleased
+## 0.5.0 — 2026-10-15
 
-- Support redis-py 4.6.0+ without changing the public API, Redis keys, Lua scripts or default policies. The server requirement remains Redis 5.0+.
-- Treat legacy local connection-pool exhaustion as an availability error without tripping the circuit breaker or granting fail-open fallback leases, matching modern `MaxConnectionsError` handling. Genuine backend outages retain their configured behavior.
-- Add real-pool and lifecycle regressions, extend client compatibility CI, and update RESP2 fixtures, cleanup examples and contributor documentation.
-- Enforce 100% combined statement and branch coverage, including real Redis startup failure cleanup and strict configuration conflict regressions.
+- **Acquisition Timeout Grace Window (`acquire_timeout`) & Dynamic $O(1)$ `Retry-After`**:
+  - Added `acquire_timeout: float = 0.0` configuration to `LeaseConfig` with per-operation overrides on `manager.acquire(..., timeout=...)`, `manager.lease(..., timeout=...)`, and `manager.stream(..., timeout=...)`.
+  - Non-blocking cooperative retry loop absorbs transient concurrency bursts, client reconnection storms, and connection races without returning premature HTTP 429 rejections.
+  - Preserves exact lease lifetime across retry waits: local lease TTL (`expires_at`) is calibrated to the monotonic timestamp when acquisition actually succeeds, while span duration records total end-to-end latency for observability.
+  - Dynamic $O(1)$ `Retry-After` estimation directly inside Redis Lua: `ACQUIRE_SCRIPT` queries the earliest expiring lease in the Sorted Set via `ZRANGE ... 0 0 WITHSCORES` and computes the exact milliseconds until capacity becomes available. Propagated through `StreamLeaseRejected.retry_after` and standard HTTP `Retry-After` response headers.
+  - Strict parameter validation: non-finite values (`NaN`, `inf`), booleans, and negative timeouts are explicitly rejected with `ValueError`.
+  - Cluster fingerprint compatibility: `acquire_timeout` is maintained as a worker-local operational parameter, ensuring zero `ConfigurationMismatchError` during rolling upgrades across pod versions.
+- **Active Lease Tracking & Graceful Reactive Drain on Shutdown**:
+  - Added worker-local active lease tracking (`manager.active_leases_count`, `manager._active_leases`) within `StreamLeaseManager`.
+  - Reactive drain on shutdown via `await manager.close(drain=True, timeout=5.0)` utilizing `asyncio.Event` (`_drained_event`), eliminating polling loops and waking up immediately once all active streams conclude naturally.
+  - Shielded concurrent batch force-release: lingering active leases past the drain timeout are released in parallel in a single network round-trip via `asyncio.gather` with cancellation shielding (`anyio.CancelScope(shield=True)`), preventing ghost leases in Redis during SIGTERM / container shutdowns.
+  - Blinded TOCTOU race mitigation during worker shutdown: acquisitions in flight when `manager.close()` is initiated execute an immediate cancellation-shielded rollback release in Redis before raising `StreamLeaseUnavailable`.
+  - Synchronous heartbeat cancellation: `StreamLease.cancel_renewal()` executes synchronously upon release and manager teardown to eliminate background renewal task leakage.
+- **Client Compatibility & Legacy Connection Pool Exhaustion**:
+  - Support `redis-py` 4.6.0+ without changing the public API, Redis keys, Lua scripts, or default policies. The server requirement remains Redis 5.0+.
+  - Treat legacy local connection-pool exhaustion (`ConnectionError` with pool messages) as an availability error without tripping the circuit breaker or granting fail-open fallback leases, matching modern `MaxConnectionsError` handling. Genuine backend outages retain their configured behavior.
+  - Add real-pool and lifecycle regressions, extend client compatibility CI, and update RESP2 fixtures, cleanup examples and contributor documentation.
+- **Security & CI Supply Chain Hardening**:
+  - Added automated dependency vulnerability auditing via `pip-audit` in CI.
+  - Updated GitHub Actions pinning to latest audited SHAs across all automated workflows.
 
 ## 0.4.0 — 2026-09-28
 
