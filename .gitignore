@@ -31,3 +31,7 @@ htmlcov/
 
 # Internal private planning
 .roadmap.md
+
+# Repomix
+repomix-output.*
+
