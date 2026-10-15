@@ -36,6 +36,37 @@ GitHub Actions are pinned to full commit hashes so a changed version tag cannot 
 
 Add a focused test for changed behavior. Update the README for public API or failure-mode changes. Keep PRs small enough to review and describe the user-visible effect. CI must pass before merge.
 
+## Architecture and Concurrency Invariants
+
+When contributing changes to the core lease engine or Redis scripts:
+
+1. **Atomic and Bounded Complexity:**
+   - All Redis Lua scripts must execute in $O(1)$ or $O(\log N)$ time.
+   - Never use unbounded `KEYS` or blocking commands (`BLPOP`, `BRPOP`) in Lua scripts.
+   - Use Sorted Sets (ZSET) indexed by expiration monotonic/epoch timestamps for $O(\log N)$ auto-eviction and earliest expiry queries (`ZRANGE ... 0 0 WITHSCORES`).
+
+2. **Strict Test-Driven Development (TDD):**
+   - Write targeted, deterministic unit and integration tests *before* or alongside implementation changes.
+   - Avoid nondeterministic timing checks or long `asyncio.sleep()` in test suites; use deterministic event loops or mocked monotonic clocks where appropriate.
+   - Maintain 100.00% combined statement and branch coverage. CI will reject any PR that drops coverage by even 0.01%.
+
+3. **Defensive Parameter Validation:**
+   - Reject invalid types (such as boolean instances passed to integer/float intervals, NaNs, infinities, or negative durations) at configuration time and call sites.
+   - Avoid leaking unhandled connection pool saturation errors into generic remote network fallback paths.
+
+4. **Git and Commit Standards:**
+   - Use [Conventional Commits](https://www.conventionalcommits.org/):
+     - `feat: <description>` for new capabilities
+     - `fix: <description>` for bug and regression fixes
+     - `perf: <description>` for algorithmic or latency improvements
+     - `docs: <description>` for documentation updates
+     - `chore: <description>` for maintenance and dependency bumps
+   - Do not bundle unrelated refactors into a single pull request.
+
+## Code of Conduct
+
+All contributors and participants are expected to adhere to our [Code of Conduct](CODE_OF_CONDUCT.md).
+
 ## Releases
 
 Only the maintainer publishes releases. Version numbers in `pyproject.toml` and `src/fastapi_stream_lease/__init__.py` must match the `vX.Y.Z` release tag. The publishing workflow reruns CI for that tag and then uploads through PyPI Trusted Publishing.

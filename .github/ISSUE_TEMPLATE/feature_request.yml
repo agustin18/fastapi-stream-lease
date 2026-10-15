@@ -1,0 +1,39 @@
+name: Feature request
+description: Suggest an idea or enhancement for fastapi-stream-lease
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to suggest a new feature or improvement!
+        Please verify that the proposed change fits the core scope: distributed SSE/stream concurrency & lease management backed by Redis Lua scripts.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem Statement / Use Case
+      description: Is your feature request related to a specific production problem or architecture constraint?
+      placeholder: "When running 50 Kubernetes pods streaming LLM responses, we observed..."
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed Solution
+      description: Describe the solution you'd like to see, including any API design or Redis primitives.
+      placeholder: "Add support for..."
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives Considered
+      description: Have you considered any alternative solutions or workarounds?
+    validations:
+      required: false
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Contribution Readiness
+      options:
+        - label: I am willing to submit a pull request implementing this feature with tests (100% coverage).
+          required: false

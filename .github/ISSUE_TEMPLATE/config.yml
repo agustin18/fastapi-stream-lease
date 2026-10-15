@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security Vulnerability
+    url: https://github.com/agustin18/fastapi-stream-lease/security/advisories/new
+    about: Report security issues privately via GitHub Security Advisories
+  - name: Ask a Question / Architecture Discussion
+    url: https://github.com/agustin18/fastapi-stream-lease/discussions
+    about: Ask implementation questions or discuss concurrency patterns
