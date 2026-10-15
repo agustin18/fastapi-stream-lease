@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.6.0 — 2026-10-15
+
+- **Native Active Leases Gauge & Observability Architecture (M-2)**:
+  - Added native `fastapi_stream_lease_active_leases` gauge to both `PrometheusMetrics` and `OpenTelemetryMetrics` adapters, labeled with static `scope` to ensure zero collisions across multiple managers sharing a telemetry registry.
+  - Gauge values are driven directly in-memory from `StreamLeaseManager._register_active_lease` and `StreamLeaseManager._unregister_active_lease`, guaranteeing 100% drift-free tracking across the worker process lifecycle without polling delays or Redis network calls.
+  - Primed to `0.0` upon manager initialization and reset to `0.0` on graceful shutdown drain or forced lease clearance.
+  - Defined `ActiveLeasesTelemetry` runtime protocol and integrated into `StreamLeaseTelemetry` while preserving 100% backward compatibility for custom legacy v0.3.0 `TelemetryAdapter` implementations via defensive dispatch.
+- **FastAPI Exception Handlers Ergonomics (DX-1)**:
+  - Introduced 1-line exception handler registration helper `register_exception_handlers(app)` and convenience method `manager.register_exception_handlers(app)`.
+  - Automatically maps `StreamLeaseRejected` to HTTP 429 (`Retry-After` header + JSON error detail) and `StreamLeaseUnavailable` to HTTP 503 (`Retry-After` header + backend unavailable JSON), eliminating boilerplate in application setup.
+  - Strict input validation rejecting non-FastAPI/Starlette application instances.
+- **Opt-in Tracing & Limit Response Headers (DX-2)**:
+  - Added `include_lease_headers: bool = False` to `LeaseConfig` with per-request overrides on `StreamLease.as_streaming_response()` and `StreamLeaseManager.stream()`.
+  - When enabled, automatically injects `X-Stream-Lease-Id`, `X-Stream-Lease-User-Limit`, and `X-Stream-Lease-Global-Limit` into response headers for end-to-end tracing and client visibility.
+  - Retained strict opt-in default (`False`) to protect private infrastructure identifiers and limit topologies from unintentional external leakage.
+- **Documentation & Examples Refresh (DX-3)**:
+  - Updated `examples/openai_streaming_demo.py` showcasing `acquire_timeout=0.5` non-blocking burst absorption and 1-line `manager.register_exception_handlers(app)`.
+  - Updated `examples/prometheus_metrics_demo.py` showcasing native `register_exception_handlers` and drift-free active gauge telemetry.
+  - Added comprehensive "Unit Testing FastAPI Endpoints with FakeRedis" recipe to `README.md`, documenting zero-infrastructure unit testing patterns with `fakeredis.aioredis.FakeRedis`.
+
 ## 0.5.1 — 2026-10-15
 
 - **Shutdown Timeout Budget & Shared Deadline Enforcement (SE-1)**:

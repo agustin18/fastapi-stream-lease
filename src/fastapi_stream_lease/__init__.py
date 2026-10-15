@@ -13,11 +13,12 @@ from fastapi_stream_lease.exceptions import (
     StreamLeaseLost,
     StreamLeaseRejected,
     StreamLeaseUnavailable,
+    register_exception_handlers,
 )
 from fastapi_stream_lease.lease import ProtectedStreamingResponse, StreamLease
 from fastapi_stream_lease.manager import StreamLeaseManager
 
-__version__ = "0.5.1"
+__version__ = "0.6.0"
 
 __all__ = [
     "BackendFailurePolicy",
@@ -34,4 +35,5 @@ __all__ = [
     "StreamLeaseRejected",
     "StreamLeaseUnavailable",
     "__version__",
+    "register_exception_handlers",
 ]

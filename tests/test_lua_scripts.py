@@ -223,3 +223,8 @@ def test_lease_config_validation():
     custom_cfg = LeaseConfig(key_prefix="{app_v1}:lease")
     assert custom_cfg.user_key("42") == "{app_v1}:lease:user:42"
     assert custom_cfg.global_key == "{app_v1}:lease:global"
+
+    assert LeaseConfig().include_lease_headers is False
+    assert LeaseConfig(include_lease_headers=True).include_lease_headers is True
+    with pytest.raises(TypeError, match="include_lease_headers must be a boolean"):
+        LeaseConfig(include_lease_headers="true")  # type: ignore[arg-type]

@@ -219,7 +219,25 @@ class CircuitBreakerTelemetry(Protocol):
 
 
 @runtime_checkable
-class StreamLeaseTelemetry(TelemetryAdapter, CircuitBreakerTelemetry, Protocol):
-    """Unified telemetry protocol supporting core lease metrics and circuit breaker telemetry."""
+class ActiveLeasesTelemetry(Protocol):
+    """Protocol for telemetry adapters supporting active leases gauge tracking."""
+
+    def record_active_leases(
+        self,
+        count: int,
+        scope: str = "default",
+    ) -> None:
+        """Record the current in-memory active lease count."""
+        ...
+
+
+@runtime_checkable
+class StreamLeaseTelemetry(
+    TelemetryAdapter, CircuitBreakerTelemetry, ActiveLeasesTelemetry, Protocol
+):
+    """
+    Unified telemetry protocol supporting core lease metrics, circuit breaker,
+    and active lease tracking.
+    """
 
     ...

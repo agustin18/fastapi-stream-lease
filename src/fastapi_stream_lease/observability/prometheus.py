@@ -126,6 +126,13 @@ class PrometheusMetrics:
         )
         self.circuit_short_circuited_total = self.short_circuited_total
 
+        self.active_leases = prom.Gauge(
+            "fastapi_stream_lease_active_leases",
+            "Current number of actively held stream leases on this worker node.",
+            ["scope"],
+            registry=self.registry,
+        )
+
     def record_operation(
         self,
         operation: Operation | str,
@@ -192,6 +199,14 @@ class PrometheusMetrics:
             state=st_enum.value,
             scope=str(scope),
         ).inc()
+
+    def record_active_leases(
+        self,
+        count: int,
+        scope: str = "default",
+    ) -> None:
+        """Record the current in-memory active lease count on this worker."""
+        self.active_leases.labels(scope=str(scope)).set(float(count))
 
     def trace_operation(self, operation: Operation | str) -> AbstractContextManager[Any]:
         """No-op context manager for metrics-only Prometheus adapter."""

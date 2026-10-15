@@ -27,6 +27,9 @@ from fastapi_stream_lease.exceptions import (
     StreamLeaseRejected,
     StreamLeaseUnavailable,
 )
+from fastapi_stream_lease.exceptions import (
+    register_exception_handlers as _register_exception_handlers,
+)
 from fastapi_stream_lease.lease import StreamLease, _safe_uncancel
 from fastapi_stream_lease.lua import (
     ACQUIRE_SCRIPT,
@@ -86,6 +89,7 @@ class StreamLeaseManager:
         self._closing_event: asyncio.Event = asyncio.Event()
         self._drained_event: asyncio.Event = asyncio.Event()
         self._drained_event.set()
+        self._safe_record_active_leases()
 
     @property
     def is_closing(self) -> bool:
@@ -105,11 +109,13 @@ class StreamLeaseManager:
     def _register_active_lease(self, lease: StreamLease) -> None:
         self._active_leases.add(lease)
         self._drained_event.clear()
+        self._safe_record_active_leases()
 
     def _unregister_active_lease(self, lease: StreamLease) -> None:
         self._active_leases.discard(lease)
         if not self._active_leases:
             self._drained_event.set()
+        self._safe_record_active_leases()
 
     @property
     def circuit_state(self) -> CircuitState | None:
@@ -209,6 +215,18 @@ class StreamLeaseManager:
                     self.telemetry.record_short_circuit()
             except Exception:
                 logger.exception("Telemetry record_short_circuit failed")
+
+    def _safe_record_active_leases(self) -> None:
+        if self.telemetry is not None and hasattr(self.telemetry, "record_active_leases"):
+            scope = self.config.telemetry_scope or self.config.key_prefix
+            count = len(self._active_leases)
+            try:
+                try:
+                    self.telemetry.record_active_leases(count, scope=scope)
+                except TypeError:
+                    self.telemetry.record_active_leases(count)
+            except Exception:
+                logger.exception("Telemetry record_active_leases failed")
 
     @contextmanager
     def _safe_trace_operation(self, operation: Operation | str) -> Iterator[Any]:
@@ -329,6 +347,7 @@ class StreamLeaseManager:
         await asyncio.gather(*(_safe_release(lease) for lease in remaining_leases))
         self._active_leases.clear()
         self._drained_event.set()
+        self._safe_record_active_leases()
 
     async def acquire(
         self,
@@ -789,6 +808,13 @@ class StreamLeaseManager:
                 await stream_lease._stop_auto_renew(renew_task)
             await stream_lease.release(reason=reason)
 
+    def register_exception_handlers(self, app: Any) -> None:
+        """
+        Register standard FastAPI / Starlette exception handlers for StreamLeaseRejected (429)
+        and StreamLeaseUnavailable (503).
+        """
+        _register_exception_handlers(app)
+
     async def stream(
         self,
         user_id: str | int,
@@ -800,6 +826,7 @@ class StreamLeaseManager:
         renew_interval: float | None = None,
         close_source: bool = True,
         acquire_timeout: float | None = None,
+        include_lease_headers: bool | None = None,
         **kwargs: Any,
     ) -> Any:
         """
@@ -824,6 +851,7 @@ class StreamLeaseManager:
                 auto_renew=auto_renew,
                 renew_interval=renew_interval,
                 close_source=close_source,
+                include_lease_headers=include_lease_headers,
                 **kwargs,
             )
         except Exception:

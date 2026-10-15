@@ -16,6 +16,8 @@ services:
       - ./benchmarks:/app/benchmarks
       - ./pyproject.toml:/app/pyproject.toml
       - ./uv.lock:/app/uv.lock
+      - ./README.md:/app/README.md
+      - ./CHANGELOG.md:/app/CHANGELOG.md
     environment:
       - REDIS_URL=redis://redis:6379/15
     depends_on:
