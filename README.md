@@ -343,6 +343,7 @@ Because `{prefix}:config` is persistent (stored with `SET ... NX` without TTL ex
   from httpx import ASGITransport, AsyncClient
   from fastapi_stream_lease import LeaseConfig, StreamLeaseManager
 
+
   @pytest.fixture
   def app():
       app = FastAPI()
@@ -361,6 +362,7 @@ Because `{prefix}:config` is persistent (stored with `SET ... NX` without TTL ex
           return await manager.stream("test_user", events())
 
       return app
+
 
   @pytest.mark.asyncio
   async def test_stream_headers_and_limit(app):
