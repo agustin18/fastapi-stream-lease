@@ -35,8 +35,6 @@ except ImportError:
 from fastapi_stream_lease import (
     LeaseConfig,
     StreamLeaseManager,
-    StreamLeaseRejected,
-    StreamLeaseUnavailable,
 )
 
 logger = logging.getLogger("openai_streaming_demo")
@@ -52,6 +50,8 @@ manager = StreamLeaseManager(
         max_per_user=1,  # Strictly allow only 1 active LLM generation stream per user
         max_global=100,  # Cluster-wide safeguard against total LLM capacity exhaustion
         lease_seconds=30.0,
+        acquire_timeout=0.5,  # Wait up to 500ms for concurrent bursts before rejecting
+        include_lease_headers=True,  # Attach X-Stream-Lease-Id and limit headers
     ),
 )
 
@@ -78,6 +78,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="LLM Streaming Protection Demo", lifespan=lifespan)
+manager.register_exception_handlers(app)
 
 
 async def authenticated_user(api_key: str = Depends(api_key_header)) -> str:
@@ -88,16 +89,6 @@ async def authenticated_user(api_key: str = Depends(api_key_header)) -> str:
             detail="Invalid API key (ensure STREAM_DEMO_TOKEN is set in environment)",
         )
     return "user-enterprise-1"
-
-
-@app.exception_handler(StreamLeaseRejected)
-async def rejected_handler(request: Request, exc: StreamLeaseRejected):
-    return exc.as_response()
-
-
-@app.exception_handler(StreamLeaseUnavailable)
-async def unavailable_handler(request: Request, exc: StreamLeaseUnavailable):
-    return exc.as_response()
 
 
 async def llm_token_stream(prompt: str, client: Any = None) -> AsyncIterator[str]:

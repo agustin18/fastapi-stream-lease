@@ -68,6 +68,10 @@ class LeaseConfig:
     across multiple managers sharing a telemetry registry (e.g. 'llm_heavy', 'worker_alpha').
     Must not contain high-cardinality dynamic data (e.g. user IDs). Defaults to key_prefix."""
 
+    include_lease_headers: bool = False
+    """Whether to automatically inject X-Stream-Lease-Id, X-Stream-Lease-User-Limit,
+    and X-Stream-Lease-Global-Limit headers into responses."""
+
     def __post_init__(self) -> None:
         if self.failure_policy is not None:
             if isinstance(self.failure_policy, dict):
@@ -146,6 +150,8 @@ class LeaseConfig:
                 raise TypeError(f"{hook_name} must be callable if provided")
         if self.telemetry_scope is not None and not isinstance(self.telemetry_scope, str):
             raise TypeError("telemetry_scope must be a string if provided")
+        if not isinstance(self.include_lease_headers, bool):
+            raise TypeError("include_lease_headers must be a boolean")
         if "{" in self.key_prefix or "}" in self.key_prefix:
             left = self.key_prefix.find("{")
             right = self.key_prefix.find("}")

@@ -482,3 +482,106 @@ async def test_protected_streaming_response_awaits_pending_release_task(fake_red
     await resp(scope, receive, send)
     assert release_finished is True
     await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_register_exception_handlers_fastapi(lease_manager) -> None:
+    """Verifies register_exception_handlers correctly binds HTTP 429 and 503 responses."""
+    from fastapi_stream_lease import register_exception_handlers
+
+    app = FastAPI()
+    register_exception_handlers(app)
+
+    @app.get("/rejected")
+    async def rejected_endpoint():
+        raise StreamLeaseRejected("user_limit", retry_after=7)
+
+    @app.get("/unavailable")
+    async def unavailable_endpoint():
+        raise StreamLeaseUnavailable(retry_after=12)
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp_rej = await client.get("/rejected")
+        assert resp_rej.status_code == 429
+        assert resp_rej.headers["retry-after"] == "7"
+        assert resp_rej.json()["code"] == "stream_connection_limit"
+        assert resp_rej.json()["reason"] == "user_limit"
+
+        resp_unav = await client.get("/unavailable")
+        assert resp_unav.status_code == 503
+        assert resp_unav.headers["retry-after"] == "12"
+        assert resp_unav.json()["code"] == "stream_lease_backend_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_manager_register_exception_handlers_ergonomics(lease_manager) -> None:
+    """Verifies manager.register_exception_handlers ergonomics method."""
+    app = FastAPI()
+    lease_manager.register_exception_handlers(app)
+
+    @app.get("/rejected_via_mgr")
+    async def rejected_endpoint():
+        raise StreamLeaseRejected("global_limit", retry_after=3)
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get("/rejected_via_mgr")
+        assert resp.status_code == 429
+        assert resp.headers["retry-after"] == "3"
+        assert resp.json()["reason"] == "global_limit"
+
+
+def test_register_exception_handlers_invalid_app() -> None:
+    """Verifies register_exception_handlers validates app type."""
+    from fastapi_stream_lease import register_exception_handlers
+
+    with pytest.raises(TypeError, match="must be a FastAPI or Starlette application"):
+        register_exception_handlers(object())
+
+
+@pytest.mark.asyncio
+async def test_include_lease_headers_opt_in_behavior(fake_redis) -> None:
+    """Verifies include_lease_headers opt-in, override, and limit headers."""
+    from fastapi_stream_lease import LeaseConfig, StreamLeaseManager
+
+    # Default: include_lease_headers is False
+    mgr_default = StreamLeaseManager(fake_redis, LeaseConfig(max_per_user=2, max_global=50))
+    lease = await mgr_default.acquire("user_default_hdr")
+
+    async def gen():
+        yield b"chunk"
+
+    resp_no_hdr = lease.as_streaming_response(gen())
+    assert "x-stream-lease-id" not in resp_no_hdr.headers
+    assert "x-stream-lease-user-limit" not in resp_no_hdr.headers
+    assert "x-stream-lease-global-limit" not in resp_no_hdr.headers
+    await lease.release()
+    await mgr_default.close()
+
+    # Opted-in via LeaseConfig: include_lease_headers is True
+    mgr_opted_in = StreamLeaseManager(
+        fake_redis,
+        LeaseConfig(max_per_user=3, max_global=100, include_lease_headers=True),
+    )
+    lease2 = await mgr_opted_in.acquire("user_opted_hdr")
+    resp_with_hdr = lease2.as_streaming_response(
+        gen(),
+        headers={"custom-header": "test-val"},
+    )
+    assert resp_with_hdr.headers["custom-header"] == "test-val"
+    assert resp_with_hdr.headers["x-stream-lease-id"] == str(lease2.lease_id)
+    assert resp_with_hdr.headers["x-stream-lease-user-limit"] == "3"
+    assert resp_with_hdr.headers["x-stream-lease-global-limit"] == "100"
+
+    # Explicit override: include_lease_headers=False when config has True
+    resp_overridden = lease2.as_streaming_response(gen(), include_lease_headers=False)
+    assert "x-stream-lease-id" not in resp_overridden.headers
+    await lease2.release()
+
+    # Explicit override: include_lease_headers=True in manager.stream()
+    resp_stream = await mgr_opted_in.stream("user_opted_hdr", gen(), include_lease_headers=True)
+    assert "x-stream-lease-id" in resp_stream.headers
+    assert resp_stream.headers["x-stream-lease-user-limit"] == "3"
+
+    await mgr_opted_in.close()

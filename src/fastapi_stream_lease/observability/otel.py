@@ -133,6 +133,12 @@ class OpenTelemetryMetrics:
             unit="1",
         )
 
+        self.active_leases_gauge = self.meter.create_gauge(
+            "fastapi_stream_lease.active_leases",
+            description="Current number of actively held stream leases on this worker node.",
+            unit="1",
+        )
+
     def record_operation(
         self,
         operation: Operation | str,
@@ -202,6 +208,17 @@ class OpenTelemetryMetrics:
                 "state": st_enum.value,
                 "scope": str(scope),
             },
+        )
+
+    def record_active_leases(
+        self,
+        count: int,
+        scope: str = "default",
+    ) -> None:
+        """Record the current in-memory active lease count on this worker."""
+        self.active_leases_gauge.set(
+            count,
+            {"scope": str(scope)},
         )
 
     def trace_operation(self, operation: Operation | str) -> AbstractContextManager[Any]:

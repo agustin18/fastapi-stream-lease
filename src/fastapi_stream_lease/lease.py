@@ -440,6 +440,7 @@ class StreamLease:
         auto_renew: bool = True,
         renew_interval: float | None = None,
         close_source: bool = True,
+        include_lease_headers: bool | None = None,
         **kwargs: Any,
     ) -> Any:
         """
@@ -455,6 +456,25 @@ class StreamLease:
                 "Starlette or FastAPI must be installed to use as_streaming_response()."
             ) from None
 
+        should_include_headers = (
+            include_lease_headers
+            if include_lease_headers is not None
+            else self.manager.config.include_lease_headers
+        )
+        effective_headers: dict[str, str] | None = None
+        if headers is not None:
+            effective_headers = dict(headers)
+        if should_include_headers:
+            if effective_headers is None:
+                effective_headers = {}
+            effective_headers.setdefault("X-Stream-Lease-Id", str(self.lease_id))
+            effective_headers.setdefault(
+                "X-Stream-Lease-User-Limit", str(self.manager.config.max_per_user)
+            )
+            effective_headers.setdefault(
+                "X-Stream-Lease-Global-Limit", str(self.manager.config.max_global)
+            )
+
         resp = ProtectedStreamingResponse(
             self.wrap(
                 stream,
@@ -464,7 +484,7 @@ class StreamLease:
             ),
             media_type=media_type,
             status_code=status_code,
-            headers=headers,
+            headers=effective_headers,
             **kwargs,
         )
         resp.lease = self

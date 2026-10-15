@@ -1040,3 +1040,167 @@ async def test_multi_manager_shared_prefix_isolated_by_telemetry_scope(fake_redi
 
     await mgr_a.close()
     await mgr_b.close()
+
+
+def test_active_leases_telemetry_protocol_conformance() -> None:
+    """Verifies that ActiveLeasesTelemetry protocol conforms and is implemented
+    by builtin adapters.
+    """
+    from fastapi_stream_lease.observability.contract import (
+        ActiveLeasesTelemetry,
+        StreamLeaseTelemetry,
+        TelemetryAdapter,
+    )
+
+    class LegacyV03Adapter:
+        def record_operation(self, operation: Any, outcome: Any, duration: float) -> None:
+            pass
+
+        def record_lost(self, reason: Any) -> None:
+            pass
+
+        def record_backend_error(self, kind: Any) -> None:
+            pass
+
+        def record_fallback(self) -> None:
+            pass
+
+        def record_hook_drop(self) -> None:
+            pass
+
+        def record_hook_error(self) -> None:
+            pass
+
+        def record_hook_queue_change(self, delta: int) -> None:
+            pass
+
+        def trace_operation(self, operation: Any) -> Any:
+            return nullcontext()
+
+    legacy = LegacyV03Adapter()
+    assert isinstance(legacy, TelemetryAdapter)
+    assert not isinstance(legacy, ActiveLeasesTelemetry)
+    assert not isinstance(legacy, StreamLeaseTelemetry)
+
+    prom = PrometheusMetrics(registry=CollectorRegistry())
+    assert isinstance(prom, ActiveLeasesTelemetry)
+    assert isinstance(prom, StreamLeaseTelemetry)
+
+    metric_reader = InMemoryMetricReader()
+    meter_provider = MeterProvider(metric_readers=[metric_reader])
+    otel = OpenTelemetryMetrics(meter_provider=meter_provider)
+    assert isinstance(otel, ActiveLeasesTelemetry)
+    assert isinstance(otel, StreamLeaseTelemetry)
+
+
+@pytest.mark.asyncio
+async def test_prometheus_active_leases_gauge_lifecycle(fake_redis) -> None:
+    """Verifies that Prometheus active_leases gauge tracks acquisitions and releases cleanly."""
+    registry = CollectorRegistry()
+    prom = PrometheusMetrics(registry=registry)
+    config = LeaseConfig(
+        max_per_user=5,
+        max_global=10,
+        lease_seconds=30.0,
+        telemetry_scope="test_active_gauge",
+    )
+    manager = StreamLeaseManager(fake_redis, config=config, telemetry=prom)
+
+    # Gauge primed to 0 upon manager initialization
+    assert (
+        registry.get_sample_value(
+            "fastapi_stream_lease_active_leases", {"scope": "test_active_gauge"}
+        )
+        == 0.0
+    )
+
+    lease1 = await manager.acquire("user_1")
+    assert (
+        registry.get_sample_value(
+            "fastapi_stream_lease_active_leases", {"scope": "test_active_gauge"}
+        )
+        == 1.0
+    )
+
+    lease2 = await manager.acquire("user_2")
+    assert (
+        registry.get_sample_value(
+            "fastapi_stream_lease_active_leases", {"scope": "test_active_gauge"}
+        )
+        == 2.0
+    )
+
+    await lease1.release()
+    assert (
+        registry.get_sample_value(
+            "fastapi_stream_lease_active_leases", {"scope": "test_active_gauge"}
+        )
+        == 1.0
+    )
+
+    await lease2.release()
+    assert (
+        registry.get_sample_value(
+            "fastapi_stream_lease_active_leases", {"scope": "test_active_gauge"}
+        )
+        == 0.0
+    )
+
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_opentelemetry_active_leases_gauge_lifecycle(fake_redis) -> None:
+    """Verifies that OpenTelemetry active_leases gauge tracks acquisitions and releases."""
+    metric_reader = InMemoryMetricReader()
+    meter_provider = MeterProvider(metric_readers=[metric_reader])
+    otel = OpenTelemetryMetrics(meter_provider=meter_provider)
+
+    config = LeaseConfig(
+        max_per_user=5,
+        max_global=10,
+        lease_seconds=30.0,
+        telemetry_scope="test_otel_gauge",
+    )
+    manager = StreamLeaseManager(fake_redis, config=config, telemetry=otel)
+
+    lease1 = await manager.acquire("user_1")
+    assert len(manager.active_leases) == 1
+
+    await lease1.release()
+    assert len(manager.active_leases) == 0
+
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_safe_record_active_leases_fault_tolerance(fake_redis) -> None:
+    """Verifies that failures or legacy signatures in record_active_leases do not disrupt leases."""
+
+    class FaultyTelemetry:
+        def __init__(self) -> None:
+            self.calls: list[int] = []
+
+        def record_active_leases(self, count: int) -> None:  # No scope argument
+            self.calls.append(count)
+
+    faulty = FaultyTelemetry()
+    manager = StreamLeaseManager(fake_redis, telemetry=faulty)  # type: ignore[arg-type]
+    assert faulty.calls == [0]
+
+    lease = await manager.acquire("user_faulty")
+    assert faulty.calls == [0, 1]
+
+    await lease.release()
+    assert faulty.calls == [0, 1, 0]
+
+    class ExplodingTelemetry:
+        def record_active_leases(self, count: int, scope: str = "default") -> None:
+            raise RuntimeError("Telemetry collector crashed")
+
+    exploding = ExplodingTelemetry()
+    mgr2 = StreamLeaseManager(fake_redis, telemetry=exploding)  # type: ignore[arg-type]
+    lease2 = await mgr2.acquire("user_exploding")
+    await lease2.release()
+    await mgr2.close()
+    await manager.close()

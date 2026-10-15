@@ -35,8 +35,6 @@ from fastapi_stream_lease import (
     LeaseConfig,
     StreamLease,
     StreamLeaseManager,
-    StreamLeaseRejected,
-    StreamLeaseUnavailable,
 )
 
 # Define Prometheus metrics
@@ -114,16 +112,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Prometheus Metrics Demo", lifespan=lifespan)
-
-
-@app.exception_handler(StreamLeaseRejected)
-async def rejected_handler(request, exc: StreamLeaseRejected):
-    return exc.as_response()
-
-
-@app.exception_handler(StreamLeaseUnavailable)
-async def unavailable_handler(request, exc: StreamLeaseUnavailable):
-    return exc.as_response()
+manager.register_exception_handlers(app)
 
 
 @app.get("/metrics")

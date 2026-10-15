@@ -130,3 +130,23 @@ class ConfigurationMismatchError(StreamLeaseError):
         super().__init__(message)
         self.existing_config = existing_config
         self.current_config = current_config
+
+
+def register_exception_handlers(app: Any) -> None:
+    """
+    Register standard FastAPI / Starlette exception handlers for StreamLeaseRejected (429)
+    and StreamLeaseUnavailable (503).
+    """
+    if not hasattr(app, "add_exception_handler") or not callable(app.add_exception_handler):
+        raise TypeError(
+            "app must be a FastAPI or Starlette application supporting add_exception_handler"
+        )
+
+    async def _handle_rejected(_request: Any, exc: StreamLeaseRejected) -> Any:
+        return exc.as_response()
+
+    async def _handle_unavailable(_request: Any, exc: StreamLeaseUnavailable) -> Any:
+        return exc.as_response()
+
+    app.add_exception_handler(StreamLeaseRejected, _handle_rejected)
+    app.add_exception_handler(StreamLeaseUnavailable, _handle_unavailable)

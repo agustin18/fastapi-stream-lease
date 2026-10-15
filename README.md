@@ -96,14 +96,8 @@ async def authenticated_user_id() -> str:
     return "user-123"
 
 
-@app.exception_handler(StreamLeaseRejected)
-async def rejected(request: Request, exc: StreamLeaseRejected):
-    return exc.as_response()
-
-
-@app.exception_handler(StreamLeaseUnavailable)
-async def unavailable(request: Request, exc: StreamLeaseUnavailable):
-    return exc.as_response()
+# Register standard 429 (StreamLeaseRejected) and 503 (StreamLeaseUnavailable) handlers:
+manager.register_exception_handlers(app)
 
 
 @app.get("/stream")
@@ -339,6 +333,42 @@ Because `{prefix}:config` is persistent (stored with `SET ... NX` without TTL ex
   # Redis Cluster 6-node multi-shard test suite:
   docker compose -f docker-compose.cluster.yml up -d --wait
   docker compose -f docker-compose.cluster.yml run --rm backend uv run --all-extras pytest -o addopts='' tests/test_cluster.py -vv -s
+  ```
+- **Unit Testing FastAPI Endpoints with FakeRedis:**
+  Test endpoints in your application suite without spinning up an external Redis server using `fakeredis`:
+  ```python
+  import pytest
+  from fakeredis.aioredis import FakeRedis
+  from fastapi import FastAPI
+  from httpx import ASGITransport, AsyncClient
+  from fastapi_stream_lease import LeaseConfig, StreamLeaseManager
+
+  @pytest.fixture
+  def app():
+      app = FastAPI()
+      redis_client = FakeRedis()
+      manager = StreamLeaseManager(
+          redis_client,
+          LeaseConfig(max_per_user=1, include_lease_headers=True),
+      )
+      manager.register_exception_handlers(app)
+
+      @app.get("/stream")
+      async def stream_route():
+          async def events():
+              yield "data: chunk\n\n"
+
+          return await manager.stream("test_user", events())
+
+      return app
+
+  @pytest.mark.asyncio
+  async def test_stream_headers_and_limit(app):
+      async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+          resp = await client.get("/stream")
+          assert resp.status_code == 200
+          assert "x-stream-lease-id" in resp.headers
+          assert resp.headers["x-stream-lease-user-limit"] == "1"
   ```
 
 ## Examples directory
