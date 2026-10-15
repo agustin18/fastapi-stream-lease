@@ -1167,8 +1167,36 @@ async def test_opentelemetry_active_leases_gauge_lifecycle(fake_redis) -> None:
     lease1 = await manager.acquire("user_1")
     assert len(manager.active_leases) == 1
 
+    data_after_acquire = metric_reader.get_metrics_data()
+    assert data_after_acquire is not None
+    data_points_acquire = [
+        dp
+        for rm in data_after_acquire.resource_metrics
+        for sm in rm.scope_metrics
+        for m in sm.metrics
+        if m.name == "fastapi_stream_lease.active_leases"
+        for dp in m.data.data_points
+    ]
+    assert len(data_points_acquire) == 1
+    assert data_points_acquire[0].value == 1
+    assert dict(data_points_acquire[0].attributes) == {"scope": "test_otel_gauge"}
+
     await lease1.release()
     assert len(manager.active_leases) == 0
+
+    data_after_release = metric_reader.get_metrics_data()
+    assert data_after_release is not None
+    data_points_release = [
+        dp
+        for rm in data_after_release.resource_metrics
+        for sm in rm.scope_metrics
+        for m in sm.metrics
+        if m.name == "fastapi_stream_lease.active_leases"
+        for dp in m.data.data_points
+    ]
+    assert len(data_points_release) == 1
+    assert data_points_release[0].value == 0
+    assert dict(data_points_release[0].attributes) == {"scope": "test_otel_gauge"}
 
     await manager.close()
 

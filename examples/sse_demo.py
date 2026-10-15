@@ -8,14 +8,12 @@ import os
 from contextlib import asynccontextmanager
 
 import redis.asyncio as redis
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.security import APIKeyHeader
 
 from fastapi_stream_lease import (
     LeaseConfig,
     StreamLeaseManager,
-    StreamLeaseRejected,
-    StreamLeaseUnavailable,
 )
 
 api_key_header = APIKeyHeader(name="X-API-Key")
@@ -41,6 +39,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+manager.register_exception_handlers(app)
 
 
 async def authenticated_user(api_key: str = Depends(api_key_header)) -> str:
@@ -48,16 +47,6 @@ async def authenticated_user(api_key: str = Depends(api_key_header)) -> str:
     if not expected or not hmac.compare_digest(api_key, expected):
         raise HTTPException(status_code=401, detail="Invalid API key")
     return "demo-user"
-
-
-@app.exception_handler(StreamLeaseRejected)
-async def rejected(request: Request, exc: StreamLeaseRejected):
-    return exc.as_response()
-
-
-@app.exception_handler(StreamLeaseUnavailable)
-async def unavailable(request: Request, exc: StreamLeaseUnavailable):
-    return exc.as_response()
 
 
 @app.get("/stream")

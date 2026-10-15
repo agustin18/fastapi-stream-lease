@@ -1,24 +1,20 @@
 """
 Prometheus Observability Demo with fastapi-stream-lease
 
-Demonstrates wiring zero-dependency lifecycle hooks (`on_acquired`, `on_released`,
-`on_rejected`, `on_lost`, `on_backend_error`) into Prometheus counters and gauges.
-
-Note on telemetry guarantees:
-    Lifecycle hooks are executed asynchronously out-of-band via an internal bounded dispatcher.
-    They provide best-effort telemetry signals (useful for metric counters and latency tracking).
-    For authoritative active lease count across a cluster, query Redis directly via
-    `manager.get_active_count()`.
+Demonstrates wiring native drift-free Prometheus metrics into FastAPI:
+- Automatic in-memory active lease tracking via `fastapi_stream_lease_active_leases` gauge.
+- Operation counts, latency histograms, circuit breaker states, and backend errors.
+- 1-line exception handling for HTTP 429 and 503 responses.
 
 Note on multi-worker deployments:
     This demo uses the default in-memory Prometheus registry reflecting streams on the
     current worker process. For multi-worker deployments (e.g. Gunicorn/Uvicorn with
     multiple worker processes), configure Prometheus Multiprocess Mode
     (PROMETHEUS_MULTIPROC_DIR) or export metrics to an aggregated telemetry backend
-    (Datadog, StatsD, OpenTelemetry).
+    (OpenTelemetry, Datadog).
 
 Requirements:
-    pip install prometheus-client fastapi uvicorn redis
+    pip install "fastapi-stream-lease[prometheus]" fastapi uvicorn redis
 """
 
 from __future__ import annotations
@@ -29,72 +25,30 @@ from contextlib import asynccontextmanager
 
 import redis.asyncio as redis
 from fastapi import FastAPI, Response
-from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, generate_latest
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from fastapi_stream_lease import (
     LeaseConfig,
-    StreamLease,
     StreamLeaseManager,
 )
-
-# Define Prometheus metrics
-ACTIVE_STREAMS = Gauge(
-    "fastapi_stream_leases_active", "Number of currently active streaming leases"
-)
-REJECTED_STREAMS = Counter(
-    "fastapi_stream_lease_rejected_total",
-    "Total number of rejected stream attempts",
-    ["reason"],
-)
-LOST_STREAMS = Counter(
-    "fastapi_stream_lease_lost_total",
-    "Total number of streams terminated due to lease loss",
-    ["reason"],
-)
-BACKEND_ERRORS = Counter(
-    "fastapi_stream_lease_backend_errors_total",
-    "Total number of Redis coordination backend errors",
-    ["error_type"],
-)
-
-
-def on_acquired(lease: StreamLease) -> None:
-    ACTIVE_STREAMS.inc()
-
-
-def on_rejected(user_id: str | int, reason: str) -> None:
-    REJECTED_STREAMS.labels(reason=reason).inc()
-
-
-def on_released(lease: StreamLease, reason: str) -> None:
-    ACTIVE_STREAMS.dec()
-
-
-def on_lost(lease: StreamLease, reason: str) -> None:
-    LOST_STREAMS.labels(reason=reason).inc()
-
-
-def on_backend_error(exc: Exception) -> None:
-    BACKEND_ERRORS.labels(error_type=type(exc).__name__).inc()
-
+from fastapi_stream_lease.observability.prometheus import PrometheusMetrics
 
 redis_client = redis.from_url(
     os.environ.get("REDIS_URL", "redis://localhost:6379/0"),
     socket_timeout=2.0,
     socket_connect_timeout=2.0,
 )
+prom_metrics = PrometheusMetrics()
 manager = StreamLeaseManager(
     redis_client,
     LeaseConfig(
         max_per_user=2,
         max_global=50,
         lease_seconds=15.0,
-        on_acquired=on_acquired,
-        on_rejected=on_rejected,
-        on_released=on_released,
-        on_lost=on_lost,
-        on_backend_error=on_backend_error,
+        acquire_timeout=0.5,
+        telemetry_scope="demo_api",
     ),
+    telemetry=prom_metrics,
 )
 
 

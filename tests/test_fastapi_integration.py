@@ -584,4 +584,24 @@ async def test_include_lease_headers_opt_in_behavior(fake_redis) -> None:
     assert "x-stream-lease-id" in resp_stream.headers
     assert resp_stream.headers["x-stream-lease-user-limit"] == "3"
 
+    # Case-insensitive header deduplication: user passes lowercase x-stream-lease-id
+    lease3 = await mgr_opted_in.acquire("user_lower_hdr")
+    resp_lower = lease3.as_streaming_response(
+        gen(),
+        headers={"x-stream-lease-id": "custom-override-id"},
+    )
+    assert resp_lower.headers["x-stream-lease-id"] == "custom-override-id"
+    raw_keys = [k for k in resp_lower.headers.keys() if k.lower() == "x-stream-lease-id"]
+    assert len(raw_keys) == 1
+    await lease3.release()
+
+    # Invalid non-bool include_lease_headers raises TypeError
+    lease4 = await mgr_opted_in.acquire("user_invalid_hdr")
+    with pytest.raises(TypeError, match="include_lease_headers must be a boolean or None"):
+        lease4.as_streaming_response(gen(), include_lease_headers="invalid")  # type: ignore[arg-type]
+    await lease4.release()
+
+    with pytest.raises(TypeError, match="include_lease_headers must be a boolean or None"):
+        await mgr_opted_in.stream("user_opted_hdr", gen(), include_lease_headers="invalid")  # type: ignore[arg-type]
+
     await mgr_opted_in.close()

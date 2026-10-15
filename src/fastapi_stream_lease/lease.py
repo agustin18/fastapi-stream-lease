@@ -456,24 +456,26 @@ class StreamLease:
                 "Starlette or FastAPI must be installed to use as_streaming_response()."
             ) from None
 
+        if include_lease_headers is not None and not isinstance(include_lease_headers, bool):
+            raise TypeError("include_lease_headers must be a boolean or None")
+
         should_include_headers = (
             include_lease_headers
             if include_lease_headers is not None
             else self.manager.config.include_lease_headers
         )
-        effective_headers: dict[str, str] | None = None
-        if headers is not None:
-            effective_headers = dict(headers)
+        effective_headers: dict[str, str] | None = dict(headers) if headers is not None else None
         if should_include_headers:
             if effective_headers is None:
                 effective_headers = {}
-            effective_headers.setdefault("X-Stream-Lease-Id", str(self.lease_id))
-            effective_headers.setdefault(
-                "X-Stream-Lease-User-Limit", str(self.manager.config.max_per_user)
-            )
-            effective_headers.setdefault(
-                "X-Stream-Lease-Global-Limit", str(self.manager.config.max_global)
-            )
+            existing_lower = {k.lower() for k in effective_headers}
+            for hdr_name, hdr_val in (
+                ("X-Stream-Lease-Id", str(self.lease_id)),
+                ("X-Stream-Lease-User-Limit", str(self.manager.config.max_per_user)),
+                ("X-Stream-Lease-Global-Limit", str(self.manager.config.max_global)),
+            ):
+                if hdr_name.lower() not in existing_lower:
+                    effective_headers[hdr_name] = hdr_val
 
         resp = ProtectedStreamingResponse(
             self.wrap(

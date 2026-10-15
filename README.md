@@ -403,7 +403,7 @@ Because `{prefix}:config` is persistent (stored with `SET ... NX` without TTL ex
 - **Observability Contract:**
   - Exported metric names (`fastapi_stream_lease_*`) and dimensional label keys (`scope`, `operation`, `state`) are treated as breaking-change contracts and will remain consistent across major versions.
 - **Path to v1.0.0:**
-  - Version `0.4.0` represents feature completeness. The subsequent `v1.0.0` release is a formal declaration of long-term API stability and freeze following external community bake time.
+  - Version `0.6.0` delivers production feature completeness, native drift-free active gauge observability, and 1-line exception handling. The subsequent `v1.0.0` release is a formal declaration of long-term API stability and freeze following external community bake time.
 
 ## Contributing and security
 
