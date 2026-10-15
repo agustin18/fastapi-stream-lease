@@ -3,10 +3,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import time
 from collections.abc import AsyncIterable, AsyncIterator, Iterator
 from contextlib import asynccontextmanager, contextmanager, suppress
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 from fastapi_stream_lease.circuit_breaker import (
@@ -312,13 +313,24 @@ class StreamLeaseManager:
         self._active_leases.clear()
         self._drained_event.set()
 
-    async def acquire(self, user_id: str | int) -> StreamLease:
+    async def acquire(
+        self,
+        user_id: str | int,
+        timeout: float | None = None,  # noqa: ASYNC109
+    ) -> StreamLease:
         """
         Acquire a new stream lease for the given user.
+
+        Args:
+            user_id: Unique identifier for the user/principal.
+            timeout: Optional maximum duration (in seconds) to wait for an available
+                slot if limits are currently reached. If None, defaults to
+                `config.acquire_timeout`. Set to 0 for strict immediate fail-fast.
 
         Raises:
             StreamLeaseUnavailable: If the manager is shutting down.
             StreamLeaseRejected: If user or global concurrency limits are exceeded.
+            ValueError: If timeout is negative or non-finite.
             RuntimeError: If Redis evaluation fails unexpectedly.
         """
         if self._is_closing:
@@ -327,27 +339,190 @@ class StreamLeaseManager:
                 retry_after=self.config.retry_after_seconds,
             )
 
-        lease_id = uuid4().hex
+        effective_timeout: float = self.config.acquire_timeout if timeout is None else timeout
+        if (
+            isinstance(effective_timeout, bool)
+            or not isinstance(effective_timeout, (int, float))
+            or not math.isfinite(effective_timeout)
+            or effective_timeout < 0
+        ):
+            raise ValueError("timeout must be a finite number >= 0")
+
         user_key = self.config.user_key(user_id)
         global_key = self.config.global_key
         start_monotonic = time.monotonic()
+        deadline = start_monotonic + effective_timeout
 
-        # Circuit breaker fast-path check
-        permit: CircuitPermit | None = None
-        if self._circuit_breaker is not None:
-            permit = self._circuit_breaker.acquire_permit()
-            self._safe_record_circuit_state(self._circuit_breaker.state)
-            if not permit.allowed:
-                self._safe_record_short_circuit(Operation.ACQUIRE, self._circuit_breaker.state)
-                duration = 0.0
-                if self.config.effective_failure_policy.fallback_mode == FallbackMode.FAIL_OPEN:
-                    self._safe_record_fallback()
-                    self._safe_record_operation(Operation.ACQUIRE, Outcome.FALLBACK, duration)
+        while True:
+            if self._is_closing:
+                raise StreamLeaseUnavailable(
+                    detail="Stream lease manager is shutting down",
+                    retry_after=self.config.retry_after_seconds,
+                )
+
+            lease_id = uuid4().hex
+
+            # Circuit breaker fast-path check
+            permit: CircuitPermit | None = None
+            if self._circuit_breaker is not None:
+                permit = self._circuit_breaker.acquire_permit()
+                self._safe_record_circuit_state(self._circuit_breaker.state)
+                if not permit.allowed:
+                    self._safe_record_short_circuit(Operation.ACQUIRE, self._circuit_breaker.state)
+                    duration = time.monotonic() - start_monotonic
+                    if self.config.effective_failure_policy.fallback_mode == FallbackMode.FAIL_OPEN:
+                        self._safe_record_fallback()
+                        self._safe_record_operation(Operation.ACQUIRE, Outcome.FALLBACK, duration)
+                        logger.warning(
+                            "Circuit breaker is %s; fallback_mode=FAIL_OPEN allows fallback lease "
+                            "%s",
+                            self._circuit_breaker.state.value,
+                            lease_id,
+                        )
+                        lease = StreamLease(
+                            lease_id=lease_id,
+                            user_id=user_id,
+                            user_key=user_key,
+                            global_key=global_key,
+                            manager=self,
+                            created_at=time.time(),
+                            created_monotonic=start_monotonic,
+                        )
+                        lease._is_fallback = True
+                        self._register_active_lease(lease)
+                        self.dispatcher.dispatch(self.config.on_acquired, lease)
+                        return lease
+
+                    self._safe_record_operation(Operation.ACQUIRE, Outcome.BACKEND_ERROR, duration)
                     logger.warning(
-                        "Circuit breaker is %s; fallback_mode=FAIL_OPEN allows fallback lease %s",
+                        "Circuit breaker is %s; fast-failing acquire for user %s",
                         self._circuit_breaker.state.value,
-                        lease_id,
+                        user_id,
                     )
+                    raise StreamLeaseUnavailable(
+                        detail=(
+                            f"Circuit breaker is {self._circuit_breaker.state.value.upper()}: "
+                            "Redis backend unavailable"
+                        ),
+                        retry_after=self.config.retry_after_seconds,
+                    )
+
+            with self._safe_trace_operation(Operation.ACQUIRE):
+                try:
+                    try:
+                        result = await self.redis.eval(
+                            ACQUIRE_SCRIPT,
+                            2,
+                            user_key,
+                            global_key,
+                            self.config.lease_seconds,
+                            lease_id,
+                            self.config.max_per_user,
+                            self.config.max_global,
+                            self.config.redis_ttl,
+                        )
+                    except Exception as exc:
+                        if permit is not None:
+                            permit.record_failure(exc)
+                            assert self._circuit_breaker is not None
+                            self._safe_record_circuit_state(self._circuit_breaker.state)
+                        duration = time.monotonic() - start_monotonic
+                        if is_network_error(exc):
+                            self._safe_record_backend_error(exc)
+                            self.dispatcher.dispatch(self.config.on_backend_error, exc)
+                            if is_transient_error(exc) and self.config.fail_open:
+                                if self._is_closing:
+                                    raise StreamLeaseUnavailable(
+                                        detail="Stream lease manager is shutting down",
+                                        retry_after=self.config.retry_after_seconds,
+                                    ) from exc
+                                self._safe_record_fallback()
+                                self._safe_record_operation(
+                                    Operation.ACQUIRE, Outcome.FALLBACK, duration
+                                )
+                                logger.warning(
+                                    "Redis backend unavailable during acquire; "
+                                    "fail_open=True allows fallback lease %s: %s",
+                                    lease_id,
+                                    exc,
+                                )
+                                lease = StreamLease(
+                                    lease_id=lease_id,
+                                    user_id=user_id,
+                                    user_key=user_key,
+                                    global_key=global_key,
+                                    manager=self,
+                                    created_at=time.time(),
+                                    created_monotonic=start_monotonic,
+                                )
+                                lease._is_fallback = True
+                                self._register_active_lease(lease)
+                                self.dispatcher.dispatch(self.config.on_acquired, lease)
+                                return lease
+                            self._safe_record_operation(
+                                Operation.ACQUIRE, Outcome.BACKEND_ERROR, duration
+                            )
+                            logger.warning(
+                                "Redis backend unavailable during acquire for user %s: %s",
+                                user_id,
+                                exc,
+                            )
+                            raise StreamLeaseUnavailable(
+                                detail=(
+                                    "Stream lease coordination backend is temporarily unavailable"
+                                ),
+                                retry_after=self.config.retry_after_seconds,
+                            ) from exc
+                        logger.error(
+                            "Execution error during stream lease acquire for user %s: %s",
+                            user_id,
+                            exc,
+                            exc_info=True,
+                        )
+                        raise
+
+                    # Backend call succeeded: Redis is reachable and executed the script.
+                    if permit is not None:
+                        permit.record_backend_reachable()
+                        assert self._circuit_breaker is not None
+                        self._safe_record_circuit_state(self._circuit_breaker.state)
+
+                    if isinstance(result, (list, tuple)):
+                        code = int(result[0])
+                        retry_after_ms = (
+                            int(result[1]) if len(result) > 1 and result[1] is not None else 0
+                        )
+                    else:
+                        code = int(result)
+                        retry_after_ms = 0
+
+                    duration = time.monotonic() - start_monotonic
+                    if code in (2, 3):
+                        reason: Literal["user_limit", "global_limit"] = (
+                            "user_limit" if code == 2 else "global_limit"
+                        )
+                        retry_after_s = (
+                            max(1, math.ceil(retry_after_ms / 1000.0))
+                            if retry_after_ms > 0
+                            else self.config.retry_after_seconds
+                        )
+                        remaining = deadline - time.monotonic()
+                        if remaining > 0:
+                            sleep_delay = min(0.05, max(0.005, remaining))
+                            await asyncio.sleep(sleep_delay)
+                            continue
+
+                        self._safe_record_operation(Operation.ACQUIRE, Outcome.REJECTED, duration)
+                        self.dispatcher.dispatch(self.config.on_rejected, user_id, reason)
+                        raise StreamLeaseRejected(reason=reason, retry_after=retry_after_s)
+
+                    if code != 1:
+                        raise RuntimeError(
+                            f"Unexpected stream lease acquisition return code: {code}"
+                        )
+
+                    self._safe_record_operation(Operation.ACQUIRE, Outcome.SUCCESS, duration)
+
                     lease = StreamLease(
                         lease_id=lease_id,
                         user_id=user_id,
@@ -357,144 +532,23 @@ class StreamLeaseManager:
                         created_at=time.time(),
                         created_monotonic=start_monotonic,
                     )
-                    lease._is_fallback = True
+                    if self._is_closing:
+                        if _has_anyio:
+                            with anyio.CancelScope(shield=True):
+                                await self.release(lease)
+                        else:  # pragma: no cover
+                            with suppress(asyncio.CancelledError):
+                                await asyncio.shield(self.release(lease))
+                        raise StreamLeaseUnavailable(
+                            detail="Stream lease manager is shutting down",
+                            retry_after=self.config.retry_after_seconds,
+                        )
                     self._register_active_lease(lease)
                     self.dispatcher.dispatch(self.config.on_acquired, lease)
                     return lease
-
-                self._safe_record_operation(Operation.ACQUIRE, Outcome.BACKEND_ERROR, duration)
-                logger.warning(
-                    "Circuit breaker is %s; fast-failing acquire for user %s",
-                    self._circuit_breaker.state.value,
-                    user_id,
-                )
-                raise StreamLeaseUnavailable(
-                    detail=(
-                        f"Circuit breaker is {self._circuit_breaker.state.value.upper()}: "
-                        "Redis backend unavailable"
-                    ),
-                    retry_after=self.config.retry_after_seconds,
-                )
-
-        with self._safe_trace_operation(Operation.ACQUIRE):
-            try:
-                try:
-                    result = await self.redis.eval(
-                        ACQUIRE_SCRIPT,
-                        2,
-                        user_key,
-                        global_key,
-                        self.config.lease_seconds,
-                        lease_id,
-                        self.config.max_per_user,
-                        self.config.max_global,
-                        self.config.redis_ttl,
-                    )
-                except Exception as exc:
+                finally:
                     if permit is not None:
-                        permit.record_failure(exc)
-                        assert self._circuit_breaker is not None
-                        self._safe_record_circuit_state(self._circuit_breaker.state)
-                    duration = time.monotonic() - start_monotonic
-                    if is_network_error(exc):
-                        self._safe_record_backend_error(exc)
-                        self.dispatcher.dispatch(self.config.on_backend_error, exc)
-                        if is_transient_error(exc) and self.config.fail_open:
-                            if self._is_closing:
-                                raise StreamLeaseUnavailable(
-                                    detail="Stream lease manager is shutting down",
-                                    retry_after=self.config.retry_after_seconds,
-                                ) from exc
-                            self._safe_record_fallback()
-                            self._safe_record_operation(
-                                Operation.ACQUIRE, Outcome.FALLBACK, duration
-                            )
-                            logger.warning(
-                                "Redis backend unavailable during acquire; "
-                                "fail_open=True allows fallback lease %s: %s",
-                                lease_id,
-                                exc,
-                            )
-                            lease = StreamLease(
-                                lease_id=lease_id,
-                                user_id=user_id,
-                                user_key=user_key,
-                                global_key=global_key,
-                                manager=self,
-                                created_at=time.time(),
-                                created_monotonic=start_monotonic,
-                            )
-                            lease._is_fallback = True
-                            self._register_active_lease(lease)
-                            self.dispatcher.dispatch(self.config.on_acquired, lease)
-                            return lease
-                        self._safe_record_operation(
-                            Operation.ACQUIRE, Outcome.BACKEND_ERROR, duration
-                        )
-                        logger.warning(
-                            "Redis backend unavailable during acquire for user %s: %s",
-                            user_id,
-                            exc,
-                        )
-                        raise StreamLeaseUnavailable(
-                            detail="Stream lease coordination backend is temporarily unavailable",
-                            retry_after=self.config.retry_after_seconds,
-                        ) from exc
-                    logger.error(
-                        "Execution error during stream lease acquire for user %s: %s",
-                        user_id,
-                        exc,
-                        exc_info=True,
-                    )
-                    raise
-
-                # Backend call succeeded: Redis is reachable and executed the script.
-                if permit is not None:
-                    permit.record_backend_reachable()
-                    assert self._circuit_breaker is not None
-                    self._safe_record_circuit_state(self._circuit_breaker.state)
-
-                code = int(result)
-                duration = time.monotonic() - start_monotonic
-                if code == 2:
-                    self._safe_record_operation(Operation.ACQUIRE, Outcome.REJECTED, duration)
-                    self.dispatcher.dispatch(self.config.on_rejected, user_id, "user_limit")
-                    raise StreamLeaseRejected(reason="user_limit")
-                if code == 3:
-                    self._safe_record_operation(Operation.ACQUIRE, Outcome.REJECTED, duration)
-                    self.dispatcher.dispatch(self.config.on_rejected, user_id, "global_limit")
-                    raise StreamLeaseRejected(reason="global_limit")
-                if code != 1:
-                    raise RuntimeError(f"Unexpected stream lease acquisition return code: {code}")
-
-                self._safe_record_operation(Operation.ACQUIRE, Outcome.SUCCESS, duration)
-
-                lease = StreamLease(
-                    lease_id=lease_id,
-                    user_id=user_id,
-                    user_key=user_key,
-                    global_key=global_key,
-                    manager=self,
-                    created_at=time.time(),
-                    created_monotonic=start_monotonic,
-                )
-                if self._is_closing:
-                    if _has_anyio:
-                        with anyio.CancelScope(shield=True):
-                            await self.release(lease)
-                    else:  # pragma: no cover
-                        with suppress(asyncio.CancelledError):
-                            await asyncio.shield(self.release(lease))
-                    raise StreamLeaseUnavailable(
-                        detail="Stream lease manager is shutting down",
-                        retry_after=self.config.retry_after_seconds,
-                    )
-                self._register_active_lease(lease)
-                self.dispatcher.dispatch(self.config.on_acquired, lease)
-                return lease
-            finally:
-                if permit is not None:
-                    permit.release()
+                        permit.release()
 
     async def renew(self, lease: StreamLease) -> bool:
         """
@@ -653,7 +707,10 @@ class StreamLeaseManager:
 
     @asynccontextmanager
     async def lease(
-        self, user_id: str | int, renew_interval: float | None = None
+        self,
+        user_id: str | int,
+        renew_interval: float | None = None,
+        timeout: float | None = None,  # noqa: ASYNC109
     ) -> AsyncIterator[StreamLease]:
         """
         Context manager for acquiring and safely releasing a stream lease for scoped
@@ -668,7 +725,7 @@ class StreamLeaseManager:
                     msg = await websocket.receive_text()
                     ...
         """
-        stream_lease = await self.acquire(user_id)
+        stream_lease = await self.acquire(user_id, timeout=timeout)
         renew_task: asyncio.Task[None] | None = None
         lease_lost = asyncio.Event()
         reason = "completed"
@@ -700,6 +757,7 @@ class StreamLeaseManager:
         auto_renew: bool = True,
         renew_interval: float | None = None,
         close_source: bool = True,
+        acquire_timeout: float | None = None,
         **kwargs: Any,
     ) -> Any:
         """
@@ -714,7 +772,7 @@ class StreamLeaseManager:
         an exception is raised immediately. If stream setup fails before returning,
         the acquired lease is safely released to prevent lingering ghost leases.
         """
-        lease = await self.acquire(user_id)
+        lease = await self.acquire(user_id, timeout=acquire_timeout)
         try:
             return lease.as_streaming_response(
                 stream,

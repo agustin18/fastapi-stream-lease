@@ -76,7 +76,8 @@ async def test_fastapi_concurrency_limit_429(fastapi_app, lease_manager):
         # 3rd request should immediately be rejected with 429
         rejected_resp = await client.get("/stream/bob?count=1")
         assert rejected_resp.status_code == 429
-        assert rejected_resp.headers.get("retry-after") == "5"
+        expected_retry_after = str(int(lease_manager.config.lease_seconds))
+        assert rejected_resp.headers.get("retry-after") == expected_retry_after
         payload = rejected_resp.json()
         assert payload["code"] == "stream_connection_limit"
         assert payload["reason"] == "user_limit"

@@ -39,7 +39,7 @@ async def test_user_concurrency_limit(lease_manager):
     with pytest.raises(StreamLeaseRejected) as exc_info:
         await lease_manager.acquire("user_1")
     assert exc_info.value.reason == "user_limit"
-    assert exc_info.value.retry_after == 5
+    assert exc_info.value.retry_after == int(lease_manager.config.lease_seconds)
 
     # Another user can still acquire fine
     lease_other = await lease_manager.acquire("user_2")
@@ -65,6 +65,7 @@ async def test_global_concurrency_limit(lease_manager):
     with pytest.raises(StreamLeaseRejected) as exc_info:
         await lease_manager.acquire("user_3")
     assert exc_info.value.reason == "global_limit"
+    assert exc_info.value.retry_after == int(lease_manager.config.lease_seconds)
 
     # Releasing one allows user_3 to acquire
     await l1.release()

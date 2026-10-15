@@ -2138,3 +2138,103 @@ async def test_lease_manual_release_cancels_renewal_tasks(fake_redis, lease_conf
     assert dummy_task.done()
     assert len(lease._active_renew_tasks) == 0
     assert lease._is_released
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_timeout", [-1.0, -0.01, float("inf"), float("nan"), True, False])
+async def test_acquire_timeout_validation(lease_manager, invalid_timeout):
+    with pytest.raises(ValueError, match="timeout must be a finite number >= 0"):
+        await lease_manager.acquire("user_invalid_timeout", timeout=invalid_timeout)
+
+
+@pytest.mark.parametrize("invalid_timeout", [-1.0, -0.01, float("inf"), float("nan"), True, False])
+def test_lease_config_acquire_timeout_validation(invalid_timeout):
+    with pytest.raises(ValueError, match="acquire_timeout must be a finite number >= 0"):
+        LeaseConfig(acquire_timeout=invalid_timeout)
+
+
+@pytest.mark.asyncio
+async def test_acquire_timeout_absorbs_reconnection_race(fake_redis):
+    cfg = LeaseConfig(lease_seconds=2.0, max_per_user=1, acquire_timeout=0.5)
+    manager = StreamLeaseManager(redis=fake_redis, config=cfg)
+
+    # User currently holds the single allowed slot
+    lease1 = await manager.acquire("user_f5")
+    assert manager.active_leases_count == 1
+
+    # Concurrent task attempts to acquire with acquire_timeout grace window
+    async def _delayed_release():
+        await asyncio.sleep(0.06)
+        await lease1.release()
+
+    release_task = asyncio.create_task(_delayed_release())
+    lease2 = await manager.acquire("user_f5")
+    await release_task
+
+    assert lease2.lease_id != lease1.lease_id
+    assert manager.active_leases_count == 1
+    await lease2.release()
+
+
+@pytest.mark.asyncio
+async def test_acquire_timeout_exhaustion_raises_rejected_with_dynamic_retry_after(fake_redis):
+    cfg = LeaseConfig(lease_seconds=3.0, max_per_user=1)
+    manager = StreamLeaseManager(redis=fake_redis, config=cfg)
+
+    lease1 = await manager.acquire("user_busy")
+    start = time.monotonic()
+
+    with pytest.raises(StreamLeaseRejected) as exc_info:
+        await manager.acquire("user_busy", timeout=0.1)
+
+    elapsed = time.monotonic() - start
+    assert elapsed >= 0.08
+    assert exc_info.value.reason == "user_limit"
+    assert exc_info.value.retry_after == 3
+
+    response = exc_info.value.as_response()
+    assert response.status_code == 429
+    assert response.headers["Retry-After"] == "3"
+
+    http_exc = exc_info.value.as_http_exception()
+    assert http_exc.status_code == 429
+    assert http_exc.headers["Retry-After"] == "3"
+
+    await lease1.release()
+
+
+@pytest.mark.asyncio
+async def test_acquire_timeout_aborts_on_manager_shutdown(fake_redis):
+    cfg = LeaseConfig(lease_seconds=2.0, max_per_user=1)
+    manager = StreamLeaseManager(redis=fake_redis, config=cfg)
+    lease1 = await manager.acquire("user_shutting_down")
+
+    async def _shutdown_soon():
+        await asyncio.sleep(0.03)
+        await manager.close(drain=False)
+
+    shutdown_task = asyncio.create_task(_shutdown_soon())
+    with pytest.raises(StreamLeaseUnavailable, match="shutting down"):
+        await manager.acquire("user_shutting_down", timeout=1.0)
+
+    await shutdown_task
+    await lease1.release()
+
+
+@pytest.mark.asyncio
+async def test_manager_lease_and_stream_forward_acquire_timeout(fake_redis):
+    cfg = LeaseConfig(lease_seconds=2.0, max_per_user=1)
+    manager = StreamLeaseManager(redis=fake_redis, config=cfg)
+    lease1 = await manager.acquire("user_forward")
+
+    with pytest.raises(StreamLeaseRejected):
+        async with manager.lease("user_forward", timeout=0.05):
+            pass
+
+    async def _dummy_stream():
+        yield "chunk"
+
+    with pytest.raises(StreamLeaseRejected):
+        await manager.stream("user_forward", _dummy_stream(), acquire_timeout=0.05)
+
+    await lease1.release()
