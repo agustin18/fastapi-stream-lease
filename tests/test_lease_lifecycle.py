@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from contextlib import aclosing
+from contextlib import aclosing, contextmanager
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -2172,6 +2172,7 @@ async def test_acquire_timeout_absorbs_reconnection_race(fake_redis):
     await release_task
 
     assert lease2.lease_id != lease1.lease_id
+    assert lease2.expires_at - time.monotonic() > cfg.lease_seconds - 0.1
     assert manager.active_leases_count == 1
     await lease2.release()
 
@@ -2238,3 +2239,35 @@ async def test_manager_lease_and_stream_forward_acquire_timeout(fake_redis):
         await manager.stream("user_forward", _dummy_stream(), acquire_timeout=0.05)
 
     await lease1.release()
+
+
+@pytest.mark.asyncio
+async def test_acquire_timeout_emits_single_trace_span_and_preserves_ttl(fake_redis):
+    spans: list[Any] = []
+
+    class DummyTelemetry:
+        @contextmanager
+        def trace_operation(self, op: Any):
+            spans.append(op)
+            yield
+
+        def record_operation(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+    cfg = LeaseConfig(lease_seconds=2.0, max_per_user=1, acquire_timeout=0.3)
+    manager = StreamLeaseManager(redis=fake_redis, config=cfg, telemetry=DummyTelemetry())
+
+    l1 = await manager.acquire("u_trace")
+
+    async def _delayed_release():
+        await asyncio.sleep(0.06)
+        await l1.release()
+
+    rel_task = asyncio.create_task(_delayed_release())
+    l2 = await manager.acquire("u_trace")
+    await rel_task
+
+    # 1 span for l1, 1 span for l2 (spans are NOT multiplied across retry iterations)
+    assert len(spans) == 2
+    assert l2.expires_at - time.monotonic() > cfg.lease_seconds - 0.1
+    await l2.release()
