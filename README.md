@@ -1,3 +1,9 @@
+<p align="center">
+  <a href="https://github.com/agustin18/fastapi-stream-lease">
+    <img src="https://raw.githubusercontent.com/agustin18/fastapi-stream-lease/main/docs/assets/logo.png" width="130" alt="fastapi-stream-lease logo">
+  </a>
+</p>
+
 # fastapi-stream-lease
 
 [![CI](https://github.com/agustin18/fastapi-stream-lease/actions/workflows/ci.yml/badge.svg)](https://github.com/agustin18/fastapi-stream-lease/actions/workflows/ci.yml)
