@@ -133,7 +133,7 @@ async def llm_token_stream(prompt: str, client: Any = None) -> AsyncIterator[str
     ]
     for token in tokens:
         yield f"data: {token}\n\n"
-        await asyncio.sleep(0.08)
+        await asyncio.sleep(0.3)
 
 
 @app.get("/v1/chat/stream")
