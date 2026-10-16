@@ -8,6 +8,62 @@ Limit **simultaneously active** SSE, LLM token streams, and WebSocket sessions a
 
 Request rate limiters answer “how many requests arrived this minute?” This package answers “how many streams are open right now?” It is useful when a connection can remain open for seconds or minutes. For a general-purpose distributed semaphore, consider [py-redis-limiters](https://pypi.org/project/redis-limiters/) or [py-redis-semaphore](https://pypi.org/project/py-redis-semaphore/).
 
+## How it works (At a glance)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor C1 as Client (Tab 1)
+    actor C2 as Client (Tab 2 / Scraper)
+    participant API as FastAPI + StreamLease
+    participant Redis as Redis (Atomic Lua ZSET)
+    participant LLM as OpenAI / Anthropic Stream
+
+    Note over API,Redis: LeaseConfig(max_per_user=1, lease_seconds=30, acquire_timeout=0.5)
+
+    rect rgba(46, 160, 67, 0.12)
+    C1->>API: GET /v1/chat/stream
+    API->>Redis: EVAL ACQUIRE_SCRIPT (O(1))
+    Redis-->>API: {1, 0} -> Lease Granted (Active: 1/1)
+    API->>LLM: Start token generation
+    LLM-->>C1: HTTP 200 (X-Stream-Lease-Id: 8f2a...) + SSE chunks
+    end
+
+    rect rgba(235, 87, 87, 0.15)
+    Note over C2,LLM: Parallel tab or abuse while Stream #1 is in-flight
+    C2->>API: GET /v1/chat/stream
+    API->>Redis: EVAL ACQUIRE_SCRIPT (waits up to acquire_timeout)
+    Redis-->>API: {2, 24100} -> User limit reached
+    API-->>C2: HTTP 429 Too Many Requests (Retry-After: 25)
+    Note over API,LLM: 0 LLM tokens billed! Blocked before calling upstream
+    end
+
+    rect rgba(56, 139, 253, 0.12)
+    Note over C1,LLM: User closes browser tab or hits Stop mid-generation
+    C1--xAPI: ASGI http.disconnect
+    API--xLLM: ProtectedStreamingResponse invokes aclose() (stops token billing!)
+    API->>Redis: Shielded EVAL RELEASE_SCRIPT (<1ms)
+    Redis-->>API: Slot freed immediately (Active: 0/1)
+    end
+```
+
+### Live Terminal Preview
+
+```text
+┌─ Terminal 1: Client Stream #1 (Allowed) ──────────┐ ┌─ Terminal 2: Concurrent Stream #2 (Blocked) ─────────┐
+│ $ curl -i -N http://localhost:8000/v1/chat/stream │ │ $ curl -i http://localhost:8000/v1/chat/stream       │
+│ HTTP/1.1 200 OK                                   │ │ HTTP/1.1 429 Too Many Requests                       │
+│ content-type: text/event-stream; charset=utf-8    │ │ content-type: application/json                       │
+│ x-stream-lease-id: 8f2a9c41d0e74b12a5c3...        │ │ retry-after: 28                                      │
+│ x-stream-lease-user-limit: 1                      │ │                                                      │
+│ x-stream-lease-global-limit: 100                  │ │ {                                                    │
+│                                                   │ │   "code": "stream_connection_limit",                 │
+│ data: Hello                                       │ │   "reason": "user_limit",                            │
+│ data:  world                                      │ │   "detail": "User stream limit reached"              │
+│ ^C (Client disconnects -> slot freed in <1ms)     │ │ }                                                    │
+└───────────────────────────────────────────────────┘ └──────────────────────────────────────────────────────┘
+```
+
 ## Install
 
 Requires Python 3.10+, a Redis server 5.0+, and the Python client `redis-py` 4.6.0+.
