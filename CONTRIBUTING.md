@@ -30,6 +30,21 @@ The default test command requires 100% combined line and branch coverage. Run it
 
 For the client floor, run `uv run --with "redis==4.6.0" pytest`; the overlay resolves dependencies normally. Real integration tests need an isolated `REDIS_URL`. The fixtures select RESP2 for newer clients and omit the unsupported `protocol` argument on 4.6. Use `aclose()` when available, otherwise await `close()`; disconnect caller-owned pools separately.
 
+## Documentation
+
+Build and preview the documentation site with the docs extra:
+
+```bash
+uv sync --extra dev --extra docs
+uv run mkdocs serve
+```
+
+Before opening a pull request, verify the strict build:
+
+```bash
+uv run mkdocs build --strict
+```
+
 Pool-exhaustion regression tests must cover actual `ConnectionPool` and `BlockingConnectionPool` errors, both fallback policies, and circuit permit ownership. A capacity error must not enable fail-open or count as a remote outage.
 
 GitHub Actions are pinned to full commit hashes so a changed version tag cannot silently change the release pipeline. The comment beside each hash shows the readable release version, and Dependabot proposes grouped updates.

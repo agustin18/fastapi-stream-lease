@@ -3,8 +3,11 @@
 [![CI](https://github.com/agustin18/fastapi-stream-lease/actions/workflows/ci.yml/badge.svg)](https://github.com/agustin18/fastapi-stream-lease/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/fastapi-stream-lease.svg)](https://pypi.org/project/fastapi-stream-lease/)
 [![Python](https://img.shields.io/pypi/pyversions/fastapi-stream-lease.svg)](https://pypi.org/project/fastapi-stream-lease/)
+[![Docs](https://img.shields.io/badge/docs-online-blue)](https://agustin18.github.io/fastapi-stream-lease/)
 
 Limit **simultaneously active** SSE, LLM token streams, and WebSocket sessions across FastAPI/Starlette workers with Redis. Set a per-user limit, a global limit, or both. An extra connection receives HTTP 429 before streaming begins.
+
+Full guides and API reference: **https://agustin18.github.io/fastapi-stream-lease/**
 
 Request rate limiters answer “how many requests arrived this minute?” This package answers “how many streams are open right now?” It is useful when a connection can remain open for seconds or minutes. For a general-purpose distributed semaphore, consider [py-redis-limiters](https://pypi.org/project/redis-limiters/) or [py-redis-semaphore](https://pypi.org/project/py-redis-semaphore/).
 

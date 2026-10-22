@@ -13,15 +13,18 @@ authors = [
 license = "MIT"
 license-files = ["LICENSE"]
 keywords = [
-    "fastapi",
-    "starlette",
-    "sse",
-    "server-sent-events",
-    "streaming",
     "concurrency",
+    "concurrency-control",
+    "distributed-lock",
+    "fastapi",
+    "llm-streaming",
     "rate-limiting",
     "redis",
-    "llm-streaming",
+    "semaphore",
+    "server-sent-events",
+    "sse",
+    "starlette",
+    "streaming",
 ]
 classifiers = [
     "Development Status :: 5 - Production/Stable",
@@ -56,6 +59,12 @@ all = [
     "prometheus-client>=0.20.0",
     "opentelemetry-api>=1.30.0",
 ]
+docs = [
+    "mkdocs-material>=9.6.0",
+    "mkdocstrings[python]>=0.29.0",
+    "pymdown-extensions>=10.0",
+    "ruff>=0.4.0",
+]
 dev = [
     "fastapi>=0.100.0",
     "httpx>=0.25.0",
@@ -73,8 +82,10 @@ dev = [
 
 [project.urls]
 Homepage = "https://github.com/agustin18/fastapi-stream-lease"
+Documentation = "https://agustin18.github.io/fastapi-stream-lease/"
 Repository = "https://github.com/agustin18/fastapi-stream-lease"
 Issues = "https://github.com/agustin18/fastapi-stream-lease/issues"
+Changelog = "https://github.com/agustin18/fastapi-stream-lease/blob/main/CHANGELOG.md"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/fastapi_stream_lease"]
@@ -112,7 +123,7 @@ ignore = []
 "examples/*" = ["T20"]
 
 [tool.codespell]
-skip = "*.lock,*.xml,.git,.venv,.mypy_cache,.pytest_cache,dist"
+skip = "*.lock,*.xml,.git,.venv,.mypy_cache,.pytest_cache,dist,site"
 ignore-words-list = "crate"
 
 [tool.mypy]
