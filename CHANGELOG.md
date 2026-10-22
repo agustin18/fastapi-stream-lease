@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.6.1 — 2026-10-22
+
+- Published the documentation site at https://agustin18.github.io/fastapi-stream-lease/ with guides for SSE, production deployment, observability, and the failure model, plus a generated API reference.
+- Added a strict documentation build to CI and automated GitHub Pages deployment.
+- Expanded PyPI project metadata with documentation and changelog URLs and additional discovery keywords.
+- No runtime code or public API changes.
+
 ## 0.6.0 — 2026-10-15
 
 - **Native Active Leases Gauge & Observability Architecture (M-2)**:
