@@ -450,7 +450,7 @@ Because `{prefix}:config` is persistent (stored with `SET ... NX` without TTL ex
    - The test matrix validates compatibility down to minimum floors (`fastapi>=0.100.0`, `starlette>=0.27.0`, `redis>=4.6.0`).
    - These are **compatibility floors**, not security recommendations. Production deployments should always maintain up-to-date versions of FastAPI, Starlette, and Redis to benefit from upstream security patches and CVE remediations.
 3. **Automated Vulnerability Scanning:**
-   - All commits and pull requests are audited in CI via `pip-audit` to detect known vulnerabilities across dependencies.
+   - All commits and pull requests are audited in CI via `pip-audit` against both the PyPI and OSV advisory databases to detect known vulnerabilities across dependencies.
 
 ## Stability & Versioning Policy
 
