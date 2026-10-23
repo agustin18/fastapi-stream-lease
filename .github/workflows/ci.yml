@@ -431,17 +431,17 @@ jobs:
           print("Smoke test passed for [prometheus] extra")
           PY
 
-      - name: Clean environment wheel smoke test (otel extra with 1.30 floor)
+      - name: Clean environment wheel smoke test (otel extra with 1.45.1 floor)
         run: |
           mkdir -p /tmp/smoke-test-otel
           cd /tmp/smoke-test-otel
           uv venv
           WHEEL_PATH=$(ls $GITHUB_WORKSPACE/dist/*.whl)
-          uv pip install "$WHEEL_PATH[otel]" "opentelemetry-api==1.30.0"
+          uv pip install "$WHEEL_PATH[otel]" "opentelemetry-api==1.45.1"
           uv run python - <<'PY'
           import importlib.metadata
           otel_version = importlib.metadata.version("opentelemetry-api")
-          assert otel_version == "1.30.0", f"Expected 1.30.0, got {otel_version}"
+          assert otel_version == "1.45.1", f"Expected 1.45.1, got {otel_version}"
           from fastapi_stream_lease.observability.otel import OpenTelemetryMetrics
 
           otel = OpenTelemetryMetrics()
