@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.6.2 — 2026-10-23
+
+- Raised the `opentelemetry-api` floor to `>=1.45.1` for the `otel` and `all` extras and the development environment, addressing GHSA-xcq7-p3pf-p88h / CVE-2026-114603 (unbounded `tracestate` header parsing). The lockfile now resolves OpenTelemetry 1.45.1.
+- Added an OSV advisory-database audit to CI alongside the existing PyPI audit. The PyPI source did not surface the GHSA advisory.
+- Updated development tooling and workflow pins: ruff 0.17.1, mypy 2.4.0, setup-uv 10.3.0, and configure-pages 6.0.0.
+- No runtime code or public API changes.
+
 ## 0.6.1 — 2026-10-22
 
 - Published the documentation site at https://agustin18.github.io/fastapi-stream-lease/ with guides for SSE, production deployment, observability, and the failure model, plus a generated API reference.

@@ -18,7 +18,7 @@ from fastapi_stream_lease.exceptions import (
 from fastapi_stream_lease.lease import ProtectedStreamingResponse, StreamLease
 from fastapi_stream_lease.manager import StreamLeaseManager
 
-__version__ = "0.6.1"
+__version__ = "0.6.2"
 
 __all__ = [
     "BackendFailurePolicy",

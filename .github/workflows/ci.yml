@@ -17,7 +17,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           enable-cache: true
 
@@ -39,8 +39,11 @@ jobs:
       - name: Check Spelling (codespell)
         run: uv run codespell
 
-      - name: Audit Dependencies for Known Vulnerabilities (pip-audit)
+      - name: Audit Dependencies for Known Vulnerabilities (PyPI)
         run: uv run --with pip-audit pip-audit
+
+      - name: Audit Dependencies for Known Vulnerabilities (OSV)
+        run: uv run --with pip-audit pip-audit --vulnerability-service osv
 
   docs:
     runs-on: ubuntu-latest
@@ -48,7 +51,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           enable-cache: true
 
@@ -84,7 +87,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           enable-cache: true
 
@@ -121,7 +124,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
       - name: Set up Python
         run: uv python install 3.13
       - name: Install dependencies
@@ -149,7 +152,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
       - name: Set up Python
         run: uv python install 3.13
       - name: Install dependencies
@@ -179,7 +182,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           enable-cache: true
       - name: Set up Python
@@ -269,7 +272,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
       - name: Set up Python ${{ matrix.python-version }}
         run: uv python install ${{ matrix.python-version }}
       - name: Install dependencies with minimum redis-py floor
@@ -297,7 +300,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
       - name: Set up Python 3.10
         run: uv python install 3.10
       - name: Install dependencies with minimum FastAPI & Starlette floor
@@ -348,7 +351,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           enable-cache: true
 
@@ -428,17 +431,17 @@ jobs:
           print("Smoke test passed for [prometheus] extra")
           PY
 
-      - name: Clean environment wheel smoke test (otel extra with 1.30 floor)
+      - name: Clean environment wheel smoke test (otel extra with 1.45.1 floor)
         run: |
           mkdir -p /tmp/smoke-test-otel
           cd /tmp/smoke-test-otel
           uv venv
           WHEEL_PATH=$(ls $GITHUB_WORKSPACE/dist/*.whl)
-          uv pip install "$WHEEL_PATH[otel]" "opentelemetry-api==1.30.0"
+          uv pip install "$WHEEL_PATH[otel]" "opentelemetry-api==1.45.1"
           uv run python - <<'PY'
           import importlib.metadata
           otel_version = importlib.metadata.version("opentelemetry-api")
-          assert otel_version == "1.30.0", f"Expected 1.30.0, got {otel_version}"
+          assert otel_version == "1.45.1", f"Expected 1.45.1, got {otel_version}"
           from fastapi_stream_lease.observability.otel import OpenTelemetryMetrics
 
           otel = OpenTelemetryMetrics()

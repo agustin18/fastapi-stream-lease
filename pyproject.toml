@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "fastapi-stream-lease"
-version = "0.6.1"
+version = "0.6.2"
 description = "Distributed stream and SSE concurrency lease manager for FastAPI and Starlette backed by atomic Redis Lua scripts."
 readme = "README.md"
 authors = [
@@ -52,12 +52,12 @@ prometheus = [
     "prometheus-client>=0.20.0",
 ]
 otel = [
-    "opentelemetry-api>=1.30.0",
+    "opentelemetry-api>=1.45.1",
 ]
 all = [
     "fastapi>=0.100.0",
     "prometheus-client>=0.20.0",
-    "opentelemetry-api>=1.30.0",
+    "opentelemetry-api>=1.45.1",
 ]
 docs = [
     "mkdocs-material>=9.6.0",
@@ -75,8 +75,8 @@ dev = [
     "ruff>=0.4.0",
     "mypy>=1.10.0",
     "prometheus-client>=0.20.0",
-    "opentelemetry-api>=1.30.0",
-    "opentelemetry-sdk>=1.30.0",
+    "opentelemetry-api>=1.45.1",
+    "opentelemetry-sdk>=1.45.1",
     "codespell>=2.2.0",
 ]
 
