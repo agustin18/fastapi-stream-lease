@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.6.3 — 2026-10-27
+
+- Added a self-contained local browser demo (`demo/`) with a two-panel synthetic SSE stream, signed session cookie, and per-session and per-IP limits. Run it from a checkout with `docker compose up --build demo`; it needs Redis but no LLM credentials.
+- Added 43 demo tests with 100% branch coverage for `demo/app.py`. The demo dependency lives in a uv dependency group and is not published in the wheel.
+- Refreshed the development lockfile to FastAPI 0.162.0, Starlette 1.10.0, Pydantic 2.14.1, fakeredis 2.40.0, pytest-asyncio 1.4.1, ruff 0.17.3, and current documentation tooling.
+- Audited the locked dependency set from an exported requirements file so vulnerabilities in the `pip-audit` tool environment do not fail the audit job.
+- No runtime code or public API changes.
+
 ## 0.6.2 — 2026-10-23
 
 - Raised the `opentelemetry-api` floor to `>=1.45.1` for the `otel` and `all` extras and the development environment, addressing GHSA-xcq7-p3pf-p88h / CVE-2026-114603 (unbounded `tracestate` header parsing). The lockfile now resolves OpenTelemetry 1.45.1.

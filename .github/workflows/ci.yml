@@ -34,16 +34,22 @@ jobs:
         run: uv run ruff format --check .
 
       - name: Run Mypy Type Checking
-        run: uv run mypy src
+        run: uv run mypy src demo
 
       - name: Check Spelling (codespell)
         run: uv run codespell
 
+      - name: Export locked dependencies for audit
+        run: |
+          uv export --frozen --extra dev --group demo --no-emit-project \
+            --format requirements-txt \
+            --output-file "$RUNNER_TEMP/requirements-audit.txt"
+
       - name: Audit Dependencies for Known Vulnerabilities (PyPI)
-        run: uv run --with pip-audit pip-audit
+        run: uv run --with pip-audit pip-audit -r "$RUNNER_TEMP/requirements-audit.txt" --no-deps --disable-pip
 
       - name: Audit Dependencies for Known Vulnerabilities (OSV)
-        run: uv run --with pip-audit pip-audit --vulnerability-service osv
+        run: uv run --with pip-audit pip-audit --vulnerability-service osv -r "$RUNNER_TEMP/requirements-audit.txt" --no-deps --disable-pip
 
   docs:
     runs-on: ubuntu-latest
@@ -99,6 +105,13 @@ jobs:
 
       - name: Run Pytest with Coverage
         run: uv run --python ${{ matrix.python-version }} pytest
+
+      - name: Run demo tests with coverage
+        if: matrix.python-version == '3.13'
+        run: |
+          uv run --python ${{ matrix.python-version }} pytest tests/test_demo.py \
+            -o addopts='' --cov=demo --cov-branch --cov-fail-under=100 \
+            --cov-report=term-missing
 
       - name: Upload coverage artifact
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
