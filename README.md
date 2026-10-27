@@ -467,6 +467,7 @@ Because `{prefix}:config` is persistent (stored with `SET ... NX` without TTL ex
 ## Stability & Versioning Policy
 
 - **Semantic Versioning (SemVer):** `fastapi-stream-lease` strictly follows SemVer.
+- **Release versioning:** Versions are calculated from Conventional Commits since the previous tag. `feat` requires a minor bump; `feat(demo)` changes limited to demo, docs, tests, and release metadata are the documented patch exception. `python scripts/release_version.py --next` prints the next version, and the publish workflow verifies the tag before upload.
 - **Public API Contract:**
   - Symbols exported from the top-level package (`fastapi_stream_lease`) constitute the public API: `StreamLeaseManager`, `StreamLease`, `LeaseConfig`, circuit breaker configurations (`CircuitBreakerConfig`, `CircuitState`, `BackendFailurePolicy`, `FallbackMode`), and exceptions (`StreamLeaseError`, etc.).
   - `ProtectedStreamingResponse` is an integration implementation detail of `manager.stream(...)` and `lease.as_streaming_response(...)`; while accessible for custom subclassing, standard applications should rely on the high-level manager and lease methods.

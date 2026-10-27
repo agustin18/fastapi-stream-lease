@@ -1,0 +1,20 @@
+name: Next release version
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  calculate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Calculate next version
+        run: |
+          git fetch --tags --force
+          python scripts/release_version.py --next
