@@ -105,6 +105,17 @@ curl -N -H 'X-API-Key: local-secret' http://localhost:8000/stream
 
 The first two requests stream events; the third receives `429` with a `Retry-After` header until a slot is freed. Replace the demo API key with your application's authenticated user or account ID before production use. Never use an unverified request parameter as the user ID.
 
+### Browser demo
+
+The [`demo/`](demo/) app runs a two-panel browser demo with a synthetic SSE stream, a signed session cookie, and the same Redis lease limits. It needs Redis but no LLM credentials:
+
+```bash
+docker compose up --build demo
+# http://localhost:8080
+```
+
+See [`demo/README.md`](demo/README.md) for configuration and endpoints.
+
 ## FastAPI integration
 
 ```python
@@ -434,6 +445,7 @@ Because `{prefix}:config` is persistent (stored with `SET ... NX` without TTL ex
 
 ## Examples directory
 
+- [`demo/`](demo/): Local browser demo with two panels, synthetic SSE, and a signed session cookie.
 - [`examples/sse_demo.py`](examples/sse_demo.py): Server-Sent Events with API key authentication.
 - [`examples/websocket_demo.py`](examples/websocket_demo.py): WebSocket streams with standard close codes (`1008 Policy Violation`, `1013 Try Again Later`).
 - [`examples/openai_streaming_demo.py`](examples/openai_streaming_demo.py): LLM token streaming with official `openai` SDK and simulated fallback.

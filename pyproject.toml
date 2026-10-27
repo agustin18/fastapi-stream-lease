@@ -80,6 +80,11 @@ dev = [
     "codespell>=2.2.0",
 ]
 
+[dependency-groups]
+demo = [
+    "uvicorn>=0.30.0",
+]
+
 [project.urls]
 Homepage = "https://github.com/agustin18/fastapi-stream-lease"
 Documentation = "https://agustin18.github.io/fastapi-stream-lease/"

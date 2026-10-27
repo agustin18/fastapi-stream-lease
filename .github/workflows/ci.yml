@@ -34,7 +34,7 @@ jobs:
         run: uv run ruff format --check .
 
       - name: Run Mypy Type Checking
-        run: uv run mypy src
+        run: uv run mypy src demo
 
       - name: Check Spelling (codespell)
         run: uv run codespell
@@ -99,6 +99,13 @@ jobs:
 
       - name: Run Pytest with Coverage
         run: uv run --python ${{ matrix.python-version }} pytest
+
+      - name: Run demo tests with coverage
+        if: matrix.python-version == '3.13'
+        run: |
+          uv run --python ${{ matrix.python-version }} pytest tests/test_demo.py \
+            -o addopts='' --cov=demo --cov-branch --cov-fail-under=100 \
+            --cov-report=term-missing
 
       - name: Upload coverage artifact
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
