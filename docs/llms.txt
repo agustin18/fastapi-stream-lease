@@ -1,0 +1,65 @@
+# fastapi-stream-lease
+
+> Distributed stream and SSE concurrency lease manager for FastAPI and Starlette backed by atomic Redis Lua scripts.
+
+FastAPI Stream Lease limits active streams instead of requests per minute. It is useful
+for SSE, LLM token streaming, WebSocket sessions, and other long-lived HTTP responses
+that can hold a worker socket or upstream API budget.
+
+## Start here
+
+- [Quickstart](https://agustin18.github.io/fastapi-stream-lease/quickstart/)
+- [FAQ](https://agustin18.github.io/fastapi-stream-lease/faq/)
+- [SSE and streaming](https://agustin18.github.io/fastapi-stream-lease/guides/sse/)
+- [Production deployment](https://agustin18.github.io/fastapi-stream-lease/guides/production/)
+- [Failure model](https://agustin18.github.io/fastapi-stream-lease/guides/failure-model/)
+- [API reference](https://agustin18.github.io/fastapi-stream-lease/api/)
+- [GitHub repository](https://github.com/agustin18/fastapi-stream-lease)
+- [PyPI package](https://pypi.org/project/fastapi-stream-lease/)
+
+## What it solves
+
+- Per-user and global concurrent stream limits.
+- Atomic Redis Lua acquire, renew, release, and expiration cleanup.
+- HTTP 429 before upstream token generation starts.
+- Upstream generator closure when the downstream client disconnects.
+- Redis Cluster hash tags, Sentinel coverage, circuit breaker, and fail-open or fail-closed policies.
+- Prometheus and OpenTelemetry metrics for active leases.
+
+## Common questions
+
+### How do I limit concurrent SSE connections in FastAPI?
+
+Wrap the async token generator with `manager.stream(user_id, token_stream())`. The lease
+is acquired before the response starts and released when the stream finishes, fails, or
+the client disconnects.
+
+### How is this different from a rate limiter?
+
+A rate limiter counts requests in a time window. A stream can stay open for 30 to 60
+seconds, so one user can hold several worker sockets while sending only a few requests.
+This library limits concurrent open streams.
+
+### Does it work with LLM token streams?
+
+Yes. It wraps any async token generator, including OpenAI, Anthropic, LiteLLM, or a
+provider-specific SDK.
+
+### What happens if Redis is unavailable?
+
+The default is fail-closed: the API returns HTTP 503 instead of allowing unlimited
+streams. `LeaseConfig(fail_open=True)` enables worker-local fallback leases during an
+outage.
+
+### Is it production-ready?
+
+The project is pre-1.0. Version `0.6.x` has production-focused failure handling, Redis
+Cluster and Sentinel coverage, and 100% statement and branch coverage. Pin a version and
+test your own failure modes before a broad rollout.
+
+## Source
+
+- License: MIT
+- Python: 3.10+
+- Redis: 5.0+
+- Repository: https://github.com/agustin18/fastapi-stream-lease

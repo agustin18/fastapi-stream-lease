@@ -1,3 +1,7 @@
+---
+description: Limit concurrent SSE, LLM token, and WebSocket streams in FastAPI with Redis-backed leases and HTTP 429 before token generation.
+---
+
 # fastapi-stream-lease
 
 Distributed concurrency leases for SSE, LLM token streams, and WebSocket sessions on

@@ -1,3 +1,7 @@
+---
+description: API reference for StreamLeaseManager, StreamLease, LeaseConfig, exceptions, and observability adapters.
+---
+
 # API reference
 
 The public API is exported from the top-level `fastapi_stream_lease` package. Internal

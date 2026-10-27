@@ -1,3 +1,7 @@
+---
+description: Install fastapi-stream-lease and run a minimal FastAPI and Redis streaming example with allowed and rejected paths.
+---
+
 # Quickstart
 
 This page runs a minimal FastAPI app against a local Redis instance and verifies both the

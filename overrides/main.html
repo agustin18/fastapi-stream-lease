@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+
+{% block extrahead %}
+  {{ super() }}
+  {% set page_title = (page.title | striptags) if page else config.site_name %}
+  {% set social_title = (page_title ~ " · " ~ config.site_name) if page else config.site_name %}
+  {% set page_description = page.meta.description if page and page.meta and page.meta.description else config.site_description %}
+  {% set page_url = page.canonical_url if page else config.site_url %}
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="{{ config.site_name }}">
+  <meta property="og:title" content="{{ social_title }}">
+  <meta property="og:description" content="{{ page_description }}">
+  <meta property="og:url" content="{{ page_url }}">
+  <meta property="og:image" content="{{ config.site_url }}assets/social-preview.png">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="{{ social_title }}">
+  <meta name="twitter:description" content="{{ page_description }}">
+  <meta name="twitter:image" content="{{ config.site_url }}assets/social-preview.png">
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "SoftwareSourceCode",
+    "name": "fastapi-stream-lease",
+    "description": "{{ config.site_description }}",
+    "codeRepository": "{{ config.repo_url }}",
+    "url": "{{ config.site_url }}",
+    "programmingLanguage": "Python",
+    "license": "https://opensource.org/licenses/MIT",
+    "author": {
+      "@type": "Person",
+      "name": "Agustin Saiz",
+      "url": "https://github.com/agustin18"
+    },
+    "sameAs": [
+      "https://pypi.org/project/fastapi-stream-lease/",
+      "{{ config.repo_url }}"
+    ]
+  }
+  </script>
+{% endblock %}

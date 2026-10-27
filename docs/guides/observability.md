@@ -1,3 +1,7 @@
+---
+description: Monitor active stream leases with Prometheus and OpenTelemetry metrics.
+---
+
 # Observability
 
 The package ships optional Prometheus and OpenTelemetry adapters, plus zero-dependency

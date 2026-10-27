@@ -1,3 +1,7 @@
+---
+description: Protect FastAPI SSE and LLM token streams with per-user and global Redis concurrency leases.
+---
+
 # SSE and streaming
 
 Server-Sent Events are long-lived HTTP responses. A normal request limiter releases its
