@@ -39,11 +39,17 @@ jobs:
       - name: Check Spelling (codespell)
         run: uv run codespell
 
+      - name: Export locked dependencies for audit
+        run: |
+          uv export --frozen --extra dev --group demo --no-emit-project \
+            --format requirements-txt \
+            --output-file "$RUNNER_TEMP/requirements-audit.txt"
+
       - name: Audit Dependencies for Known Vulnerabilities (PyPI)
-        run: uv run --with pip-audit pip-audit
+        run: uv run --with pip-audit pip-audit -r "$RUNNER_TEMP/requirements-audit.txt"
 
       - name: Audit Dependencies for Known Vulnerabilities (OSV)
-        run: uv run --with pip-audit pip-audit --vulnerability-service osv
+        run: uv run --with pip-audit pip-audit --vulnerability-service osv -r "$RUNNER_TEMP/requirements-audit.txt"
 
   docs:
     runs-on: ubuntu-latest
