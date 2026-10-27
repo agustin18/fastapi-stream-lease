@@ -56,3 +56,11 @@ uv run mkdocs build --strict
 - Update the README or docs for public API or failure-mode changes.
 - Use Conventional Commits (`feat:`, `fix:`, `docs:`, `perf:`, `chore:`).
 - CI must pass before merge.
+
+## Releases
+
+Release versions are calculated from Conventional Commits since the previous tag.
+`feat` requires a minor bump; `feat(demo)` changes limited to demo, docs, tests, and
+release metadata are the documented patch exception. Run
+`python scripts/release_version.py --next` to preview the next version; the publish
+workflow verifies the tag before uploading.
