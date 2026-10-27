@@ -1,3 +1,7 @@
+---
+description: Failure model for Redis outages, lease loss, circuit breaking, and fail-open versus fail-closed behavior.
+---
+
 # Failure model
 
 The package is designed around one invariant: a slot is held by a lease, and every lease

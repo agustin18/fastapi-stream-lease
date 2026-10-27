@@ -13,6 +13,7 @@ exclude_docs: |
 
 theme:
   name: material
+  custom_dir: overrides
   language: en
   features:
     - navigation.sections
@@ -45,6 +46,7 @@ theme:
 nav:
   - Home: index.md
   - Quickstart: quickstart.md
+  - FAQ: faq.md
   - Guides:
       - SSE and streaming: guides/sse.md
       - Production deployment: guides/production.md

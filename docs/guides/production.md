@@ -1,3 +1,7 @@
+---
+description: Deploy fastapi-stream-lease with Redis, connection pools, graceful shutdown, and multi-worker coordination.
+---
+
 # Production deployment
 
 The lease engine is deliberately small: Redis is the source of truth, and each worker
