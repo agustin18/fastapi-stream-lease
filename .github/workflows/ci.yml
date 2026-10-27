@@ -46,10 +46,10 @@ jobs:
             --output-file "$RUNNER_TEMP/requirements-audit.txt"
 
       - name: Audit Dependencies for Known Vulnerabilities (PyPI)
-        run: uv run --with pip-audit pip-audit -r "$RUNNER_TEMP/requirements-audit.txt"
+        run: uv run --with pip-audit pip-audit -r "$RUNNER_TEMP/requirements-audit.txt" --no-deps --disable-pip
 
       - name: Audit Dependencies for Known Vulnerabilities (OSV)
-        run: uv run --with pip-audit pip-audit --vulnerability-service osv -r "$RUNNER_TEMP/requirements-audit.txt"
+        run: uv run --with pip-audit pip-audit --vulnerability-service osv -r "$RUNNER_TEMP/requirements-audit.txt" --no-deps --disable-pip
 
   docs:
     runs-on: ubuntu-latest
