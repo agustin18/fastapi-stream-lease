@@ -107,7 +107,7 @@ The first two requests stream events; the third receives `429` with a `Retry-Aft
 
 ### Browser demo
 
-The [`demo/`](demo/) app runs a two-panel browser demo with a synthetic SSE stream, a signed session cookie, and the same Redis lease limits. It needs Redis but no LLM credentials:
+The [`demo/`](demo/) app runs a two-panel browser demo with a synthetic SSE stream, a signed session cookie, and the same Redis lease limits. The second tab is rejected by the per-session lease; the per-IP guard is set to `2` so the two-tab demo can reach it. It needs Redis but no LLM credentials:
 
 ```bash
 docker compose up --build demo

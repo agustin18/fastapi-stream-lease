@@ -16,6 +16,7 @@ services:
     environment:
       - REDIS_URL=redis://redis:6379/0
       - DEMO_COOKIE_SECURE=0
+      - DEMO_MAX_PER_IP=2
     depends_on:
       redis:
         condition: service_healthy

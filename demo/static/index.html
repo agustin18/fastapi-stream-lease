@@ -5,7 +5,6 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
   <link rel="icon" href="data:,">
-  <meta name="color-scheme" content="dark">
   <title>FastAPI Stream Lease Demo</title>
   <style>
     :root {
@@ -85,14 +84,14 @@
     .lede strong { color: var(--text); }
 
     .stats {
-      display: flex;
-      flex-wrap: wrap;
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(10.5rem, 1fr));
       gap: 0.75rem;
       margin: 1.6rem 0 2.4rem;
     }
 
     .stat {
-      min-width: 10.5rem;
+      min-width: 0;
       padding: 0.85rem 1rem;
       border: 1px solid var(--line);
       border-radius: 0.9rem;
@@ -205,6 +204,11 @@
       background: transparent;
     }
 
+    button:focus-visible {
+      outline: 2px solid var(--accent-2);
+      outline-offset: 2px;
+    }
+
     .progress {
       overflow: hidden;
       height: 0.42rem;
@@ -256,11 +260,76 @@
       color: var(--muted);
       background: rgba(8, 11, 20, 0.45);
       font-size: 0.8rem;
+      overflow-wrap: anywhere;
     }
 
     .panel[data-state="live"] .status { color: var(--accent); }
     .panel[data-state="blocked"] .status { color: var(--danger); }
     .panel[data-state="done"] .status { color: var(--accent-2); }
+
+    .guide {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(min(100%, 280px), 1fr));
+      gap: 1rem;
+      margin: 0 0 1.5rem;
+    }
+
+    .guide-card {
+      padding: 1.1rem 1.2rem;
+      border: 1px solid var(--line);
+      border-radius: 1.1rem;
+      background: rgba(16, 23, 42, 0.55);
+    }
+
+    .guide h2 {
+      margin: 0;
+      color: var(--muted);
+      font-size: 0.78rem;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+    }
+
+    .guide ol {
+      display: grid;
+      gap: 0.4rem;
+      margin: 0.7rem 0 0;
+      padding-left: 1.15rem;
+      color: var(--muted);
+      font-size: 0.84rem;
+    }
+
+    .guide li::marker { color: var(--accent); }
+    .guide strong { color: var(--text); }
+    .guide code { color: var(--text); }
+
+    .flow {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.45rem;
+      margin: 0.75rem 0 0;
+    }
+
+    .flow span {
+      padding: 0.32rem 0.55rem;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      color: var(--text);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 0.72rem;
+    }
+
+    .flow .arrow {
+      border: 0;
+      padding: 0;
+      background: transparent;
+      color: var(--muted);
+    }
+
+    .guide p {
+      margin: 0.7rem 0 0;
+      color: var(--muted);
+      font-size: 0.8rem;
+    }
 
     .notes {
       margin-top: 2.5rem;
@@ -302,6 +371,17 @@
     footer a { color: var(--accent-2); text-decoration: none; }
     footer a:hover { text-decoration: underline; }
 
+    @media (max-width: 640px) {
+      main {
+        width: min(100% - 1.25rem, 1040px);
+        padding-top: 2rem;
+      }
+
+      .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .stat { padding: 0.75rem 0.8rem; }
+      .panel { min-height: auto; }
+    }
+
     @media (prefers-reduced-motion: reduce) {
       *, *::before, *::after {
         scroll-behavior: auto !important;
@@ -315,12 +395,12 @@
 <body>
   <main>
     <header>
-      <div class="eyebrow">fastapi-stream-lease</div>
+      <div class="eyebrow">fastapi-stream-lease · local demo</div>
       <h1>One user. One stream. Two tabs.</h1>
       <p class="lede">
-        This demo holds a Redis lease for each SSE stream. Both panels share one
-        <strong>HttpOnly session cookie</strong>, so the second stream is rejected with
-        <code>429</code> until the first one finishes or disconnects.
+        Each SSE stream holds a Redis lease. Both panels share one
+        <strong>HttpOnly session cookie</strong>, so Tab B is rejected with
+        <code>429</code> until Tab A finishes or disconnects.
       </p>
       <div class="stats" role="group" aria-label="Live lease statistics">
         <div class="stat">
@@ -328,8 +408,12 @@
           <div class="stat-value"><span id="active-count">0</span> / <span id="global-limit">20</span></div>
         </div>
         <div class="stat">
-          <div class="stat-label">Per user</div>
+          <div class="stat-label">Per session</div>
           <div class="stat-value" id="user-limit">1</div>
+        </div>
+        <div class="stat">
+          <div class="stat-label">Per network</div>
+          <div class="stat-value" id="ip-limit">2</div>
         </div>
         <div class="stat">
           <div class="stat-label">Backend</div>
@@ -338,12 +422,31 @@
       </div>
     </header>
 
+    <section class="guide" aria-label="How to try the demo">
+      <div class="guide-card">
+        <h2>Try this</h2>
+        <ol>
+          <li>Open <strong>Tab A</strong> and let it stream.</li>
+          <li>Open <strong>Tab B</strong> while A is running. It gets <code>429</code> from the per-session lease.</li>
+          <li>Disconnect A or let it finish.</li>
+          <li>Open B again. The slot is free.</li>
+        </ol>
+      </div>
+      <div class="guide-card">
+        <h2>Request path</h2>
+        <p class="flow" aria-label="Rate limit, per-IP guard, per-session lease, SSE">
+          <span>rate limit</span><span class="arrow" aria-hidden="true">→</span><span>per-IP guard</span><span class="arrow" aria-hidden="true">→</span><span>per-session lease</span><span class="arrow" aria-hidden="true">→</span><span>SSE</span>
+        </p>
+        <p>The per-IP guard is set to <strong data-note-per-ip>2</strong> so two tabs can reach the session lease. A third session from the same network is rejected by the IP guard.</p>
+      </div>
+    </section>
+
     <section class="grid" aria-label="Stream panels">
       <article class="panel" data-panel="a" data-state="idle">
         <div class="panel-head">
           <div>
             <h2>Tab A</h2>
-            <p class="panel-sub">Synthetic SSE stream</p>
+            <p class="panel-sub">First stream, holds the lease</p>
           </div>
           <span class="pill" data-pill>idle</span>
         </div>
@@ -361,14 +464,14 @@
         </div>
 
         <div class="progress" aria-hidden="true"><span data-progress></span></div>
-        <div class="status" data-status aria-live="polite">Ready.</div>
+        <div class="status" data-status role="status" aria-live="polite" aria-atomic="true">Ready.</div>
       </article>
 
       <article class="panel" data-panel="b" data-state="idle">
         <div class="panel-head">
           <div>
             <h2>Tab B</h2>
-            <p class="panel-sub">Same cookie, same user</p>
+            <p class="panel-sub">Same cookie, same session</p>
           </div>
           <span class="pill" data-pill>idle</span>
         </div>
@@ -386,7 +489,7 @@
         </div>
 
         <div class="progress" aria-hidden="true"><span data-progress></span></div>
-        <div class="status" data-status aria-live="polite">Ready.</div>
+        <div class="status" data-status role="status" aria-live="polite" aria-atomic="true">Ready.</div>
       </article>
     </section>
 
@@ -395,14 +498,16 @@
       <ul>
         <li>Each stream is a synthetic <span data-note-stream-seconds>20</span>-second SSE response. No LLM calls or API keys are involved.</li>
         <li>The lease lives in Redis with a <span data-note-lease-seconds>25</span>-second TTL and is renewed while the response is open.</li>
-        <li>The public limits are <code data-note-per-user>1</code> concurrent stream per session and <code data-note-global>20</code> globally.</li>
+        <li>Limits: <code data-note-per-user>1</code> per session, <code data-note-per-ip>2</code> per network, <code data-note-global>20</code> globally.</li>
+        <li>Request rate limit: <code data-note-rate-limit>30</code> stream attempts per minute per IP.</li>
+        <li>Tab B is rejected by the per-session lease. A third session from the same network would hit the per-IP guard.</li>
         <li>If Redis is unavailable, the API returns <code>503</code> instead of silently allowing streams.</li>
       </ul>
     </section>
 
     <footer>
       <span>Built with <a href="https://github.com/agustin18/fastapi-stream-lease">fastapi-stream-lease</a>.</span>
-      <span><a href="https://agustin18.github.io/fastapi-stream-lease/">Docs</a> · <a href="https://pypi.org/project/fastapi-stream-lease/">PyPI</a></span>
+      <span><a href="https://github.com/agustin18/fastapi-stream-lease/tree/main/demo">Demo source</a> · <a href="https://agustin18.github.io/fastapi-stream-lease/">Docs</a> · <a href="https://pypi.org/project/fastapi-stream-lease/">PyPI</a></span>
     </footer>
   </main>
 
@@ -422,11 +527,14 @@
     const activeCount = document.querySelector("#active-count");
     const globalLimit = document.querySelector("#global-limit");
     const userLimit = document.querySelector("#user-limit");
+    const ipLimit = document.querySelector("#ip-limit");
     const backendStatus = document.querySelector("#backend-status");
-    const noteStreamSeconds = document.querySelector("[data-note-stream-seconds]");
-    const noteLeaseSeconds = document.querySelector("[data-note-lease-seconds]");
-    const notePerUser = document.querySelector("[data-note-per-user]");
-    const noteGlobal = document.querySelector("[data-note-global]");
+
+    function setNote(selector, value) {
+      for (const node of document.querySelectorAll(selector)) {
+        node.textContent = String(value);
+      }
+    }
 
     function setStatus(panel, message, state) {
       panel.root.dataset.state = state;
@@ -450,13 +558,30 @@
       panel.progress.style.width = `${Math.min(100, (received / payload.total) * 100)}%`;
     }
 
-    async function readErrorMessage(response) {
+    async function readErrorPayload(response) {
       try {
-        const payload = await response.json();
-        return payload.detail || payload.code || `HTTP ${response.status}`;
+        return await response.json();
       } catch {
-        return `HTTP ${response.status}`;
+        return {};
       }
+    }
+
+    function describeLimit(payload, status) {
+      if (payload.reason === "user_limit") return "per-session lease";
+      if (payload.reason === "global_limit") return "global lease";
+      const labels = {
+        cross_site_stream_blocked: "cross-site guard",
+        demo_ip_limit: "per-IP guard",
+        demo_rate_limit: "request rate limit",
+        stream_lease_backend_unavailable: "Redis unavailable",
+      };
+      return labels[payload.code] || (status === 429 ? "request rejected" : "request failed");
+    }
+
+    function retryHint(payload, retryAfter) {
+      if (!retryAfter) return "";
+      if (payload.code === "demo_rate_limit") return ` Retry in ${retryAfter}s.`;
+      return ` Retry after the active stream ends (up to ${retryAfter}s).`;
     }
 
     async function startStream(panel) {
@@ -475,10 +600,15 @@
         });
 
         if (!response.ok) {
-          const detail = await readErrorMessage(response);
+          const payload = await readErrorPayload(response);
           const retryAfter = response.headers.get("Retry-After");
-          const suffix = retryAfter ? ` Retry in ${retryAfter}s.` : "";
-          setStatus(panel, `${response.status}: ${detail}${suffix}`, "blocked");
+          const label = describeLimit(payload, response.status);
+          const detail = payload.detail || payload.code || `HTTP ${response.status}`;
+          setStatus(
+            panel,
+            `${response.status} · ${label}: ${detail}${retryHint(payload, retryAfter)}`,
+            "blocked",
+          );
           return;
         }
 
@@ -512,10 +642,10 @@
           }
         }
 
-        setStatus(panel, "Stream completed. The lease was released.", "done");
+        setStatus(panel, "Stream completed. Lease released.", "done");
       } catch (error) {
         if (error.name === "AbortError") {
-          setStatus(panel, "Disconnected by the browser. The lease should be released.", "idle");
+          setStatus(panel, "Disconnected. Lease release requested.", "idle");
         } else {
           setStatus(panel, `Error: ${error.message}`, "blocked");
         }
@@ -546,10 +676,13 @@
         activeCount.textContent = String(payload.active_global);
         globalLimit.textContent = String(payload.max_global);
         userLimit.textContent = String(payload.max_per_user);
-        noteStreamSeconds.textContent = String(payload.stream_seconds);
-        noteLeaseSeconds.textContent = String(payload.lease_seconds);
-        notePerUser.textContent = String(payload.max_per_user);
-        noteGlobal.textContent = String(payload.max_global);
+        ipLimit.textContent = String(payload.max_per_ip);
+        setNote("[data-note-stream-seconds]", payload.stream_seconds);
+        setNote("[data-note-lease-seconds]", payload.lease_seconds);
+        setNote("[data-note-per-user]", payload.max_per_user);
+        setNote("[data-note-per-ip]", payload.max_per_ip);
+        setNote("[data-note-global]", payload.max_global);
+        setNote("[data-note-rate-limit]", payload.rate_limit_per_minute);
         backendStatus.textContent = "Redis ok";
       } catch {
         backendStatus.textContent = "unavailable";

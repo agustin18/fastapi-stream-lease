@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.6.4 — 2026-10-27
+
+- Clarified the local browser demo so the second tab is rejected by the per-session lease, not by the demo's per-IP guard. The per-IP guard now defaults to `2`; a third session from the same network still hits the IP guard.
+- Added a guided "Try this" flow, a request-path explanation, per-session and per-network limit readouts, and clearer blocked-state messages to the demo UI.
+- Expanded the demo stats payload with `max_per_ip` and `rate_limit_per_minute`, and added tests for the default two-tab behavior and the third-session IP rejection. The demo suite now has 46 tests and keeps 100% branch coverage for `demo/app.py`.
+- No runtime library changes.
+
 ## 0.6.3 — 2026-10-27
 
 - Added a self-contained local browser demo (`demo/`) with a two-panel synthetic SSE stream, signed session cookie, and per-session and per-IP limits. Run it from a checkout with `docker compose up --build demo`; it needs Redis but no LLM credentials.

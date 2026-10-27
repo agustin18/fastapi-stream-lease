@@ -6,9 +6,10 @@ shipped in the repository source tree and is not part of the published wheel; ru
 it from a checkout or from the included Docker image.
 
 Both panels share one signed HttpOnly session cookie. The first stream acquires
-a Redis lease; the second stream for the same session receives `429` until the
-first one finishes or the browser disconnects. A Redis-backed per-IP cap also
-prevents one client from filling every global slot with forged sessions.
+a Redis lease; the second stream for the same session receives `429` from the
+per-session lease until the first one finishes or the browser disconnects. The
+per-IP guard is set to `2` so the two-tab demo can reach the session limit; a
+third session from the same network is rejected by the IP guard.
 
 ## Run locally
 
@@ -37,7 +38,7 @@ DEMO_COOKIE_SECURE=0 uv run uvicorn demo.app:app --reload
 | `DEMO_TOKEN_INTERVAL` | `0.5` | Delay between synthetic tokens. |
 | `DEMO_MAX_PER_USER` | `1` | Concurrent streams per session. |
 | `DEMO_MAX_GLOBAL` | `20` | Concurrent streams across the process. |
-| `DEMO_MAX_PER_IP` | `1` | Concurrent streams per client IP. |
+| `DEMO_MAX_PER_IP` | `2` | Concurrent streams per client IP. |
 | `DEMO_RATE_LIMIT_PER_MINUTE` | `30` | Stream attempts per IP per window. |
 | `DEMO_RATE_LIMIT_WINDOW_SECONDS` | `60` | Rate-limit window. |
 | `DEMO_COOKIE_SECURE` | `0` | Set to `1` if you run the demo behind HTTPS. |

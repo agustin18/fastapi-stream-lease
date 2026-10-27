@@ -32,7 +32,6 @@ def make_config(**overrides: object) -> DemoConfig:
         "lease_seconds": 2.0,
         "max_per_user": 1,
         "max_global": 2,
-        "max_per_ip": 2,
         "stream_seconds": 0.2,
         "token_interval": 0.05,
         "rate_limit_per_minute": 100,
@@ -46,6 +45,10 @@ def make_config(**overrides: object) -> DemoConfig:
 
 async def test_demo_config_hides_session_secret_from_repr():
     assert "test-session-secret" not in repr(make_config())
+
+
+async def test_default_demo_config_allows_two_tabs():
+    assert DemoConfig().max_per_ip == 2
 
 
 @pytest.fixture
@@ -91,6 +94,14 @@ async def test_index_serves_demo_and_reuses_session_cookie(demo_client):
     second = await demo_client.get("/")
     assert SESSION_COOKIE not in second.headers.get("set-cookie", "")
     assert demo_client.cookies.get(SESSION_COOKIE) == session
+
+
+async def test_index_explains_the_two_limits(demo_client):
+    response = await demo_client.get("/")
+
+    assert "per-session lease" in response.text
+    assert "per-IP guard" in response.text
+    assert "Try this" in response.text
 
 
 async def test_forged_session_cookie_is_replaced(demo_client):
@@ -171,6 +182,8 @@ async def test_health_and_stats(demo_client):
         "active_global": 0,
         "max_global": 2,
         "max_per_user": 1,
+        "max_per_ip": 2,
+        "rate_limit_per_minute": 100,
         "lease_seconds": 2.0,
         "stream_seconds": 0.2,
     }
@@ -276,6 +289,7 @@ async def test_second_stream_for_same_session_is_rejected(demo_client, demo_app)
 
         assert rejected.status_code == 429
         assert rejected.headers["retry-after"] == "2"
+        assert rejected.json()["code"] == "stream_connection_limit"
         assert rejected.json()["reason"] == "user_limit"
 
         first = await first_task
@@ -326,6 +340,48 @@ async def test_ip_limit_blocks_another_session_from_same_ip(fake_redis):
 
         allowed = await second_client.get("/demo/stream")
         assert allowed.status_code == 200
+
+    await manager.close(drain=False)
+
+
+async def test_default_ip_limit_allows_two_sessions_then_blocks_third(fake_redis):
+    app = create_app(
+        fake_redis,
+        make_config(lease_seconds=5.0, stream_seconds=1.0, token_interval=0.1),
+        close_redis=False,
+    )
+    transport = ASGITransport(app=app)
+    manager = app.state.manager
+
+    async with (
+        AsyncClient(transport=transport, base_url="http://test") as first_client,
+        AsyncClient(transport=transport, base_url="http://test") as second_client,
+        AsyncClient(transport=transport, base_url="http://test") as third_client,
+    ):
+        await first_client.get("/")
+        await second_client.get("/")
+        await third_client.get("/")
+        first_session = session_id(first_client)
+        second_session = session_id(second_client)
+        assert first_session != second_session
+
+        first_task = asyncio.create_task(first_client.get("/demo/stream"))
+        second_task = asyncio.create_task(second_client.get("/demo/stream"))
+        try:
+            await wait_for_count(manager, None, 2)
+            rejected = await third_client.get("/demo/stream")
+
+            assert rejected.status_code == 429
+            assert rejected.json()["code"] == "demo_ip_limit"
+
+            assert (await first_task).status_code == 200
+            assert (await second_task).status_code == 200
+        finally:
+            for task in (first_task, second_task):
+                if not task.done():
+                    task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await task
 
     await manager.close(drain=False)
 
