@@ -126,6 +126,7 @@ ignore = []
 "tests/*" = ["T20", "SIM", "ASYNC", "PERF", "RUF006"]
 "benchmarks/*" = ["T20"]
 "examples/*" = ["T20"]
+"scripts/*" = ["T20"]
 
 [tool.codespell]
 skip = "*.lock,*.xml,.git,.venv,.mypy_cache,.pytest_cache,dist,site"

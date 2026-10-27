@@ -85,3 +85,12 @@ All contributors and participants are expected to adhere to our [Code of Conduct
 ## Releases
 
 Only the maintainer publishes releases. Version numbers in `pyproject.toml` and `src/fastapi_stream_lease/__init__.py` must match the `vX.Y.Z` release tag. The publishing workflow reruns CI for that tag and then uploads through PyPI Trusted Publishing.
+
+Release versions are calculated from Conventional Commits since the previous tag:
+
+- `feat`: minor.
+- `fix`, `perf`, `docs`, `chore`, `ci`, `test`, `build`, `style`, `refactor`, `revert`: patch.
+- `!` or `BREAKING CHANGE`: major.
+- `feat(demo)` limited to demo, docs, tests, and release metadata: patch exception.
+
+Use `python scripts/release_version.py --next` to calculate the next version. Use `--write` to update `pyproject.toml`, `src/fastapi_stream_lease/__init__.py`, and `uv.lock`. Use `--check vX.Y.Z` to verify a tag. The publish workflow runs the same check before uploading.
