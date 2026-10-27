@@ -2,7 +2,8 @@
 
 The demo intentionally uses a synthetic SSE stream so it runs without LLM
 credentials. Each browser session gets one stream; the second one is rejected
-until the first releases its Redis lease.
+until the first releases its Redis lease. The per-IP guard is set to two so the
+two-tab demo can reach the per-session limit.
 """
 
 from __future__ import annotations
@@ -52,7 +53,7 @@ class DemoConfig:
     lease_seconds: float = 25.0
     max_per_user: int = 1
     max_global: int = 20
-    max_per_ip: int = 1
+    max_per_ip: int = 2
     stream_seconds: float = 20.0
     token_interval: float = 0.5
     rate_limit_per_minute: int = 30
@@ -89,7 +90,7 @@ class DemoConfig:
             lease_seconds=float(os.environ.get("DEMO_LEASE_SECONDS", "25")),
             max_per_user=int(os.environ.get("DEMO_MAX_PER_USER", "1")),
             max_global=int(os.environ.get("DEMO_MAX_GLOBAL", "20")),
-            max_per_ip=int(os.environ.get("DEMO_MAX_PER_IP", "1")),
+            max_per_ip=int(os.environ.get("DEMO_MAX_PER_IP", "2")),
             stream_seconds=float(os.environ.get("DEMO_STREAM_SECONDS", "20")),
             token_interval=float(os.environ.get("DEMO_TOKEN_INTERVAL", "0.5")),
             rate_limit_per_minute=int(os.environ.get("DEMO_RATE_LIMIT_PER_MINUTE", "30")),
@@ -393,6 +394,8 @@ def create_app(
                 "active_global": await manager.get_active_count(),
                 "max_global": settings.max_global,
                 "max_per_user": settings.max_per_user,
+                "max_per_ip": settings.max_per_ip,
+                "rate_limit_per_minute": settings.rate_limit_per_minute,
                 "lease_seconds": settings.lease_seconds,
                 "stream_seconds": settings.stream_seconds,
             }
